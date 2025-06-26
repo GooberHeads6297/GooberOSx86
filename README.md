@@ -14,7 +14,7 @@ sha256:a5443d4be7844a5e6c9a8148b852c4d19567c725b0f7367dbf1546e2abd875e2
 |    1. Use DD image mode               |
 |    2. Select MBR/BIOS using Rufus     |
 |    3. Boot from MBR/Legacy using BIOS |
-|---------------------------------------|
+
 
   
   Install via CD/DVD:
