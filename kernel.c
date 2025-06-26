@@ -1,5 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
+#include "drivers/keyboard/keyboard.h"
+#include "drivers/io/io.h"
 
 static uint16_t* const VIDEO_MEMORY = (uint16_t*)0xb8000;
 static uint8_t cursor_row = 0;
@@ -33,16 +35,6 @@ extern void isr32_stub();
 #define ICW1_INIT    0x10
 #define ICW1_ICW4    0x01
 #define ICW4_8086    0x01
-
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
 
 void pic_remap() {
     uint8_t a1 = inb(PIC1_DATA);
@@ -82,7 +74,7 @@ volatile int keyboard_interrupt_flag = 0;
 void irq1_handler_main() {
     volatile uint8_t scancode = inb(0x60);
     (void)scancode;
-    keyboard_interrupt_flag = 1;
+    keyboard_interrupt_handler();
 }
 
 void idt_init() {
@@ -161,12 +153,14 @@ void kernel_main() {
     }
 
     idt_init();
+
     __asm__ volatile("sti");
 
     while (1) {
-        if (keyboard_interrupt_flag) {
-            keyboard_interrupt_flag = 0;
-            print("Keyboard Interrupt Detected!\n");
+        char c = keyboard_read_char();
+        if (c) {
+            char str[2] = { c, '\0' };
+            print(str);
         }
         __asm__("hlt");
     }
