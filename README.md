@@ -2,5 +2,6 @@
 Simple OS with a Kernel (W.I.P)
 
 
-Release: 0.0.1
-sha256:ce4808d40d8961f44ef9263dd0bbfc808e885b00f4351e51ca5bbf277a1c10b3
+Release: 0.0.2
+
+sha256:a5443d4be7844a5e6c9a8148b852c4d19567c725b0f7367dbf1546e2abd875e2
