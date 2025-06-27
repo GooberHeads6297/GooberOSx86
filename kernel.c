@@ -100,7 +100,7 @@ static void scroll_screen() {
     if (cursor_row > 0) cursor_row--;
 }
 
-static void clear_screen() {
+void clear_screen() {
     for (size_t row = 0; row < 25; row++)
         for (size_t col = 0; col < 80; col++)
             VIDEO_MEMORY[row * 80 + col] = ((uint16_t)0x0F << 8) | ' ';
@@ -153,15 +153,13 @@ void kernel_main() {
     }
 
     idt_init();
+    fs_init();
+    shell_init();
 
     __asm__ volatile("sti");
 
     while (1) {
-        char c = keyboard_read_char();
-        if (c) {
-            char str[2] = { c, '\0' };
-            print(str);
-        }
+        shell_run();
         __asm__("hlt");
     }
 }
