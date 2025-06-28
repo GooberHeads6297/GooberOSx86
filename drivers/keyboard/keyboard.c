@@ -1,6 +1,11 @@
 #include "keyboard.h"
 #include "drivers/io/io.h"
 
+#define BUFFER_SIZE 128
+static char buffer[BUFFER_SIZE];
+static volatile int head = 0;
+static volatile int tail = 0;
+
 static char scancode_to_ascii[128] = {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8',
     '9', '0', '-', '=', '\b', '\t', 'q', 'w', 'e', 'r',
@@ -27,11 +32,11 @@ static char scancode_to_ascii_shift[128] = {
     0, 0, 0, 0, 0, 0, 0, 0
 };
 
-volatile char last_char = 0;
 static uint8_t shift = 0;
 
 void keyboard_init() {
-    // Optional: configure controller if needed
+    head = 0;
+    tail = 0;
 }
 
 void keyboard_interrupt_handler() {
@@ -43,14 +48,25 @@ void keyboard_interrupt_handler() {
         shift = 0;
     } else if (!(scancode & 0x80)) {
         char c = shift ? scancode_to_ascii_shift[scancode] : scancode_to_ascii[scancode];
-        if (c) last_char = c;
+        if (c) {
+            int next = (head + 1) % BUFFER_SIZE;
+            if (next != tail) { // Avoid buffer overflow
+                buffer[head] = c;
+                head = next;
+            }
+        }
     }
 
     outb(0x20, 0x20);
 }
 
+int keyboard_has_char() {
+    return head != tail;
+}
+
 char keyboard_read_char() {
-    char c = last_char;
-    last_char = 0;
+    if (head == tail) return 0;
+    char c = buffer[tail];
+    tail = (tail + 1) % BUFFER_SIZE;
     return c;
 }

@@ -1,8 +1,6 @@
 #include "../kernel.h"
 #include <stddef.h>
 
-
-
 extern void clear_screen();
 extern void print(const char*);
 extern void move_cursor(uint8_t row, uint8_t col);
@@ -10,9 +8,7 @@ extern char keyboard_read_char();
 
 extern uint8_t cursor_row;
 extern uint8_t cursor_col;
-
 extern uint16_t* const VIDEO_MEMORY;
-
 
 #define INPUT_BUFFER_SIZE 128
 static char input_buffer[INPUT_BUFFER_SIZE];
@@ -46,12 +42,14 @@ static void print_char_shell(char c) {
         }
     }
     move_cursor(cursor_row, cursor_col);
+    VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | '_';
 }
 
 static void prompt() {
     print("GooberOS> ");
     cursor_col = 10;
     move_cursor(cursor_row, cursor_col);
+    VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | '_';
 }
 
 static void clear_input() {
@@ -77,6 +75,9 @@ static void execute_command(const char* cmd) {
         print(cmd);
         print("\n");
     }
+
+    move_cursor(cursor_row, cursor_col);
+    VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | '_';
 }
 
 void shell_init() {
@@ -89,13 +90,20 @@ void shell_run() {
     if (!c) return;
 
     if (c == '\r' || c == '\n') {
+        // Clear cursor before executing command
+        VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
+
         print_char_shell('\n');
         input_buffer[input_pos] = '\0';
         execute_command(input_buffer);
         clear_input();
         prompt();
+
     } else if (c == '\b' || c == 127) {
         if (input_pos > 0) {
+            // Clear the cursor visual at current position
+            VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
+
             input_pos--;
             if (cursor_col == 0 && cursor_row > 0) {
                 cursor_row--;
@@ -103,11 +111,25 @@ void shell_run() {
             } else {
                 cursor_col--;
             }
+
+            // Clear the character being backspaced
             VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
+
             move_cursor(cursor_row, cursor_col);
+
+            // Draw blinking cursor
+            VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | '_';
         }
+
     } else if (input_pos < INPUT_BUFFER_SIZE - 1) {
+        // Clear previous cursor underscore
+        VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
+
         input_buffer[input_pos++] = c;
         print_char_shell(c);
+
+        // Draw updated cursor
+        VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | '_';
     }
 }
+

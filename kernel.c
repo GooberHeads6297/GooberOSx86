@@ -8,7 +8,6 @@ uint16_t* const VIDEO_MEMORY = (uint16_t*)0xb8000;
 uint8_t cursor_row = 0;
 uint8_t cursor_col = 0;
 
-
 struct IDTEntry {
     uint16_t base_low;
     uint16_t selector;
@@ -124,6 +123,7 @@ void clear_screen() {
     cursor_row = 0;
     cursor_col = 0;
     move_cursor(cursor_row, cursor_col);
+    VIDEO_MEMORY[0] = ((uint16_t)0x0F << 8) | '_';
 }
 
 static void print_char(char c) {
@@ -161,7 +161,7 @@ void kernel_main() {
     clear_screen();
     print("GooberOS -- x86 Kernel\n");
     print("VGA output Success.\n");
-    print("Testing scrolling...\n\n"); // Ensures the prompt starts on a clean line
+    print("Testing scrolling...\n\n");
 
     delay();
 
@@ -176,7 +176,7 @@ void kernel_main() {
         print(buffer);
     }
 
-    print("\n"); // Add newline to separate kernel logs from shell prompt
+    print("\n");
 
     idt_init();
     fs_init();
@@ -189,4 +189,3 @@ void kernel_main() {
         __asm__("hlt");
     }
 }
-
