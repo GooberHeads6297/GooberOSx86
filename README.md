@@ -3,9 +3,9 @@ Simple OS with a Kernel and a Shell (W.I.P)
 
 ________________________________
 
-Release: 0.0.4 (sha256 only shows the one for the latest release)
+Release: 0.0.7 (sha256 only shows the one for the latest release)
 
-sha256:177275862875d6e4583483ae787bdc24bd93dbc7c5847a56080a9e4987afdf7b
+sha256:d3bb63799c81bea019f264d6a6da7b164507fca23166f1680f5bec62ca8488a3
 
   Install with USB:  (Use FAT32)
 |---------------------------------------|
