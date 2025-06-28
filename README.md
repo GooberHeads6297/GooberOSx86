@@ -1,5 +1,5 @@
 # GooberOSx86
-Simple OS with a Kernel (W.I.P)
+Simple OS with a Kernel and a Shell (W.I.P)
 
 ________________________________
 
