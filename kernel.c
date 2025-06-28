@@ -3,9 +3,11 @@
 #include "drivers/keyboard/keyboard.h"
 #include "drivers/io/io.h"
 
-static uint16_t* const VIDEO_MEMORY = (uint16_t*)0xb8000;
-static uint8_t cursor_row = 0;
-static uint8_t cursor_col = 0;
+uint16_t* const VIDEO_MEMORY = (uint16_t*)0xb8000;
+
+uint8_t cursor_row = 0;
+uint8_t cursor_col = 0;
+
 
 struct IDTEntry {
     uint16_t base_low;
@@ -36,6 +38,11 @@ extern void isr32_stub();
 #define ICW1_ICW4    0x01
 #define ICW4_8086    0x01
 
+#define IRQ0 32
+#define IRQ1 33
+
+volatile int keyboard_interrupt_flag = 0;
+
 void pic_remap() {
     uint8_t a1 = inb(PIC1_DATA);
     uint8_t a2 = inb(PIC2_DATA);
@@ -52,8 +59,8 @@ void pic_remap() {
     outb(PIC1_DATA, ICW4_8086);
     outb(PIC2_DATA, ICW4_8086);
 
-    outb(PIC1_DATA, 0xFD);  // Unmask only IRQ1 (keyboard)
-    outb(PIC2_DATA, 0xFF);  // Mask all on Slave PIC
+    outb(PIC1_DATA, 0xFD);
+    outb(PIC2_DATA, 0xFF);
 }
 
 void set_idt_entry(int index, uint32_t base, uint16_t selector, uint8_t type_attr) {
@@ -64,13 +71,6 @@ void set_idt_entry(int index, uint32_t base, uint16_t selector, uint8_t type_att
     idt[index].base_high = (base >> 16) & 0xFFFF;
 }
 
-void print(const char* str);
-
-#define IRQ0 32
-#define IRQ1 33
-
-volatile int keyboard_interrupt_flag = 0;
-
 void irq1_handler_main() {
     volatile uint8_t scancode = inb(0x60);
     (void)scancode;
@@ -79,13 +79,30 @@ void irq1_handler_main() {
 
 void idt_init() {
     pic_remap();
-
     set_idt_entry(IRQ0, (uint32_t)isr32_stub,       0x08, 0x8E);
     set_idt_entry(IRQ1, (uint32_t)irq1_handler_asm,  0x08, 0x8E);
-
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint32_t)&idt;
     load_idt(&idt_ptr);
+}
+
+void move_cursor(uint8_t row, uint8_t col) {
+    if (row >= 25) row = 24;
+    if (col >= 80) col = 79;
+    cursor_row = row;
+    cursor_col = col;
+    uint16_t pos = row * 80 + col;
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (uint8_t)(pos & 0xFF));
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
+
+static void clear_line(uint8_t row) {
+    if (row >= 25) return;
+    for (size_t col = 0; col < 80; col++) {
+        VIDEO_MEMORY[row * 80 + col] = ((uint16_t)0x0F << 8) | ' ';
+    }
 }
 
 static void scroll_screen() {
@@ -94,33 +111,36 @@ static void scroll_screen() {
             VIDEO_MEMORY[(row - 1) * 80 + col] = VIDEO_MEMORY[row * 80 + col];
         }
     }
-    for (size_t col = 0; col < 80; col++) {
-        VIDEO_MEMORY[24 * 80 + col] = ((uint16_t)0x0F << 8) | ' ';
-    }
-    if (cursor_row > 0) cursor_row--;
+    clear_line(24);
+    cursor_row = 24;
+    cursor_col = 0;
+    move_cursor(cursor_row, cursor_col);
 }
 
 void clear_screen() {
-    for (size_t row = 0; row < 25; row++)
-        for (size_t col = 0; col < 80; col++)
-            VIDEO_MEMORY[row * 80 + col] = ((uint16_t)0x0F << 8) | ' ';
+    for (size_t row = 0; row < 25; row++) {
+        clear_line(row);
+    }
     cursor_row = 0;
     cursor_col = 0;
+    move_cursor(cursor_row, cursor_col);
 }
 
 static void print_char(char c) {
     if (c == '\n') {
         cursor_row++;
         cursor_col = 0;
+        if (cursor_row >= 25) scroll_screen();
     } else {
         VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | c;
         cursor_col++;
         if (cursor_col >= 80) {
             cursor_col = 0;
             cursor_row++;
+            if (cursor_row >= 25) scroll_screen();
         }
     }
-    if (cursor_row >= 25) scroll_screen();
+    move_cursor(cursor_row, cursor_col);
 }
 
 void print(const char* str) {
@@ -133,11 +153,15 @@ static void delay() {
         __asm__("nop");
 }
 
+extern void fs_init();
+extern void shell_init();
+extern void shell_run();
+
 void kernel_main() {
     clear_screen();
     print("GooberOS -- x86 Kernel\n");
     print("VGA output Success.\n");
-    print("Testing scrolling...\n");
+    print("Testing scrolling...\n\n"); // Ensures the prompt starts on a clean line
 
     delay();
 
@@ -152,6 +176,8 @@ void kernel_main() {
         print(buffer);
     }
 
+    print("\n"); // Add newline to separate kernel logs from shell prompt
+
     idt_init();
     fs_init();
     shell_init();
@@ -163,3 +189,4 @@ void kernel_main() {
         __asm__("hlt");
     }
 }
+

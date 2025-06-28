@@ -1,14 +1,20 @@
-#include "shell.h"
+#include "../kernel.h"
 #include <stddef.h>
-#include <stdint.h>
 
-extern void clear_screen();  // declared here since no kernel.h
+
+
+extern void clear_screen();
+extern void print(const char*);
+extern void move_cursor(uint8_t row, uint8_t col);
+extern char keyboard_read_char();
+
+extern uint8_t cursor_row;
+extern uint8_t cursor_col;
+
+extern uint16_t* const VIDEO_MEMORY;
+
 
 #define INPUT_BUFFER_SIZE 128
-
-extern char keyboard_read_char();
-extern void print(const char*);
-
 static char input_buffer[INPUT_BUFFER_SIZE];
 static size_t input_pos = 0;
 
@@ -27,8 +33,25 @@ static int strncmp(const char* s1, const char* s2, size_t n) {
     return 0;
 }
 
+static void print_char_shell(char c) {
+    if (c == '\n') {
+        cursor_row++;
+        cursor_col = 0;
+    } else {
+        VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | c;
+        cursor_col++;
+        if (cursor_col >= 80) {
+            cursor_col = 0;
+            cursor_row++;
+        }
+    }
+    move_cursor(cursor_row, cursor_col);
+}
+
 static void prompt() {
     print("GooberOS> ");
+    cursor_col = 10;
+    move_cursor(cursor_row, cursor_col);
 }
 
 static void clear_input() {
@@ -44,6 +67,8 @@ static void execute_command(const char* cmd) {
         print("Available commands:\nhelp\nclear\necho\n");
     } else if (!strcmp(cmd, "clear")) {
         clear_screen();
+        cursor_row = 0;
+        cursor_col = 0;
     } else if (!strncmp(cmd, "echo ", 5)) {
         print(cmd + 5);
         print("\n");
@@ -64,19 +89,25 @@ void shell_run() {
     if (!c) return;
 
     if (c == '\r' || c == '\n') {
-        print("\n");
+        print_char_shell('\n');
         input_buffer[input_pos] = '\0';
         execute_command(input_buffer);
         clear_input();
         prompt();
-    } else if (c == '\b' || c == 127) {  // Backspace
+    } else if (c == '\b' || c == 127) {
         if (input_pos > 0) {
             input_pos--;
-            print("\b \b");
+            if (cursor_col == 0 && cursor_row > 0) {
+                cursor_row--;
+                cursor_col = 79;
+            } else {
+                cursor_col--;
+            }
+            VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
+            move_cursor(cursor_row, cursor_col);
         }
     } else if (input_pos < INPUT_BUFFER_SIZE - 1) {
         input_buffer[input_pos++] = c;
-        char str[2] = {c, '\0'};
-        print(str);
+        print_char_shell(c);
     }
 }
