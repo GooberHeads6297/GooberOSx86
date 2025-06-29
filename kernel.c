@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include "drivers/timer/timer.h"
 #include "drivers/keyboard/keyboard.h"
 #include "drivers/io/io.h"
 
@@ -25,6 +26,7 @@ static struct IDTEntry idt[256];
 static struct IDTPointer idt_ptr;
 
 extern void load_idt(struct IDTPointer*);
+extern void timer_interrupt_handler();
 extern void irq1_handler_asm();
 extern void isr32_stub();
 
@@ -70,6 +72,20 @@ void set_idt_entry(int index, uint32_t base, uint16_t selector, uint8_t type_att
     idt[index].base_high = (base >> 16) & 0xFFFF;
 }
 
+void irq0_handler_main() {
+    timer_interrupt_handler();
+}
+
+__attribute__((naked)) void irq0_handler_asm() {
+    __asm__ volatile (
+        "pusha\n"
+        "call irq0_handler_main\n"
+        "popa\n"
+        "iret\n"
+    );
+}
+
+
 void irq1_handler_main() {
     volatile uint8_t scancode = inb(0x60);
     (void)scancode;
@@ -78,12 +94,13 @@ void irq1_handler_main() {
 
 void idt_init() {
     pic_remap();
-    set_idt_entry(IRQ0, (uint32_t)isr32_stub,       0x08, 0x8E);
-    set_idt_entry(IRQ1, (uint32_t)irq1_handler_asm,  0x08, 0x8E);
+    set_idt_entry(IRQ0, (uint32_t)irq0_handler_asm, 0x08, 0x8E);
+    set_idt_entry(IRQ1, (uint32_t)irq1_handler_asm, 0x08, 0x8E);
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint32_t)&idt;
     load_idt(&idt_ptr);
 }
+
 
 void move_cursor(uint8_t row, uint8_t col) {
     if (row >= 25) row = 24;
@@ -179,6 +196,7 @@ void kernel_main() {
     print("\n");
 
     idt_init();
+    timer_init(2);  // Set PIT to 100Hz to drive cursor blinking
     fs_init();
     shell_init();
 
@@ -189,3 +207,4 @@ void kernel_main() {
         __asm__("hlt");
     }
 }
+

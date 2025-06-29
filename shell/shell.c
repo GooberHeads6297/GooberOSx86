@@ -1,14 +1,21 @@
 #include "../kernel.h"
 #include <stddef.h>
+#include "../drivers/io/io.h"
+
 
 extern void clear_screen();
 extern void print(const char*);
 extern void move_cursor(uint8_t row, uint8_t col);
 extern char keyboard_read_char();
-
+extern unsigned char inb(unsigned short port);
+extern void outb(unsigned short port, unsigned char val);
 extern uint8_t cursor_row;
 extern uint8_t cursor_col;
 extern uint16_t* const VIDEO_MEMORY;
+
+// filesystem commands declarations
+extern int fs_list();
+extern int fs_change_dir(const char* path);
 
 #define INPUT_BUFFER_SIZE 128
 static char input_buffer[INPUT_BUFFER_SIZE];
@@ -58,18 +65,40 @@ static void clear_input() {
         input_buffer[i] = 0;
 }
 
+static void reboot() {
+    while ((inb(0x64) & 0x02) != 0);
+    outb(0x64, 0xFE);
+    while (1) __asm__ volatile ("hlt");
+}
+
 static void execute_command(const char* cmd) {
     if (cmd[0] == '\0') return;
 
     if (!strcmp(cmd, "help")) {
-        print("Available commands:\nhelp\nclear\necho\n");
-    } else if (!strcmp(cmd, "clear")) {
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\n");
+    } else if (!strcmp(cmd, "cls")) {
         clear_screen();
         cursor_row = 0;
         cursor_col = 0;
     } else if (!strncmp(cmd, "echo ", 5)) {
         print(cmd + 5);
         print("\n");
+    } else if (!strcmp(cmd, "ls")) {
+        fs_list();
+    } else if (!strncmp(cmd, "cd ", 3)) {
+        const char* path = cmd + 3;
+        if (fs_change_dir(path) == 0) {
+            print("Changed directory to ");
+            print(path);
+            print("\n");
+        } else {
+            print("cd: Directory not found: ");
+            print(path);
+            print("\n");
+        }
+    } else if (!strcmp(cmd, "exit")) {
+        print("Rebooting...\n");
+        reboot();
     } else {
         print("Unknown command: ");
         print(cmd);
@@ -90,7 +119,6 @@ void shell_run() {
     if (!c) return;
 
     if (c == '\r' || c == '\n') {
-        // Clear cursor before executing command
         VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
 
         print_char_shell('\n');
@@ -101,7 +129,6 @@ void shell_run() {
 
     } else if (c == '\b' || c == 127) {
         if (input_pos > 0) {
-            // Clear the cursor visual at current position
             VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
 
             input_pos--;
@@ -112,24 +139,19 @@ void shell_run() {
                 cursor_col--;
             }
 
-            // Clear the character being backspaced
             VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
 
             move_cursor(cursor_row, cursor_col);
 
-            // Draw blinking cursor
             VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | '_';
         }
 
     } else if (input_pos < INPUT_BUFFER_SIZE - 1) {
-        // Clear previous cursor underscore
         VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | ' ';
 
         input_buffer[input_pos++] = c;
         print_char_shell(c);
 
-        // Draw updated cursor
         VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | '_';
     }
 }
-
