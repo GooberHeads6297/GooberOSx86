@@ -2,7 +2,6 @@
 #include <stddef.h>
 #include "../drivers/io/io.h"
 
-
 extern void clear_screen();
 extern void print(const char*);
 extern void move_cursor(uint8_t row, uint8_t col);
@@ -16,6 +15,7 @@ extern uint16_t* const VIDEO_MEMORY;
 // filesystem commands declarations
 extern int fs_list();
 extern int fs_change_dir(const char* path);
+extern int fs_cd_up(); // added for cd ..
 
 #define INPUT_BUFFER_SIZE 128
 static char input_buffer[INPUT_BUFFER_SIZE];
@@ -66,8 +66,20 @@ static void clear_input() {
 }
 
 static void reboot() {
-    while ((inb(0x64) & 0x02) != 0);
-    outb(0x64, 0xFE);
+    __asm__ volatile ("cli");
+
+    struct {
+        uint16_t limit;
+        uint32_t base;
+    } __attribute__((packed)) idt_ptr = {0, 0};
+
+    __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
+
+    __asm__ volatile (
+        "int3\n"
+        "ud2\n"
+    );
+
     while (1) __asm__ volatile ("hlt");
 }
 
@@ -87,14 +99,22 @@ static void execute_command(const char* cmd) {
         fs_list();
     } else if (!strncmp(cmd, "cd ", 3)) {
         const char* path = cmd + 3;
-        if (fs_change_dir(path) == 0) {
-            print("Changed directory to ");
-            print(path);
-            print("\n");
+        if (!strcmp(path, "..")) {
+            if (fs_cd_up() == 0) {
+                print("Moved up one directory\n");
+            } else {
+                print("Already at root directory\n");
+            }
         } else {
-            print("cd: Directory not found: ");
-            print(path);
-            print("\n");
+            if (fs_change_dir(path) == 0) {
+                print("Changed directory to ");
+                print(path);
+                print("\n");
+            } else {
+                print("cd: Directory not found: ");
+                print(path);
+                print("\n");
+            }
         }
     } else if (!strcmp(cmd, "exit")) {
         print("Rebooting...\n");

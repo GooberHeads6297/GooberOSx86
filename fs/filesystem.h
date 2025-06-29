@@ -19,5 +19,8 @@ void fs_init();
 FileHandle* fs_open(const char* filename);
 size_t fs_read(FileHandle* fh, uint8_t* buffer, size_t bytes);
 void fs_close(FileHandle* fh);
+int fs_list();
+int fs_change_dir(const char* path);
+int fs_cd_up();
 
 #endif
