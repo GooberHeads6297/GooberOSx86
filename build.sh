@@ -52,5 +52,5 @@ cp ${BUILD_DIR}/kernel.bin ${ISO_DIR}/boot/
 cp grub/grub.cfg ${ISO_DIR}/boot/grub/
 
 # Create ISO image
-grub-mkrescue -o GooberOSx86.iso ${ISO_DIR}/ --modules="biosdisk part_msdos"
+grub-mkrescue -o GooberOSx86.iso ${ISO_DIR}/ --modules="biosdisk part_msdos" --directory=/usr/lib/grub/i386-pc/
 echo "[+] ISO created: GooberOSx86.iso"
