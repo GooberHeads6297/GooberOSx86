@@ -1,5 +1,5 @@
 #include "keyboard.h"
-#include "drivers/io/io.h"
+#include "../io/io.h"
 #include <stddef.h>
 
 #define BUFFER_SIZE 128
@@ -35,52 +35,14 @@ static char scancode_to_ascii_shift[128] = {
     0, 0, 0, 0, 0, 0, 0, 0
 };
 
-// Extended scancodes map for numpad keys (after 0xE0 prefix)
-// These are commonly numpad keys with Num Lock ON that send extended scancodes.
-static char extended_scancode_to_ascii[128] = {
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 0-9
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 10-19
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 20-29
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 30-39
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 40-49
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 50-59
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 60-69
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 70-79
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 80-89
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 90-99
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 100-109
-    0,    0, 0, 0, 0, 0, 0, 0, 0, 0,  // padding for indices 110-119
-    0,    0, 0, 0, 0, 0, 0, 0          // up to 127
-};
-
-// Manually map common extended numpad keys (0xE0 prefixed)
-// Scancodes for keypad with Num Lock ON that send extended codes:
-// These are common:
-// 0x4A = Keypad '-' (minus)
-// 0x4E = Keypad '+' (plus)
-// 0x47 = Keypad '7' (Home)
-// 0x48 = Keypad '8' (Up)
-// 0x49 = Keypad '9' (Page Up)
-// 0x4B = Keypad '4' (Left)
-// 0x4D = Keypad '6' (Right)
-// 0x4F = Keypad '1' (End)
-// 0x50 = Keypad '2' (Down)
-// 0x51 = Keypad '3' (Page Down)
-// 0x52 = Keypad '0' (Insert)
-// 0x53 = Keypad '.' (Delete)
-
-// We'll handle these in the handler explicitly instead of table lookup.
-
-void keyboard_init() {
+void keyboard_init(void) {
     head = 0;
     tail = 0;
     shift = 0;
     extended = 0;
-    // IRQ1 handler should be registered here if not already done elsewhere
-    // Example: isr_register_handler(IRQ1, keyboard_interrupt_handler);
 }
 
-void keyboard_interrupt_handler() {
+void keyboard_interrupt_handler(void) {
     uint8_t scancode = inb(0x60);
 
     if (scancode == 0xE0) {
@@ -98,8 +60,8 @@ void keyboard_interrupt_handler() {
 
         if (extended) {
             switch (scancode) {
-                case 0x4A: c = '-'; break;  // keypad minus
-                case 0x4E: c = '+'; break;  // keypad plus
+                case 0x4A: c = '-'; break;
+                case 0x4E: c = '+'; break;
                 case 0x47: c = '7'; break;
                 case 0x48: c = '8'; break;
                 case 0x49: c = '9'; break;
@@ -113,7 +75,23 @@ void keyboard_interrupt_handler() {
                 default: c = 0; break;
             }
         } else {
-            c = shift ? scancode_to_ascii_shift[scancode] : scancode_to_ascii[scancode];
+            switch (scancode) {
+                case 0x3B: c = 0x8B; break; // F1
+                case 0x3C: c = 0x8C; break; // F2
+                case 0x3D: c = 0x8D; break; // F3
+                case 0x3E: c = 0x8E; break; // F4
+                case 0x3F: c = 0x8F; break; // F5
+                case 0x40: c = 0x90; break; // F6
+                case 0x41: c = 0x91; break; // F7
+                case 0x42: c = 0x92; break; // F8
+                case 0x43: c = 0x93; break; // F9
+                case 0x44: c = 0x94; break; // F10
+                case 0x57: c = 0x95; break; // F11
+                case 0x58: c = 0x96; break; // F12
+                default:
+                    c = shift ? scancode_to_ascii_shift[scancode] : scancode_to_ascii[scancode];
+                    break;
+            }
         }
 
         if (c) {
@@ -125,15 +103,17 @@ void keyboard_interrupt_handler() {
         }
     }
 
-    extended = 0;
+    if (scancode != 0xE0) {
+        extended = 0;
+    }
     outb(0x20, 0x20);
 }
 
-int keyboard_has_char() {
+int keyboard_has_char(void) {
     return head != tail;
 }
 
-char keyboard_read_char() {
+char keyboard_read_char(void) {
     if (head == tail) return 0;
     char c = buffer[tail];
     tail = (tail + 1) % BUFFER_SIZE;

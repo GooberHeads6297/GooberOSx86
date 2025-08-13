@@ -3,11 +3,31 @@
 #include "drivers/timer/timer.h"
 #include "drivers/keyboard/keyboard.h"
 #include "drivers/io/io.h"
+#include "drivers/video/vga.h"
+#include "taskmgr/process.h"
+#include "lib/memory.h"
 
-uint16_t* const VIDEO_MEMORY = (uint16_t*)0xb8000;
+#define IRQ0 32
+#define IRQ1 33
 
-uint8_t cursor_row = 0;
-uint8_t cursor_col = 0;
+#define KERNEL_HEAP_SIZE (64 * 1024)  // 64KB heap, adjust as needed
+
+volatile int keyboard_interrupt_flag = 0;
+
+extern unsigned char _kernel_start;
+extern unsigned char _kernel_end;
+
+
+
+static int kernel_pid = -1;
+
+static void update_kernel_process_memory();
+
+static void register_kernel_process() {
+    size_t kernel_size_bytes = (size_t)(&_kernel_end) - (size_t)(&_kernel_start);
+    size_t kernel_size_kb = (kernel_size_bytes + 1023) / 1024;
+    create_process("kernel.bin", kernel_size_kb);
+}
 
 struct IDTEntry {
     uint16_t base_low;
@@ -26,42 +46,29 @@ static struct IDTEntry idt[256];
 static struct IDTPointer idt_ptr;
 
 extern void load_idt(struct IDTPointer*);
-extern void timer_interrupt_handler();
 extern void irq1_handler_asm();
 extern void isr32_stub();
 
-#define PIC1_COMMAND 0x20
-#define PIC1_DATA    0x21
-#define PIC2_COMMAND 0xA0
-#define PIC2_DATA    0xA1
-
-#define ICW1_INIT    0x10
-#define ICW1_ICW4    0x01
-#define ICW4_8086    0x01
-
-#define IRQ0 32
-#define IRQ1 33
-
-volatile int keyboard_interrupt_flag = 0;
+static unsigned int update_counter = 0;
 
 void pic_remap() {
-    uint8_t a1 = inb(PIC1_DATA);
-    uint8_t a2 = inb(PIC2_DATA);
+    uint8_t a1 = inb(0x21);
+    uint8_t a2 = inb(0xA1);
 
-    outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4);
-    outb(PIC2_COMMAND, ICW1_INIT | ICW1_ICW4);
+    outb(0x20, 0x11);
+    outb(0xA0, 0x11);
 
-    outb(PIC1_DATA, 0x20);
-    outb(PIC2_DATA, 0x28);
+    outb(0x21, 0x20);
+    outb(0xA1, 0x28);
 
-    outb(PIC1_DATA, 4);
-    outb(PIC2_DATA, 2);
+    outb(0x21, 4);
+    outb(0xA1, 2);
 
-    outb(PIC1_DATA, ICW4_8086);
-    outb(PIC2_DATA, ICW4_8086);
+    outb(0x21, 0x01);
+    outb(0xA1, 0x01);
 
-    outb(PIC1_DATA, 0xFD);
-    outb(PIC2_DATA, 0xFF);
+    outb(0x21, a1);
+    outb(0xA1, a2);
 }
 
 void set_idt_entry(int index, uint32_t base, uint16_t selector, uint8_t type_attr) {
@@ -73,6 +80,13 @@ void set_idt_entry(int index, uint32_t base, uint16_t selector, uint8_t type_att
 }
 
 void irq0_handler_main() {
+    // Increment counter and update kernel process memory every ~2 seconds
+    update_counter++;
+    if (update_counter >= 200) {
+        update_kernel_process_memory();
+        update_counter = 0;
+    }
+
     timer_interrupt_handler();
 }
 
@@ -84,7 +98,6 @@ __attribute__((naked)) void irq0_handler_asm() {
         "iret\n"
     );
 }
-
 
 void irq1_handler_main() {
     volatile uint8_t scancode = inb(0x60);
@@ -101,63 +114,17 @@ void idt_init() {
     load_idt(&idt_ptr);
 }
 
-
-void move_cursor(uint8_t row, uint8_t col) {
-    if (row >= 25) row = 24;
-    if (col >= 80) col = 79;
-    cursor_row = row;
-    cursor_col = col;
-    uint16_t pos = row * 80 + col;
-    outb(0x3D4, 0x0F);
-    outb(0x3D5, (uint8_t)(pos & 0xFF));
-    outb(0x3D4, 0x0E);
-    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
-}
-
-static void clear_line(uint8_t row) {
-    if (row >= 25) return;
-    for (size_t col = 0; col < 80; col++) {
-        VIDEO_MEMORY[row * 80 + col] = ((uint16_t)0x0F << 8) | ' ';
-    }
-}
-
-static void scroll_screen() {
-    for (size_t row = 1; row < 25; row++) {
-        for (size_t col = 0; col < 80; col++) {
-            VIDEO_MEMORY[(row - 1) * 80 + col] = VIDEO_MEMORY[row * 80 + col];
+void clear_screen() {
+    for (uint8_t y = 0; y < 25; y++) {
+        for (uint8_t x = 0; x < 80; x++) {
+            vga_put_char_at(' ', x, y, 0x0F);
         }
     }
-    clear_line(24);
-    cursor_row = 24;
-    cursor_col = 0;
-    move_cursor(cursor_row, cursor_col);
-}
-
-void clear_screen() {
-    for (size_t row = 0; row < 25; row++) {
-        clear_line(row);
-    }
-    cursor_row = 0;
-    cursor_col = 0;
-    move_cursor(cursor_row, cursor_col);
-    VIDEO_MEMORY[0] = ((uint16_t)0x0F << 8) | '_';
+    vga_set_cursor(0, 0);
 }
 
 static void print_char(char c) {
-    if (c == '\n') {
-        cursor_row++;
-        cursor_col = 0;
-        if (cursor_row >= 25) scroll_screen();
-    } else {
-        VIDEO_MEMORY[cursor_row * 80 + cursor_col] = ((uint16_t)0x0F << 8) | c;
-        cursor_col++;
-        if (cursor_col >= 80) {
-            cursor_col = 0;
-            cursor_row++;
-            if (cursor_row >= 25) scroll_screen();
-        }
-    }
-    move_cursor(cursor_row, cursor_col);
+    vga_put_char(c);
 }
 
 void print(const char* str) {
@@ -165,39 +132,43 @@ void print(const char* str) {
         print_char(str[i]);
 }
 
-static void delay() {
-    for (volatile int i = 0; i < 100000000; i++)
-        __asm__("nop");
-}
-
 extern void fs_init();
 extern void shell_init();
 extern void shell_run();
 
+static void update_kernel_process_memory() {
+    if (kernel_pid < 0) return;
+    size_t kernel_size_bytes = (size_t)(&_kernel_end) - (size_t)(&_kernel_start);
+    size_t kernel_size_kb = (kernel_size_bytes + 1023) / 1024;
+
+    process_entry_t *table = get_kernel_process_table();
+    int total = get_kernel_process_count();
+    for (int i = 0; i < total; i++) {
+        if (table[i].pid == kernel_pid && table[i].active) {
+            table[i].memory_kb = kernel_size_kb;
+            break;
+        }
+    }
+}
+
 void kernel_main() {
+    vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     clear_screen();
     print("GooberOS -- x86 Kernel\n");
     print("VGA output Success.\n");
-    print("Testing scrolling...\n\n");
-
-    delay();
-
-    char buffer[8];
-    for (int i = 1; i <= 3; i++) {
-        buffer[0] = '/';
-        buffer[1] = ':';
-        buffer[2] = '0' + (i / 10);
-        buffer[3] = '0' + (i % 10);
-        buffer[4] = '\n';
-        buffer[5] = '\0';
-        print(buffer);
-    }
-
     print("\n");
 
     idt_init();
-    timer_init(2);  // Set PIT to 100Hz to drive cursor blinking
+    timer_init(2);
     fs_init();
+
+    // Initialize heap allocator
+    void* heap_start = (void*)(&_kernel_end);
+    memory_init(heap_start, KERNEL_HEAP_SIZE);
+
+    kernel_pid = create_process("kernel.bin", 0);
+    update_kernel_process_memory();
+
     shell_init();
 
     __asm__ volatile("sti");
@@ -207,4 +178,3 @@ void kernel_main() {
         __asm__("hlt");
     }
 }
-

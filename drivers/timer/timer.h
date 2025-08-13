@@ -6,5 +6,6 @@
 void timer_init(uint32_t frequency);
 void timer_phase(uint32_t hz);
 void timer_interrupt_handler(void);
+void timer_sleep(uint32_t ms);
 
 #endif

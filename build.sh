@@ -22,13 +22,19 @@ i686-elf-gcc -ffreestanding -m32 -O0 \
   -Idrivers/io \
   -Ifs \
   -Ishell \
+  -Itaskmgr \
   -c kernel.c -o ${BUILD_DIR}/kernel.o
 
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c lib/string.c                -o ${BUILD_DIR}/string.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c lib/memory.c                -o ${BUILD_DIR}/memory.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/keyboard/keyboard.c -o ${BUILD_DIR}/keyboard.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/timer/timer.c       -o ${BUILD_DIR}/timer.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/video/vga.c         -o ${BUILD_DIR}/vga.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c fs/filesystem.c             -o ${BUILD_DIR}/filesystem.o
-i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c shell/shell.c               -o ${BUILD_DIR}/shell.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Itaskmgr -c shell/shell.c     -o ${BUILD_DIR}/shell.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c games/snake.c               -o ${BUILD_DIR}/snake.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Itaskmgr -c taskmgr/taskmgr.c -o ${BUILD_DIR}/taskmgr.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Itaskmgr -c taskmgr/process.c -o ${BUILD_DIR}/process.o
 
 # Link all objects into a kernel binary
 i686-elf-ld -m elf_i386 -T linker.ld -o ${BUILD_DIR}/kernel.bin \
@@ -42,6 +48,11 @@ i686-elf-ld -m elf_i386 -T linker.ld -o ${BUILD_DIR}/kernel.bin \
     ${BUILD_DIR}/vga.o \
     ${BUILD_DIR}/filesystem.o \
     ${BUILD_DIR}/shell.o \
+    ${BUILD_DIR}/snake.o \
+    ${BUILD_DIR}/taskmgr.o \
+    ${BUILD_DIR}/process.o \
+    ${BUILD_DIR}/memory.o \
+    ${BUILD_DIR}/string.o \
     ${BUILD_DIR}/kernel.o
 
 echo "[+] Kernel built: ${BUILD_DIR}/kernel.bin"
