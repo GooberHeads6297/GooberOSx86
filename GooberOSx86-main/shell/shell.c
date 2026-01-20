@@ -4,6 +4,7 @@
 #include "../games/snake.h"
 #include "../games/cubeDip.h"
 #include "../games/pong.h"
+#include "../games/doom.h"
 #include "../taskmgr/taskmgr.h"
 #include "../fs/filesystem.h"
 #include "../lib/string.h"
@@ -176,6 +177,7 @@ static void list_games() {
     print("snakeGame.exe\n");
     print("cubeDip.exe\n");
     print("pong.exe\n");
+    print("doom.exe\n");
 }
 
 static void execute_command(const char* cmd) {
@@ -192,7 +194,7 @@ static void execute_command(const char* cmd) {
     }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\nnew\nwrite\nmkdir\ndel\nrmdir\nread\nsnakeGame.exe\ncubeDip.exe\npong.exe\n");
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\nnew\nwrite\nmkdir\ndel\nrmdir\nread\n");
     } else if (!strcmp_local(cmd, "cls")) {
         clear_screen();
         cursor_row = 0;
@@ -365,6 +367,10 @@ static void execute_command(const char* cmd) {
         print("Launching Pong... Press ESC to quit.\n");
         run_pong_game();
         print("Exited Pong\n");
+    } else if (!strcmp_local(cmd, "doom.exe")) {
+        print("Launching Doom prototype... Press ESC to quit.\n");
+        run_doom_game();
+        print("Exited Doom\n");
     } else if (!strcmp_local(cmd, "taskview")) {
         run_task_manager();
         print("Exited task manager\n");
@@ -373,6 +379,7 @@ static void execute_command(const char* cmd) {
         print(cmd);
         print("\n");
     }
+
 
 
     cursor_enabled = 1;
