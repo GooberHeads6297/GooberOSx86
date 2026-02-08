@@ -35,3 +35,7 @@ void timer_sleep(uint32_t ms) {
         __asm__ volatile ("hlt");
     }
 }
+
+uint32_t timer_ticks(void) {
+    return tick;
+}

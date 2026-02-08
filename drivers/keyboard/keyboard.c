@@ -60,15 +60,15 @@ void keyboard_interrupt_handler(void) {
 
         if (extended) {
             switch (scancode) {
+                case 0x48: c = 0x80; break; /* Arrow up */
+                case 0x50: c = 0x81; break; /* Arrow down */
+                case 0x4B: c = 0x82; break; /* Arrow left */
+                case 0x4D: c = 0x83; break; /* Arrow right */
                 case 0x4A: c = '-'; break;
                 case 0x4E: c = '+'; break;
                 case 0x47: c = '7'; break;
-                case 0x48: c = '8'; break;
                 case 0x49: c = '9'; break;
-                case 0x4B: c = '4'; break;
-                case 0x4D: c = '6'; break;
                 case 0x4F: c = '1'; break;
-                case 0x50: c = '2'; break;
                 case 0x51: c = '3'; break;
                 case 0x52: c = '0'; break;
                 case 0x53: c = '.'; break;

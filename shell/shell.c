@@ -2,9 +2,14 @@
 #include <stddef.h>
 #include "../drivers/io/io.h"
 #include "../games/snake.h"
+#include "../games/cubeDip.h"
+#include "../games/pong.h"
+#include "../games/doom.h"
+#include "../editor/editor.h"
 #include "../taskmgr/taskmgr.h"
 #include "../fs/filesystem.h"
 #include "../lib/string.h"
+#include "../drivers/video/vga.h"
 
 #define PROMPT_COLOR 0x01
 #define DEFAULT_COLOR 0x0F
@@ -33,8 +38,14 @@ extern int fs_cd_up(void);
 extern const char* fs_get_cwd();
 
 #define INPUT_BUFFER_SIZE 256
+#define HISTORY_SIZE 32
 static char input_buffer[INPUT_BUFFER_SIZE];
 static size_t input_pos = 0;
+static char history[HISTORY_SIZE][INPUT_BUFFER_SIZE];
+static int history_next = 0;
+static int history_count = 0;
+static int history_nav_index = 0;
+static char saved_input[INPUT_BUFFER_SIZE];
 
 static int strcmp_local(const char* s1, const char* s2) {
     while (*s1 && (*s1 == *s2)) { s1++; s2++; }
@@ -162,6 +173,31 @@ static void clear_input() {
     for (size_t i = 0; i < INPUT_BUFFER_SIZE; i++) input_buffer[i] = 0;
 }
 
+static size_t input_len(void) {
+    size_t i = 0;
+    while (i < INPUT_BUFFER_SIZE && input_buffer[i] != '\0') i++;
+    return i;
+}
+
+static void set_input_line(const char* text) {
+    size_t len = 0;
+    while (text[len] && len < INPUT_BUFFER_SIZE - 1) len++;
+    for (size_t i = 0; i < INPUT_BUFFER_SIZE; i++)
+        input_buffer[i] = (i < len) ? text[i] : '\0';
+    input_pos = len;
+    int r = prompt_start_row, c = prompt_start_col;
+    for (size_t i = 0; i < INPUT_BUFFER_SIZE; i++) {
+        put_cell(r, c, (i < len) ? text[i] : ' ', DEFAULT_COLOR);
+        c++;
+        if (c >= SCREEN_COLS) { c = 0; r++; }
+    }
+    if (input_index_to_pos(input_pos, &r, &c) == 0) {
+        cursor_row = r;
+        cursor_col = c;
+    }
+    draw_cursor();
+}
+
 static void reboot() {
     __asm__ volatile ("cli");
     struct { uint16_t limit; uint32_t base; } __attribute__((packed)) idt_ptr = {0, 0};
@@ -172,13 +208,16 @@ static void reboot() {
 
 static void list_games() {
     print("snakeGame.exe\n");
+    print("cubeDip.exe\n");
+    print("pong.exe\n");
+    print("doom.exe\n");
 }
 
 static void execute_command(const char* cmd) {
     if (!cmd) return;
 
     restore_prev_cursor_cell();
-    move_cursor(cursor_row, cursor_col); // make sure VGA write position is correct
+    move_cursor(cursor_row, cursor_col);
     cursor_enabled = 0;
 
     if (cmd[0] == '\0') {
@@ -186,9 +225,21 @@ static void execute_command(const char* cmd) {
         draw_cursor();
         return;
     }
+    {
+        size_t len = 0;
+        while (cmd[len] && len < INPUT_BUFFER_SIZE) len++;
+        if (len > 0) {
+            for (size_t i = 0; i < len && i < INPUT_BUFFER_SIZE - 1; i++)
+                history[history_next][i] = cmd[i];
+            history[history_next][(len < INPUT_BUFFER_SIZE - 1 ? len : INPUT_BUFFER_SIZE - 1)] = '\0';
+            history_next = (history_next + 1) % HISTORY_SIZE;
+            if (history_count < HISTORY_SIZE) history_count++;
+        }
+        history_nav_index = 0;
+    }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\nnew\nwrite\nmkdir\ndel\nrmdir\nread\n");
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\n");
     } else if (!strcmp_local(cmd, "cls")) {
         clear_screen();
         cursor_row = 0;
@@ -344,15 +395,41 @@ static void execute_command(const char* cmd) {
                 print("\n");
             }
         }
+    } else if (!strncmp_local(cmd, "edit ", 5)) {
+        const char* filename = cmd + 5;
+        while (*filename == ' ') filename++;
+        if (*filename == '\0') {
+            print("edit: Filename required\n");
+        } else {
+            run_editor(filename);
+            clear_screen();
+            vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+            cursor_row = 0;
+            cursor_col = 0;
+            print("Exited editor\n");
+            vga_set_text_color(DEFAULT_COLOR, VGA_COLOR_BLACK);
+        }
     } else if (!strcmp_local(cmd, "exit")) {
         print("Rebooting...\n");
         reboot();
     } else if (!strcmp_local(cmd, "games")) {
         list_games();
     } else if (!strcmp_local(cmd, "snakeGame.exe")) {
-        print("Launching snakeGame.exe... Press CTRL+C to quit.\n");
+        print("Launching snakeGame.exe... Press ESC to quit.\n");
         run_snake_game();
         print("Exited snakeGame.exe\n");
+    } else if (!strcmp_local(cmd, "cubeDip.exe")) {
+        print("Launching cubeDip.exe... Press ESC to quit.\n");
+        run_cubeDip_game();
+        print("Exited cubeDip.exe\n");
+    } else if (!strcmp_local(cmd, "pong.exe")) {
+        print("Launching Pong... Press ESC to quit.\n");
+        run_pong_game();
+        print("Exited Pong\n");
+    } else if (!strcmp_local(cmd, "doom.exe")) {
+        print("Launching Doom prototype... Press ESC to quit.\n");
+        run_doom_game();
+        print("Exited Doom\n");
     } else if (!strcmp_local(cmd, "taskview")) {
         run_task_manager();
         print("Exited task manager\n");
@@ -361,6 +438,8 @@ static void execute_command(const char* cmd) {
         print(cmd);
         print("\n");
     }
+
+
 
     cursor_enabled = 1;
     draw_cursor();
@@ -386,29 +465,80 @@ void shell_run() {
         prompt();                          // prompt restores before drawing itself
     } else if (c == '\b' || c == 127) {
         if (input_pos > 0) {
+            size_t len = input_len();
+            for (size_t i = input_pos - 1; i < len && i + 1 < INPUT_BUFFER_SIZE; i++)
+                input_buffer[i] = input_buffer[i + 1];
+            input_buffer[len > 0 ? len - 1 : 0] = '\0';
             input_pos--;
-            int r, col;
-            if (input_index_to_pos(input_pos, &r, &col) == 0) {
-                restore_prev_cursor_cell();  // <— restore first
-                cursor_row = r;
-                cursor_col = col;
-                put_cell(cursor_row, cursor_col, ' ', DEFAULT_COLOR);
-                draw_cursor();
-            }
+            restore_prev_cursor_cell();
+            set_input_line(input_buffer);
         }
     } else if ((unsigned char)c == 0x8B) {
-        restore_prev_cursor_cell();       // <— safety
+        restore_prev_cursor_cell();       // safety
         run_task_manager();
         print("Exited task manager\n");
         prompt();
+    } else if ((unsigned char)c == 0x80) {
+        if (history_count > 0) {
+            if (history_nav_index == 0) {
+                for (size_t i = 0; i < INPUT_BUFFER_SIZE; i++) saved_input[i] = input_buffer[i];
+            }
+            history_nav_index++;
+            if (history_nav_index > history_count) history_nav_index = history_count;
+            int idx = (history_next - history_nav_index + HISTORY_SIZE) % HISTORY_SIZE;
+            restore_prev_cursor_cell();
+            set_input_line(history[idx]);
+        }
+    } else if ((unsigned char)c == 0x81) {
+        if (history_nav_index > 0) {
+            history_nav_index--;
+            restore_prev_cursor_cell();
+            if (history_nav_index == 0) {
+                set_input_line(saved_input);
+            } else {
+                int idx = (history_next - history_nav_index + HISTORY_SIZE) % HISTORY_SIZE;
+                set_input_line(history[idx]);
+            }
+        }
+    } else if ((unsigned char)c == 0x82) {
+        if (input_pos > 0) {
+            input_pos--;
+            int r, col;
+            if (input_index_to_pos(input_pos, &r, &col) == 0) {
+                restore_prev_cursor_cell();
+                cursor_row = r;
+                cursor_col = col;
+                draw_cursor();
+            }
+        }
+    } else if ((unsigned char)c == 0x83) {
+        if (input_pos < input_len()) {
+            input_pos++;
+            int r, col;
+            if (input_index_to_pos(input_pos, &r, &col) == 0) {
+                restore_prev_cursor_cell();
+                cursor_row = r;
+                cursor_col = col;
+                draw_cursor();
+            }
+        }
     } else if (input_pos < INPUT_BUFFER_SIZE - 1) {
-        int r = cursor_row, col = cursor_col;
-        restore_prev_cursor_cell();       // <— restore first
-        input_buffer[input_pos++] = c;
-        put_cell(r, col, c, DEFAULT_COLOR);
-        cursor_row = r;
-        cursor_col = col;
-        if (++cursor_col >= SCREEN_COLS) { cursor_col = 0; cursor_row++; ensure_scroll(); }
-        draw_cursor();
+        size_t len = input_len();
+        if (input_pos < len && len < INPUT_BUFFER_SIZE - 1) {
+            for (size_t i = len + 1; i > input_pos; i--) input_buffer[i] = input_buffer[i - 1];
+            input_buffer[input_pos] = c;
+            input_pos++;
+            restore_prev_cursor_cell();
+            set_input_line(input_buffer);
+        } else if (len < INPUT_BUFFER_SIZE - 1) {
+            int r = cursor_row, col = cursor_col;
+            restore_prev_cursor_cell();
+            input_buffer[input_pos++] = c;
+            put_cell(r, col, c, DEFAULT_COLOR);
+            cursor_row = r;
+            cursor_col = col;
+            if (++cursor_col >= SCREEN_COLS) { cursor_col = 0; cursor_row++; ensure_scroll(); }
+            draw_cursor();
+        }
     }
 }
