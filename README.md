@@ -6,12 +6,24 @@ Simple OS with a Kernel and a Shell (W.I.P)
 
 ________________________________
 
-### Built-in Task Manager (At the moment not neccesary becasue the only thing runnnig is the Kernel itself.)
+### Built-in Task Manager 
+(At the moment not neccesary becasue the only thing runnnig is the Kernel itself.)
 
 <img width="858" height="411" alt="imageselect" src="https://github.com/user-attachments/assets/6dcc429d-36e9-4d9f-9652-5c11f3f8782a" />
 
 
 ________________________________
+
+### Memory-Based Filesystem With Directory Traversal
+
+
+<img width="693" height="270" alt="ImageMemfilesystem" src="https://github.com/user-attachments/assets/4e2f3cc1-fcf3-4ec6-a14c-ce4ea1cce921" />
+
+________________________________
+
+### Integrated Text Editor (Currenntly In Development)
+
+<img width="835" height="354" alt="ImageEditor" src="https://github.com/user-attachments/assets/e8d2dc58-3b94-4217-b09f-59b8ca868698" />
 
 Release: 0.10.8 (sha256 only shows the one for the latest release)
 
