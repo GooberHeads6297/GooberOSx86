@@ -1,36 +1,13 @@
 # GooberOSx86
 Simple OS with a Kernel and a Shell (W.I.P)
 
-<img width="397" height="138" alt="imageStart" src="https://github.com/user-attachments/assets/7598db4d-5243-41c1-84ba-0f8388f031cc" />
-
-
 ________________________________
 
-### Built-in Task Manager 
-(At the moment not neccesary becasue the only thing runnnig is the Kernel itself.)
+<img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
-<img width="858" height="411" alt="imageselect" src="https://github.com/user-attachments/assets/6dcc429d-36e9-4d9f-9652-5c11f3f8782a" />
+Release: 0.0.9 (sha256 only shows the one for the latest release)
 
-
-________________________________
-
-### Memory-Based Filesystem With Directory Traversal
-
-
-<img width="693" height="270" alt="ImageMemfilesystem" src="https://github.com/user-attachments/assets/4e2f3cc1-fcf3-4ec6-a14c-ce4ea1cce921" />
-
-________________________________
-
-### Integrated Text Editor (Currenntly In Development)
-
-<img width="835" height="354" alt="ImageEditor" src="https://github.com/user-attachments/assets/e8d2dc58-3b94-4217-b09f-59b8ca868698" />
-
-________________________________
-
-
-Release: 0.10.8 (sha256 only shows the one for the latest release)
-
-sha256:612576a5847ee2d6f877ada4cdf33fd9b07406bff732ea98c9a6e37e00778349
+sha256:e22f1d523f15df35281799cd604d8585240ace59672bc69688c7996efd13940f
 
   Install with USB:  (Use FAT32)
 |---------------------------------------|

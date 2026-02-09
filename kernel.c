@@ -159,7 +159,7 @@ void kernel_main() {
     print("\n");
 
     idt_init();
-    timer_init(2);
+    timer_init(100);
     fs_init();
 
     // Initialize heap allocator

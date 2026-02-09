@@ -10,9 +10,12 @@
 #include "../fs/filesystem.h"
 #include "../lib/string.h"
 #include "../drivers/video/vga.h"
+#include "../drivers/keyboard/keyboard.h"
+#include "../drivers/timer/timer.h"
+#include "../drivers/storage/bios_disk.h"
 
-#define PROMPT_COLOR 0x01
-#define DEFAULT_COLOR 0x0F
+#define PROMPT_COLOR VGA_COLOR_BLUE
+#define DEFAULT_COLOR VGA_COLOR_LIGHT_GREEN
 #define SCREEN_COLS 80
 #define SCREEN_ROWS 25
 
@@ -23,6 +26,9 @@ extern char keyboard_read_char();
 extern uint8_t cursor_row;
 extern uint8_t cursor_col;
 extern uint16_t* const VIDEO_MEMORY;
+
+extern unsigned char _binary_GooberOSx86_iso_start;
+extern unsigned char _binary_GooberOSx86_iso_end;
 
 extern FileHandle* fs_open(const char* filename);
 extern size_t fs_read(FileHandle* fh, uint8_t* buffer, size_t bytes);
@@ -66,6 +72,8 @@ static int prev_cursor_row = -1;
 static int prev_cursor_col = -1;
 static uint16_t prev_cell_value = 0;
 static int cursor_enabled = 1;
+static int cursor_drawn = 0;
+static uint32_t last_blink_tick = 0;
 
 static void put_cell(int r, int c, char ch, uint8_t attr) {
     if (r < 0 || c < 0 || r >= SCREEN_ROWS || c >= SCREEN_COLS) return;
@@ -106,6 +114,7 @@ static void restore_prev_cursor_cell() {
     prev_cursor_row = -1;
     prev_cursor_col = -1;
     prev_cell_value = 0;
+    cursor_drawn = 0;
 }
 
 static void draw_cursor() {
@@ -118,6 +127,18 @@ static void draw_cursor() {
     put_cell(cursor_row, cursor_col, '_', PROMPT_COLOR);
     prev_cursor_row = cursor_row;
     prev_cursor_col = cursor_col;
+    cursor_drawn = 1;
+}
+
+static void blink_cursor() {
+    if (!cursor_enabled) return;
+    uint32_t now = timer_ticks();
+    if (last_blink_tick == 0) last_blink_tick = now;
+    if ((now - last_blink_tick) >= 20) { // ~200ms at 100Hz
+        last_blink_tick = now;
+        if (cursor_drawn) restore_prev_cursor_cell();
+        else draw_cursor();
+    }
 }
 
 static void print_char_shell(char c) {
@@ -213,6 +234,71 @@ static void list_games() {
     print("doom.exe\n");
 }
 
+static int parse_hex(const char* s, uint32_t* out) {
+    uint32_t val = 0;
+    if (!s || *s == '\0') return -1;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    if (*s == '\0') return -1;
+    while (*s) {
+        char c = *s++;
+        uint8_t d;
+        if (c >= '0' && c <= '9') d = (uint8_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (uint8_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (uint8_t)(c - 'A' + 10);
+        else return -1;
+        val = (val << 4) | d;
+    }
+    *out = val;
+    return 0;
+}
+
+static void list_devices() {
+    bios_disk_scan();
+    int count = bios_disk_count();
+    if (count <= 0) {
+        print("No BIOS drives detected.\n");
+        return;
+    }
+    print("BIOS drives:\n");
+    for (int i = 0; i < count; i++) {
+        const bios_drive_info_t* d = bios_disk_get(i);
+        if (!d || !d->present) continue;
+        print("  Drive 0x");
+        char buf[16];
+        itoa(d->drive, buf, 16);
+        print(buf);
+        print(" (sector size ");
+        itoa((int)d->sector_size, buf, 10);
+        print(buf);
+        print(")\n");
+    }
+}
+
+static void install_iso_to_drive(uint8_t drive) {
+    unsigned char* iso_start = &_binary_GooberOSx86_iso_start;
+    unsigned char* iso_end = &_binary_GooberOSx86_iso_end;
+    size_t iso_size = (size_t)(iso_end - iso_start);
+    size_t total_sectors = (iso_size + 511) / 512;
+
+    print("Writing ISO to drive 0x");
+    char buf[16];
+    itoa(drive, buf, 16);
+    print(buf);
+    print("... ");
+
+    for (size_t i = 0; i < total_sectors; i++) {
+        const void* src = iso_start + (i * 512);
+        if (bios_write_lba(drive, (uint64_t)i, 1, src) != 0) {
+            print("\ninstall: write failed at LBA ");
+            itoa((int)i, buf, 10);
+            print(buf);
+            print("\n");
+            return;
+        }
+    }
+    print("done\n");
+}
+
 static void execute_command(const char* cmd) {
     if (!cmd) return;
 
@@ -239,7 +325,7 @@ static void execute_command(const char* cmd) {
     }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\n");
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\n");
     } else if (!strcmp_local(cmd, "cls")) {
         clear_screen();
         cursor_row = 0;
@@ -395,6 +481,40 @@ static void execute_command(const char* cmd) {
                 print("\n");
             }
         }
+    } else if (!strcmp_local(cmd, "devices")) {
+        list_devices();
+    } else if (!strncmp_local(cmd, "install ", 8)) {
+        const char* args = cmd + 8;
+        while (*args == ' ') args++;
+        if (*args == '\0') {
+            print("install: drive required (e.g. install 0x80 YES)\n");
+        } else {
+            const char* drive_str = args;
+            while (*args && *args != ' ') args++;
+            char tmp[16] = {0};
+            size_t len = (size_t)(args - drive_str);
+            if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+            for (size_t i = 0; i < len; i++) tmp[i] = drive_str[i];
+            tmp[len] = '\0';
+
+            uint32_t drive_val = 0;
+            int parse_ok = 0;
+            if (tmp[0] == '0' && (tmp[1] == 'x' || tmp[1] == 'X')) {
+                parse_ok = (parse_hex(tmp, &drive_val) == 0);
+            } else {
+                drive_val = (uint32_t)atoi(tmp);
+                parse_ok = 1;
+            }
+
+            while (*args == ' ') args++;
+            if (!parse_ok) {
+                print("install: invalid drive\n");
+            } else if (!(args[0] == 'Y' && args[1] == 'E' && args[2] == 'S' && args[3] == '\0')) {
+                print("install: add YES to confirm (destructive)\n");
+            } else {
+                install_iso_to_drive((uint8_t)drive_val);
+            }
+        }
     } else if (!strncmp_local(cmd, "edit ", 5)) {
         const char* filename = cmd + 5;
         while (*filename == ' ') filename++;
@@ -407,7 +527,7 @@ static void execute_command(const char* cmd) {
             cursor_row = 0;
             cursor_col = 0;
             print("Exited editor\n");
-            vga_set_text_color(DEFAULT_COLOR, VGA_COLOR_BLACK);
+            vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
         }
     } else if (!strcmp_local(cmd, "exit")) {
         print("Rebooting...\n");
@@ -454,7 +574,10 @@ void shell_init() {
 
 void shell_run() {
     char c = keyboard_read_char();
-    if (!c) return;
+    if (!c) {
+        blink_cursor();
+        return;
+    }
 
     if (c == '\r' || c == '\n') {
         restore_prev_cursor_cell();        // <— restore first
@@ -473,54 +596,56 @@ void shell_run() {
             restore_prev_cursor_cell();
             set_input_line(input_buffer);
         }
-    } else if ((unsigned char)c == 0x8B) {
+    } else if ((unsigned char)c == KEY_F1) {
         restore_prev_cursor_cell();       // safety
         run_task_manager();
         print("Exited task manager\n");
         prompt();
-    } else if ((unsigned char)c == 0x80) {
+    } else if ((unsigned char)c == KEY_UP) {
+        // Up arrow: previous history
         if (history_count > 0) {
             if (history_nav_index == 0) {
-                for (size_t i = 0; i < INPUT_BUFFER_SIZE; i++) saved_input[i] = input_buffer[i];
+                strcpy(saved_input, input_buffer);
             }
-            history_nav_index++;
-            if (history_nav_index > history_count) history_nav_index = history_count;
-            int idx = (history_next - history_nav_index + HISTORY_SIZE) % HISTORY_SIZE;
+            history_nav_index = (history_nav_index - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+            strcpy(input_buffer, history[history_nav_index]);
+            input_pos = strlen(input_buffer);
             restore_prev_cursor_cell();
-            set_input_line(history[idx]);
+            set_input_line(input_buffer);
         }
-    } else if ((unsigned char)c == 0x81) {
-        if (history_nav_index > 0) {
-            history_nav_index--;
-            restore_prev_cursor_cell();
-            if (history_nav_index == 0) {
-                set_input_line(saved_input);
+    } else if ((unsigned char)c == KEY_DOWN) {
+        // Down arrow: next history
+        if (history_count > 0) {
+            history_nav_index = (history_nav_index + 1) % HISTORY_SIZE;
+            if (history_nav_index == history_next) {
+                strcpy(input_buffer, saved_input);
             } else {
-                int idx = (history_next - history_nav_index + HISTORY_SIZE) % HISTORY_SIZE;
-                set_input_line(history[idx]);
+                strcpy(input_buffer, history[history_nav_index]);
             }
+            input_pos = strlen(input_buffer);
+            restore_prev_cursor_cell();
+            set_input_line(input_buffer);
         }
-    } else if ((unsigned char)c == 0x82) {
+    } else if ((unsigned char)c == KEY_LEFT) {
+        // Left arrow: move cursor left
         if (input_pos > 0) {
             input_pos--;
             int r, col;
-            if (input_index_to_pos(input_pos, &r, &col) == 0) {
-                restore_prev_cursor_cell();
-                cursor_row = r;
-                cursor_col = col;
-                draw_cursor();
-            }
+            input_index_to_pos(input_pos, &r, &col);
+            restore_prev_cursor_cell();
+            move_cursor(r, col);
+            draw_cursor();
         }
-    } else if ((unsigned char)c == 0x83) {
-        if (input_pos < input_len()) {
+    } else if ((unsigned char)c == KEY_RIGHT) {
+        // Right arrow: move cursor right
+        size_t len = input_len();
+        if (input_pos < len) {
             input_pos++;
             int r, col;
-            if (input_index_to_pos(input_pos, &r, &col) == 0) {
-                restore_prev_cursor_cell();
-                cursor_row = r;
-                cursor_col = col;
-                draw_cursor();
-            }
+            input_index_to_pos(input_pos, &r, &col);
+            restore_prev_cursor_cell();
+            move_cursor(r, col);
+            draw_cursor();
         }
     } else if (input_pos < INPUT_BUFFER_SIZE - 1) {
         size_t len = input_len();

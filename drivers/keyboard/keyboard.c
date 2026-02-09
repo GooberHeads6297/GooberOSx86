@@ -1,6 +1,7 @@
 #include "keyboard.h"
 #include "../io/io.h"
 #include <stddef.h>
+#include "../video/vga.h"
 
 #define BUFFER_SIZE 128
 static char buffer[BUFFER_SIZE];
@@ -44,6 +45,7 @@ void keyboard_init(void) {
 
 void keyboard_interrupt_handler(void) {
     uint8_t scancode = inb(0x60);
+    
 
     if (scancode == 0xE0) {
         extended = 1;
@@ -76,6 +78,10 @@ void keyboard_interrupt_handler(void) {
             }
         } else {
             switch (scancode) {
+                case 0x48: c = 0x80; break; /* Arrow up (non-extended) */
+                case 0x50: c = 0x81; break; /* Arrow down (non-extended) */
+                case 0x4B: c = 0x82; break; /* Arrow left (non-extended) */
+                case 0x4D: c = 0x83; break; /* Arrow right (non-extended) */
                 case 0x3B: c = 0x8B; break; // F1
                 case 0x3C: c = 0x8C; break; // F2
                 case 0x3D: c = 0x8D; break; // F3

@@ -18,6 +18,8 @@
 #define KEY_LEFT    0x82
 #define KEY_RIGHT   0x83
 
+
+
 static char editor_buf[EDITOR_MAX_SIZE];
 static size_t buf_len;
 static size_t cursor;
@@ -174,7 +176,9 @@ static void render(void) {
     int disp_line = (int)cur_line - view_line;
     if (disp_line >= 0 && disp_line < TEXT_ROWS) {
         int y = TEXT_START_ROW + disp_line;
-        vga_set_cursor(y, cur_col < (size_t)COLS ? (int)cur_col : COLS - 1);
+        int x = cur_col < (size_t)COLS ? (int)cur_col : COLS - 1;
+        vga_set_cursor(y, x);
+        vga_put_char_at('_', x, y, VGA_COLOR_WHITE | (VGA_COLOR_BLACK << 4));
     }
 }
 
@@ -266,4 +270,5 @@ void run_editor(const char* filename) {
         render();
         timer_sleep(20);
     }
+    vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK); // Reset text color to light green
 }

@@ -36,5 +36,6 @@ void vga_toggle_cursor(void);
 void vga_put_char_at(char c, int x, int y, unsigned char attr);
 void vga_put_char(char c);
 void vga_set_text_color(unsigned char fg, unsigned char bg);
+void vga_set_default_color(unsigned char color);
 
 #endif

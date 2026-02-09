@@ -88,3 +88,14 @@ void move_cursor(uint8_t row, uint8_t col) {
 void vga_set_text_color(unsigned char fg, unsigned char bg) {
     default_attr = (fg & 0x0F) | ((bg & 0x0F) << 4);
 }
+
+void vga_set_default_color(unsigned char color) {
+    default_attr = color;
+    for (int y = 0; y < VGA_HEIGHT; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            uint16_t current = VIDEO_MEMORY[y * VGA_WIDTH + x];
+            char c = current & 0xFF;
+            VIDEO_MEMORY[y * VGA_WIDTH + x] = ((uint16_t)color << 8) | c;
+        }
+    }
+}
