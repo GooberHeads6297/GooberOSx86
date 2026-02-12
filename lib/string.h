@@ -15,5 +15,7 @@ void print_colored(const char* str, uint8_t fg, uint8_t bg);
 
 int atoi(const char* str);
 char* itoa(int value, char* str, int base);
+void* memcpy(void* dest, const void* src, size_t n);
+void* memset(void* s, int c, size_t n);
 
 #endif

@@ -10,6 +10,7 @@ mkdir -p ${BUILD_DIR}
 nasm -f elf32 boot.s         -o ${BUILD_DIR}/boot.o
 nasm -f elf32 gdt.s          -o ${BUILD_DIR}/gdt.o
 nasm -f elf32 irq1_wrapper.s -o ${BUILD_DIR}/irq1_wrapper.o
+nasm -f elf32 irq12_wrapper.s -o ${BUILD_DIR}/irq12_wrapper.o
 nasm -f elf32 idt_load.s     -o ${BUILD_DIR}/idt_load.o
 nasm -f elf32 isr32_stub.s   -o ${BUILD_DIR}/isr32_stub.o
 nasm -f elf32 drivers/storage/bios_int13.s -o ${BUILD_DIR}/bios_int13.o
@@ -18,17 +19,20 @@ nasm -f elf32 drivers/storage/bios_int13.s -o ${BUILD_DIR}/bios_int13.o
 i686-elf-gcc -ffreestanding -m32 -O0 \
   -I. \
   -Idrivers/keyboard \
+  -Idrivers/mouse \
   -Idrivers/timer \
   -Idrivers/video \
   -Idrivers/io \
   -Ifs \
   -Ishell \
+  -Igui \
   -Itaskmgr \
   -c kernel.c -o ${BUILD_DIR}/kernel.o
 
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c lib/string.c                -o ${BUILD_DIR}/string.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c lib/memory.c                -o ${BUILD_DIR}/memory.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/keyboard/keyboard.c -o ${BUILD_DIR}/keyboard.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/mouse/mouse.c       -o ${BUILD_DIR}/mouse.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/timer/timer.c       -o ${BUILD_DIR}/timer.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/video/vga.c         -o ${BUILD_DIR}/vga.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c fs/filesystem.c             -o ${BUILD_DIR}/filesystem.o
@@ -40,6 +44,7 @@ i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c games/pong.c           
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c games/doom.c                -o ${BUILD_DIR}/doom.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Itaskmgr -c taskmgr/taskmgr.c -o ${BUILD_DIR}/taskmgr.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Itaskmgr -c taskmgr/process.c -o ${BUILD_DIR}/process.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Idrivers/video -Idrivers/mouse -Idrivers/keyboard -Ilib -c gui/window.c -o ${BUILD_DIR}/window.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Idrivers/video -Idrivers/timer -Ifs -c editor/editor.c -o ${BUILD_DIR}/editor.o
 
 # Embed existing ISO image for raw install
@@ -50,10 +55,12 @@ i686-elf-ld -m elf_i386 -T linker.ld -o ${BUILD_DIR}/kernel.bin \
     ${BUILD_DIR}/boot.o \
     ${BUILD_DIR}/gdt.o \
     ${BUILD_DIR}/irq1_wrapper.o \
+    ${BUILD_DIR}/irq12_wrapper.o \
     ${BUILD_DIR}/idt_load.o \
     ${BUILD_DIR}/isr32_stub.o \
     ${BUILD_DIR}/bios_int13.o \
     ${BUILD_DIR}/keyboard.o \
+    ${BUILD_DIR}/mouse.o \
     ${BUILD_DIR}/timer.o \
     ${BUILD_DIR}/vga.o \
     ${BUILD_DIR}/filesystem.o \
@@ -66,6 +73,7 @@ i686-elf-ld -m elf_i386 -T linker.ld -o ${BUILD_DIR}/kernel.bin \
     ${BUILD_DIR}/editor.o \
     ${BUILD_DIR}/taskmgr.o \
     ${BUILD_DIR}/process.o \
+    ${BUILD_DIR}/window.o \
     ${BUILD_DIR}/osimage.o \
     ${BUILD_DIR}/memory.o \
     ${BUILD_DIR}/string.o \

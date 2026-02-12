@@ -99,3 +99,12 @@ void vga_set_default_color(unsigned char color) {
         }
     }
 }
+
+void clear_screen() {
+    for (uint8_t y = 0; y < 25; y++) {
+        for (uint8_t x = 0; x < 80; x++) {
+            vga_put_char_at(' ', x, y, 0x0F);
+        }
+    }
+    vga_set_cursor(0, 0);
+}

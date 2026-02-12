@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include "drivers/timer/timer.h"
 #include "drivers/keyboard/keyboard.h"
+#include "drivers/mouse/mouse.h"
 #include "drivers/io/io.h"
 #include "drivers/video/vga.h"
 #include "taskmgr/process.h"
@@ -47,6 +48,7 @@ static struct IDTPointer idt_ptr;
 
 extern void load_idt(struct IDTPointer*);
 extern void irq1_handler_asm();
+extern void irq12_handler_asm();
 extern void isr32_stub();
 
 static unsigned int update_counter = 0;
@@ -109,18 +111,10 @@ void idt_init() {
     pic_remap();
     set_idt_entry(IRQ0, (uint32_t)irq0_handler_asm, 0x08, 0x8E);
     set_idt_entry(IRQ1, (uint32_t)irq1_handler_asm, 0x08, 0x8E);
+    set_idt_entry(44, (uint32_t)irq12_handler_asm, 0x08, 0x8E);
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (uint32_t)&idt;
     load_idt(&idt_ptr);
-}
-
-void clear_screen() {
-    for (uint8_t y = 0; y < 25; y++) {
-        for (uint8_t x = 0; x < 80; x++) {
-            vga_put_char_at(' ', x, y, 0x0F);
-        }
-    }
-    vga_set_cursor(0, 0);
 }
 
 static void print_char(char c) {
@@ -160,6 +154,7 @@ void kernel_main() {
 
     idt_init();
     timer_init(100);
+    mouse_init();
     fs_init();
 
     // Initialize heap allocator

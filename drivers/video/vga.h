@@ -23,6 +23,9 @@
 #define VGA_COLOR_LIGHT_BROWN   0xE
 #define VGA_COLOR_WHITE         0xF
 
+extern uint16_t* const VIDEO_MEMORY;
+
+void clear_screen(void);
 void move_cursor(uint8_t row, uint8_t col);
 
 int vga_get_cursor_row(void);

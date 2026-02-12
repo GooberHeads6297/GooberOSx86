@@ -12,20 +12,18 @@
 #include "../drivers/video/vga.h"
 #include "../drivers/keyboard/keyboard.h"
 #include "../drivers/timer/timer.h"
+#include "../gui/window.h"
 #include "../drivers/storage/bios_disk.h"
 
 #define PROMPT_COLOR VGA_COLOR_BLUE
-#define DEFAULT_COLOR VGA_COLOR_LIGHT_GREEN
+static uint8_t current_color = VGA_COLOR_LIGHT_GREEN;
 #define SCREEN_COLS 80
 #define SCREEN_ROWS 25
 
-extern void clear_screen();
 extern void print(const char*);
-extern void move_cursor(uint8_t row, uint8_t col);
 extern char keyboard_read_char();
 extern uint8_t cursor_row;
 extern uint8_t cursor_col;
-extern uint16_t* const VIDEO_MEMORY;
 
 extern unsigned char _binary_GooberOSx86_iso_start;
 extern unsigned char _binary_GooberOSx86_iso_end;
@@ -98,7 +96,7 @@ static void ensure_scroll() {
             }
         }
         for (int c = 0; c < SCREEN_COLS; c++) {
-            put_cell(SCREEN_ROWS - 1, c, ' ', DEFAULT_COLOR);
+            put_cell(SCREEN_ROWS - 1, c, ' ', current_color);
         }
         cursor_row--;
         if (prompt_start_row > 0) prompt_start_row--;
@@ -148,7 +146,7 @@ static void print_char_shell(char c) {
         cursor_col = 0;
         ensure_scroll();
     } else {
-        put_cell(cursor_row, cursor_col, c, DEFAULT_COLOR);
+        put_cell(cursor_row, cursor_col, c, current_color);
         if (++cursor_col >= SCREEN_COLS) { cursor_col = 0; cursor_row++; ensure_scroll(); }
     }
     draw_cursor();
@@ -208,7 +206,7 @@ static void set_input_line(const char* text) {
     input_pos = len;
     int r = prompt_start_row, c = prompt_start_col;
     for (size_t i = 0; i < INPUT_BUFFER_SIZE; i++) {
-        put_cell(r, c, (i < len) ? text[i] : ' ', DEFAULT_COLOR);
+        put_cell(r, c, (i < len) ? text[i] : ' ', current_color);
         c++;
         if (c >= SCREEN_COLS) { c = 0; r++; }
     }
@@ -325,7 +323,19 @@ static void execute_command(const char* cmd) {
     }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\n");
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\ngui\ncolor\n");
+    } else if (!strcmp_local(cmd, "gui")) {
+        gui_run();
+        prompt();
+    } else if (!strncmp_local(cmd, "color ", 6)) {
+        const char* args = cmd + 6;
+        uint32_t val;
+        if (parse_hex(args, &val) == 0) {
+            current_color = (uint8_t)val;
+            print("Color changed.\n");
+        } else {
+            print("Usage: color <hex>\nExample: color 0A (Green on Black)\n");
+        }
     } else if (!strcmp_local(cmd, "cls")) {
         clear_screen();
         cursor_row = 0;
@@ -659,7 +669,7 @@ void shell_run() {
             int r = cursor_row, col = cursor_col;
             restore_prev_cursor_cell();
             input_buffer[input_pos++] = c;
-            put_cell(r, col, c, DEFAULT_COLOR);
+            put_cell(r, col, c, current_color);
             cursor_row = r;
             cursor_col = col;
             if (++cursor_col >= SCREEN_COLS) { cursor_col = 0; cursor_row++; ensure_scroll(); }
