@@ -23,6 +23,7 @@
 static char editor_buf[EDITOR_MAX_SIZE];
 static size_t buf_len;
 static size_t cursor;
+static size_t preferred_col;
 static int view_line;
 static int exit_editor;
 static const char* edit_filename;
@@ -111,28 +112,32 @@ static void delete_backward(void) {
 
 static void move_cursor_left(void) {
     if (cursor > 0) cursor--;
+    preferred_col = (size_t)-1;
 }
 
 static void move_cursor_right(void) {
     if (cursor < buf_len) cursor++;
+    preferred_col = (size_t)-1;
 }
 
 static void move_cursor_up(void) {
     size_t cl, cc;
     cursor_to_line_col(cursor, &cl, &cc);
+    if (preferred_col == (size_t)-1) preferred_col = cc;
     if (cl == 0) return;
-    cursor = line_col_to_cursor(cl - 1, cc);
+    cursor = line_col_to_cursor(cl - 1, preferred_col);
 }
 
 static void move_cursor_down(void) {
     size_t cl, cc;
     cursor_to_line_col(cursor, &cl, &cc);
+    if (preferred_col == (size_t)-1) preferred_col = cc;
     size_t line_count = get_line_count();
     if (cl + 1 >= line_count) {
         cursor = buf_len;
         return;
     }
-    cursor = line_col_to_cursor(cl + 1, cc);
+    cursor = line_col_to_cursor(cl + 1, preferred_col);
 }
 
 static void draw_status(const char* extra) {
@@ -235,14 +240,17 @@ static void handle_input(void) {
         }
         if (c == 0x08 || c == 127) {
             delete_backward();
+            preferred_col = (size_t)-1;
             continue;
         }
         if (c == '\n' || c == '\r') {
             insert_char('\n');
+            preferred_col = (size_t)-1;
             continue;
         }
         if (c >= 32 && c < 127) {
             insert_char((char)c);
+            preferred_col = (size_t)-1;
             continue;
         }
     }
@@ -252,6 +260,7 @@ void run_editor(const char* filename) {
     edit_filename = filename;
     buf_len = 0;
     cursor = 0;
+    preferred_col = (size_t)-1;
     view_line = 0;
     exit_editor = 0;
     for (size_t i = 0; i < EDITOR_MAX_SIZE; i++) editor_buf[i] = 0;

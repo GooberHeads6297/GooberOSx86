@@ -48,7 +48,7 @@ static size_t input_pos = 0;
 static char history[HISTORY_SIZE][INPUT_BUFFER_SIZE];
 static int history_next = 0;
 static int history_count = 0;
-static int history_nav_index = 0;
+static int history_nav_offset = -1; // -1 = not browsing history
 static char saved_input[INPUT_BUFFER_SIZE];
 
 static int strcmp_local(const char* s1, const char* s2) {
@@ -198,6 +198,11 @@ static size_t input_len(void) {
     return i;
 }
 
+static int history_index_from_offset(int offset) {
+    // offset 0 = newest entry, offset 1 = previous...
+    return (history_next - 1 - offset + HISTORY_SIZE) % HISTORY_SIZE;
+}
+
 static void set_input_line(const char* text) {
     size_t len = 0;
     while (text[len] && len < INPUT_BUFFER_SIZE - 1) len++;
@@ -319,7 +324,7 @@ static void execute_command(const char* cmd) {
             history_next = (history_next + 1) % HISTORY_SIZE;
             if (history_count < HISTORY_SIZE) history_count++;
         }
-        history_nav_index = 0;
+        history_nav_offset = -1;
     }
 
     if (!strcmp_local(cmd, "help")) {
@@ -612,25 +617,30 @@ void shell_run() {
         print("Exited task manager\n");
         prompt();
     } else if ((unsigned char)c == KEY_UP) {
-        // Up arrow: previous history
+        // Up arrow: older command
         if (history_count > 0) {
-            if (history_nav_index == 0) {
+            if (history_nav_offset < 0) {
                 strcpy(saved_input, input_buffer);
+                history_nav_offset = 0;
+            } else if (history_nav_offset < history_count - 1) {
+                history_nav_offset++;
             }
-            history_nav_index = (history_nav_index - 1 + HISTORY_SIZE) % HISTORY_SIZE;
-            strcpy(input_buffer, history[history_nav_index]);
+
+            int idx = history_index_from_offset(history_nav_offset);
+            strcpy(input_buffer, history[idx]);
             input_pos = strlen(input_buffer);
             restore_prev_cursor_cell();
             set_input_line(input_buffer);
         }
     } else if ((unsigned char)c == KEY_DOWN) {
-        // Down arrow: next history
-        if (history_count > 0) {
-            history_nav_index = (history_nav_index + 1) % HISTORY_SIZE;
-            if (history_nav_index == history_next) {
+        // Down arrow: newer command
+        if (history_count > 0 && history_nav_offset >= 0) {
+            history_nav_offset--;
+            if (history_nav_offset < 0) {
                 strcpy(input_buffer, saved_input);
             } else {
-                strcpy(input_buffer, history[history_nav_index]);
+                int idx = history_index_from_offset(history_nav_offset);
+                strcpy(input_buffer, history[idx]);
             }
             input_pos = strlen(input_buffer);
             restore_prev_cursor_cell();

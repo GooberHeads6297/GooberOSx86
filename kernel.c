@@ -5,6 +5,9 @@
 #include "drivers/mouse/mouse.h"
 #include "drivers/io/io.h"
 #include "drivers/video/vga.h"
+#include "drivers/input/input.h"
+#include "drivers/pci/pci.h"
+#include "drivers/usb/usb.h"
 #include "taskmgr/process.h"
 #include "lib/memory.h"
 
@@ -154,7 +157,10 @@ void kernel_main() {
 
     idt_init();
     timer_init(100);
+    input_init();
     mouse_init();
+    pci_init();
+    usb_init();
     fs_init();
 
     // Initialize heap allocator
@@ -169,6 +175,7 @@ void kernel_main() {
     __asm__ volatile("sti");
 
     while (1) {
+        usb_poll();
         shell_run();
         __asm__("hlt");
     }

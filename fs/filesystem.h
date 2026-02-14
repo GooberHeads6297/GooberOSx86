@@ -43,5 +43,6 @@ int fs_delete_dir(const char* dirname);
 int fs_create_dir(const char* dirname);
 int fs_write(const char* filename, const uint8_t* data, size_t size);
 const char* fs_get_cwd(void);
+const Directory* fs_get_current_dir(void);
 
 #endif

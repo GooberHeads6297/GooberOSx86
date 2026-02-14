@@ -1,6 +1,7 @@
 #include "mouse.h"
 #include "../io/io.h"
 #include "../video/vga.h"
+#include "../input/input.h"
 
 #define MOUSE_PORT_DATA 0x60
 #define MOUSE_PORT_CMD  0x64
@@ -68,6 +69,8 @@ void mouse_init(void) {
     // Enable streaming
     mouse_write(0xF4);
     mouse_read();  // Acknowledge
+
+    input_set_bounds(80, 25);
 }
 
 void mouse_handler_main(void) {
@@ -91,19 +94,16 @@ void mouse_handler_main(void) {
         case 2:
             mouse_byte[2] = data;
             mouse_cycle = 0;
-
-            mouse_buttons = mouse_byte[0] & 0x07;
-            
-            // Update position
-            mouse_x += mouse_byte[1];
-            mouse_y -= mouse_byte[2]; // Y is inverted in PS/2
-
-            // Clamp to screen
-            if (mouse_x < 0) mouse_x = 0;
-            if (mouse_x >= 80) mouse_x = 79;
-            if (mouse_y < 0) mouse_y = 0;
-            if (mouse_y >= 25) mouse_y = 24;
-            
+            mouse_buttons = (uint8_t)(mouse_byte[0] & 0x07);
+            input_report_pointer_delta(
+                INPUT_DEVICE_PS2_MOUSE,
+                mouse_byte[1],
+                (int)(-mouse_byte[2]),
+                mouse_buttons,
+                0);
+            mouse_x = input_get_pointer_x();
+            mouse_y = input_get_pointer_y();
+            mouse_buttons = input_get_pointer_buttons();
             break;
     }
 }

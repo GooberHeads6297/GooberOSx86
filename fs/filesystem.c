@@ -363,3 +363,7 @@ const char* fs_get_cwd(void) {
     }
     return path;
 }
+
+const Directory* fs_get_current_dir(void) {
+    return current_dir;
+}

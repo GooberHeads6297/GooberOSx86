@@ -35,6 +35,13 @@ i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/keyboard/keyboa
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/mouse/mouse.c       -o ${BUILD_DIR}/mouse.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/timer/timer.c       -o ${BUILD_DIR}/timer.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/video/vga.c         -o ${BUILD_DIR}/vga.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/input/input.c       -o ${BUILD_DIR}/input.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Ilib -c drivers/pci/pci.c     -o ${BUILD_DIR}/pci.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Idrivers/input -c drivers/usb/hid/hid.c -o ${BUILD_DIR}/usb_hid.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Idrivers/pci -c drivers/usb/host/uhci.c -o ${BUILD_DIR}/usb_uhci.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Idrivers/pci -c drivers/usb/host/host.c -o ${BUILD_DIR}/usb_host.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Idrivers/usb -c drivers/usb/core/enumeration.c -o ${BUILD_DIR}/usb_enum.o
+i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Idrivers/usb -c drivers/usb/usb.c -o ${BUILD_DIR}/usb.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c fs/filesystem.c             -o ${BUILD_DIR}/filesystem.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -Itaskmgr -c shell/shell.c     -o ${BUILD_DIR}/shell.o
 i686-elf-gcc -ffreestanding -m32 -O0 -I. -Idrivers/io -c drivers/storage/bios_disk.c -o ${BUILD_DIR}/bios_disk.o
@@ -63,6 +70,13 @@ i686-elf-ld -m elf_i386 -T linker.ld -o ${BUILD_DIR}/kernel.bin \
     ${BUILD_DIR}/mouse.o \
     ${BUILD_DIR}/timer.o \
     ${BUILD_DIR}/vga.o \
+    ${BUILD_DIR}/input.o \
+    ${BUILD_DIR}/pci.o \
+    ${BUILD_DIR}/usb_hid.o \
+    ${BUILD_DIR}/usb_uhci.o \
+    ${BUILD_DIR}/usb_host.o \
+    ${BUILD_DIR}/usb_enum.o \
+    ${BUILD_DIR}/usb.o \
     ${BUILD_DIR}/filesystem.o \
     ${BUILD_DIR}/shell.o \
     ${BUILD_DIR}/bios_disk.o \
