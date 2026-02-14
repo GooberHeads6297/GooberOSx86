@@ -27,24 +27,17 @@ typedef struct {
     char input[TERM_LINE_LEN];
     int input_len;
     int input_cursor;
-    char history[16][TERM_LINE_LEN];
-    int history_count;
-    int history_next;
-    int history_nav_offset; // -1 when not browsing history
-    char saved_input[TERM_LINE_LEN];
 } app_terminal_state_t;
 
 #define NOTE_MAX_TEXT 2048
 typedef struct {
     char text[NOTE_MAX_TEXT];
     int len;
+    int cursor;
+    int preferred_col;
     int scroll_row;
     int dirty;
     char filename[32];
-    int cursor_pos;
-    int preferred_col;
-    uint32_t blink_tick;
-    int cursor_visible;
 } app_notepad_state_t;
 
 typedef struct {
@@ -69,7 +62,6 @@ typedef struct {
 
 typedef struct {
     int selected;
-    int scroll_top;
 } app_explorer_state_t;
 
 typedef enum {
@@ -116,8 +108,6 @@ static const char* launcher_labels[LAUNCH_COUNT] = {
 };
 
 static Window* launch_app(launcher_item_t item, const char* arg);
-static void bring_to_front(Window* win);
-static void set_focused_window(Window* win);
 
 static int min_int(int a, int b) { return (a < b) ? a : b; }
 static int max_int(int a, int b) { return (a > b) ? a : b; }
@@ -142,22 +132,6 @@ static Window* top_active_window(void) {
         if (win->active) return win;
     }
     return NULL;
-}
-
-static void focus_cycle_next(void) {
-    if (z_count <= 0) return;
-    if (!focused_window) {
-        set_focused_window(&windows[z_order[z_count - 1]]);
-        return;
-    }
-    for (int z = 0; z < z_count; z++) {
-        if (&windows[z_order[z]] == focused_window) {
-            int next = (z + 1) % z_count;
-            set_focused_window(&windows[z_order[next]]);
-            bring_to_front(&windows[z_order[next]]);
-            return;
-        }
-    }
 }
 
 static int point_in_window_frame(const Window* win, int x, int y) {
@@ -293,87 +267,80 @@ static void parse_two_args(const char* in, char* a, int a_len, char* b, int b_le
     b[k] = '\0';
 }
 
-static void term_insert_char(app_terminal_state_t* state, char ch) {
-    if (!state || state->input_len >= TERM_LINE_LEN - 1) return;
-    for (int i = state->input_len; i > state->input_cursor; i--) {
-        state->input[i] = state->input[i - 1];
+static void notepad_advance_pos(char ch, int width, int* row, int* col) {
+    if (ch == '\n') {
+        (*row)++;
+        *col = 0;
+        return;
     }
-    state->input[state->input_cursor] = ch;
-    state->input_len++;
-    state->input_cursor++;
-    state->input[state->input_len] = '\0';
-}
-
-static void term_backspace_char(app_terminal_state_t* state) {
-    if (!state || state->input_cursor <= 0 || state->input_len <= 0) return;
-    for (int i = state->input_cursor - 1; i < state->input_len; i++) {
-        state->input[i] = state->input[i + 1];
+    if (*col >= width) {
+        (*row)++;
+        *col = 0;
     }
-    state->input_len--;
-    state->input_cursor--;
+    (*col)++;
 }
 
-static void term_add_history(app_terminal_state_t* state, const char* cmd) {
-    if (!state || !cmd || cmd[0] == '\0') return;
-    strncpy(state->history[state->history_next], cmd, TERM_LINE_LEN - 1);
-    state->history[state->history_next][TERM_LINE_LEN - 1] = '\0';
-    state->history_next = (state->history_next + 1) % 16;
-    if (state->history_count < 16) state->history_count++;
+static void notepad_cursor_to_row_col(const app_notepad_state_t* note, int width, int* out_row, int* out_col) {
+    int row = 0, col = 0;
+    int stop;
+    if (!note || width <= 0 || !out_row || !out_col) return;
+    stop = note->cursor;
+    if (stop < 0) stop = 0;
+    if (stop > note->len) stop = note->len;
+    for (int i = 0; i < stop; i++) notepad_advance_pos(note->text[i], width, &row, &col);
+    *out_row = row;
+    *out_col = col;
 }
 
-static int term_history_index_from_offset(const app_terminal_state_t* state, int offset) {
-    return (state->history_next - 1 - offset + 16) % 16;
-}
-
-static void shell_ls_into_lines(app_terminal_state_t* state) {
-    const Directory* dir = fs_get_current_dir();
-    if (!state || !dir) return;
-    for (size_t i = 0; i < dir->child_count; i++) {
-        char line[TERM_LINE_LEN];
-        line[0] = '\0';
-        append_limited(line, "<DIR> ", TERM_LINE_LEN);
-        append_limited(line, dir->children[i].name, TERM_LINE_LEN);
-        gui_shell_push_line(state, line);
-    }
-    for (size_t i = 0; i < dir->file_count; i++) {
-        gui_shell_push_line(state, dir->files[i].name);
-    }
-}
-
-static int notepad_line_col_to_cursor(const app_notepad_state_t* note, int target_row, int target_col) {
-    int row = 0;
-    int col = 0;
-    int i = 0;
-    if (!note) return 0;
-    while (i < note->len) {
-        if (row == target_row && col == target_col) return i;
-        if (note->text[i] == '\n') {
-            row++;
-            col = 0;
-            if (row > target_row) return i;
-            i++;
-            continue;
+static int notepad_row_col_to_cursor(const app_notepad_state_t* note, int width, int target_row, int target_col) {
+    int row = 0, col = 0;
+    if (!note || width <= 0) return 0;
+    if (target_row < 0) target_row = 0;
+    if (target_col < 0) target_col = 0;
+    for (int i = 0; i <= note->len; i++) {
+        if (row == target_row && col >= target_col) return i;
+        if (i == note->len) return note->len;
+        {
+            int prev_row = row;
+            notepad_advance_pos(note->text[i], width, &row, &col);
+            if (prev_row == target_row && row > prev_row) return i;
         }
-        col++;
-        i++;
     }
     return note->len;
 }
 
-static void notepad_cursor_to_line_col(const app_notepad_state_t* note, int cursor, int* out_row, int* out_col) {
-    int row = 0;
-    int col = 0;
-    if (!note) { *out_row = 0; *out_col = 0; return; }
-    for (int i = 0; i < cursor && i < note->len; i++) {
-        if (note->text[i] == '\n') {
-            row++;
-            col = 0;
-        } else {
-            col++;
-        }
-    }
-    *out_row = row;
-    *out_col = col;
+static void notepad_ensure_cursor_visible(Window* win, app_notepad_state_t* note) {
+    int cursor_row, cursor_col;
+    int rows_visible;
+    int text_w;
+    if (!win || !note) return;
+    text_w = max_int(1, win->width);
+    rows_visible = max_int(1, win->height - 1);
+    notepad_cursor_to_row_col(note, text_w, &cursor_row, &cursor_col);
+    (void)cursor_col;
+    if (cursor_row < note->scroll_row) note->scroll_row = cursor_row;
+    if (cursor_row >= note->scroll_row + rows_visible) note->scroll_row = cursor_row - rows_visible + 1;
+    if (note->scroll_row < 0) note->scroll_row = 0;
+}
+
+static void notepad_insert_at_cursor(app_notepad_state_t* note, char key) {
+    if (!note || note->len >= NOTE_MAX_TEXT - 1) return;
+    if (note->cursor < 0) note->cursor = 0;
+    if (note->cursor > note->len) note->cursor = note->len;
+    for (int i = note->len; i >= note->cursor; i--) note->text[i + 1] = note->text[i];
+    note->text[note->cursor] = key;
+    note->len++;
+    note->cursor++;
+    note->dirty = 1;
+}
+
+static void notepad_backspace_at_cursor(app_notepad_state_t* note) {
+    if (!note || note->cursor <= 0 || note->len <= 0) return;
+    if (note->cursor > note->len) note->cursor = note->len;
+    for (int i = note->cursor - 1; i < note->len; i++) note->text[i] = note->text[i + 1];
+    note->len--;
+    note->cursor--;
+    note->dirty = 1;
 }
 
 static void notepad_load_file(app_notepad_state_t* note, const char* filename) {
@@ -381,6 +348,8 @@ static void notepad_load_file(app_notepad_state_t* note, const char* filename) {
     uint8_t buf[128];
     size_t n;
     note->len = 0;
+    note->cursor = 0;
+    note->preferred_col = -1;
     note->text[0] = '\0';
     if (!filename || filename[0] == '\0') return;
     strncpy(note->filename, filename, 31);
@@ -391,6 +360,7 @@ static void notepad_load_file(app_notepad_state_t* note, const char* filename) {
         for (size_t i = 0; i < n && note->len < NOTE_MAX_TEXT - 1; i++) note->text[note->len++] = (char)buf[i];
     }
     note->text[note->len] = '\0';
+    note->cursor = note->len;
     fs_close(fh);
 }
 
@@ -619,28 +589,19 @@ static void app_explorer_tick(Window* win, uint32_t ticks) {
     app_explorer_state_t* state = (app_explorer_state_t*)win->app_state;
     int total;
     int row = 1;
-    int visible_rows = max_int(1, win->height - 2);
     (void)ticks;
     if (!state || !dir) return;
 
     total = explorer_total_entries(dir);
     if (state->selected < 0) state->selected = 0;
     if (state->selected >= total && total > 0) state->selected = total - 1;
-    if (state->scroll_top < 0) state->scroll_top = 0;
-    if (state->selected < state->scroll_top) state->scroll_top = state->selected;
-    if (state->selected >= state->scroll_top + visible_rows) {
-        state->scroll_top = state->selected - visible_rows + 1;
-    }
-    if (state->scroll_top > max_int(0, total - visible_rows)) {
-        state->scroll_top = max_int(0, total - visible_rows);
-    }
 
     // TempleOS-inspired compact contrast: dark blue background + bright text.
     gui_clear_window(win, VGA_COLOR_WHITE | (VGA_COLOR_BLUE << 4));
     gui_draw_text(win, 0, 0, "DIR ", VGA_COLOR_LIGHT_CYAN | (VGA_COLOR_BLUE << 4));
     gui_draw_text(win, 4, 0, fs_get_cwd(), VGA_COLOR_WHITE | (VGA_COLOR_BLUE << 4));
 
-    for (int i = state->scroll_top; i < total && row < win->height - 1; i++, row++) {
+    for (int i = 0; i < total && row < win->height; i++, row++) {
         char line[64];
         const char* name = explorer_entry_name(dir, i);
         int is_dir = explorer_is_dir_entry(dir, i);
@@ -702,7 +663,6 @@ static void app_shell_execute(Window* shell_win, app_terminal_state_t* state) {
     strncpy(cmd, state->input, TERM_LINE_LEN - 1);
     cmd[TERM_LINE_LEN - 1] = '\0';
     if (strlen(cmd) > 0) {
-        term_add_history(state, cmd);
         strcpy(line, "> ");
         append_limited(line, cmd, TERM_LINE_LEN);
         gui_shell_push_line(state, line);
@@ -762,14 +722,13 @@ static void app_shell_execute(Window* shell_win, app_terminal_state_t* state) {
     } else if (strcmp(cmd, "explorer") == 0) {
         launch_app(LAUNCH_EXPLORER, NULL);
     } else if (strcmp(cmd, "ls") == 0) {
-        shell_ls_into_lines(state);
+        gui_shell_push_line(state, "ls unavailable in window shell (use shell mode)");
     } else if (strlen(cmd) > 0) {
         gui_shell_push_line(state, "Unknown command");
     }
     state->input_len = 0;
     state->input_cursor = 0;
     state->input[0] = '\0';
-    state->history_nav_offset = -1;
     gui_shell_scroll_to_bottom(state, view_h);
 }
 
@@ -796,23 +755,21 @@ static void app_shell_tick(Window* win, uint32_t ticks) {
 
     {
         char prompt[TERM_LINE_LEN];
+        int prompt_w = min_int(text_w, TERM_LINE_LEN - 1);
         int cursor_col;
-        int input_max = TERM_LINE_LEN - 4;
-        strcpy(prompt, "> ");
-        append_limited(prompt, state->input, TERM_LINE_LEN);
-        prompt[min_int(text_w, TERM_LINE_LEN - 1)] = '\0';
-
         if (state->input_cursor < 0) state->input_cursor = 0;
         if (state->input_cursor > state->input_len) state->input_cursor = state->input_len;
-        cursor_col = 2 + state->input_cursor;
-        if (cursor_col >= input_max) cursor_col = input_max;
-        if ((int)strlen(prompt) >= input_max) prompt[input_max] = '\0';
-        if ((int)strlen(prompt) <= cursor_col) {
-            int plen = (int)strlen(prompt);
-            while (plen <= cursor_col && plen < TERM_LINE_LEN - 1) prompt[plen++] = ' ';
-            prompt[min_int(plen, TERM_LINE_LEN - 1)] = '\0';
+        for (int i = 0; i < prompt_w; i++) prompt[i] = ' ';
+        prompt[prompt_w] = '\0';
+        if (prompt_w > 0) prompt[0] = '>';
+        if (prompt_w > 1) prompt[1] = ' ';
+        for (int i = 0; i < state->input_len && (i + 2) < prompt_w; i++) prompt[i + 2] = state->input[i];
+        if (prompt_w > 0) {
+            cursor_col = state->input_cursor + 2;
+            if (cursor_col < 0) cursor_col = 0;
+            if (cursor_col >= prompt_w) cursor_col = prompt_w - 1;
+            prompt[cursor_col] = '_';
         }
-        prompt[cursor_col] = '_';
         gui_draw_text(win, 0, win->height - 1, prompt, VGA_COLOR_WHITE | (VGA_COLOR_BLACK << 4));
     }
 
@@ -838,8 +795,16 @@ static void app_shell_tick(Window* win, uint32_t ticks) {
 static void app_shell_key(Window* win, char key) {
     app_terminal_state_t* state = (app_terminal_state_t*)win->app_state;
     if (!state) return;
+    if (state->input_cursor < 0) state->input_cursor = 0;
+    if (state->input_cursor > state->input_len) state->input_cursor = state->input_len;
     if ((unsigned char)key == KEY_BACKSPACE || (unsigned char)key == 127) {
-        term_backspace_char(state);
+        if (state->input_cursor > 0 && state->input_len > 0) {
+            for (int i = state->input_cursor - 1; i < state->input_len; i++) {
+                state->input[i] = state->input[i + 1];
+            }
+            state->input_len--;
+            state->input_cursor--;
+        }
         return;
     }
     if ((unsigned char)key == KEY_LEFT) {
@@ -850,91 +815,72 @@ static void app_shell_key(Window* win, char key) {
         if (state->input_cursor < state->input_len) state->input_cursor++;
         return;
     }
-    if ((unsigned char)key == KEY_UP) {
-        if (state->history_count > 0) {
-            if (state->history_nav_offset < 0) {
-                strcpy(state->saved_input, state->input);
-                state->history_nav_offset = 0;
-            } else if (state->history_nav_offset < state->history_count - 1) {
-                state->history_nav_offset++;
-            }
-            int idx = term_history_index_from_offset(state, state->history_nav_offset);
-            strcpy(state->input, state->history[idx]);
-            state->input_len = (int)strlen(state->input);
-            state->input_cursor = state->input_len;
-        }
-        return;
-    }
-    if ((unsigned char)key == KEY_DOWN) {
-        if (state->history_count > 0 && state->history_nav_offset >= 0) {
-            state->history_nav_offset--;
-            if (state->history_nav_offset < 0) {
-                strcpy(state->input, state->saved_input);
-            } else {
-                int idx = term_history_index_from_offset(state, state->history_nav_offset);
-                strcpy(state->input, state->history[idx]);
-            }
-            state->input_len = (int)strlen(state->input);
-            state->input_cursor = state->input_len;
-        }
-        return;
-    }
+    if ((unsigned char)key == KEY_UP) { state->scroll_top = max_int(0, state->scroll_top - 1); return; }
+    if ((unsigned char)key == KEY_DOWN) { state->scroll_top++; return; }
     if (key == '\r' || key == '\n') { app_shell_execute(win, state); return; }
     if ((unsigned char)key < 32 || (unsigned char)key > 126) return;
-    term_insert_char(state, key);
+    if (state->input_len < TERM_LINE_LEN - 1) {
+        for (int i = state->input_len; i >= state->input_cursor; i--) {
+            state->input[i + 1] = state->input[i];
+        }
+        state->input[state->input_cursor] = key;
+        state->input_len++;
+        state->input_cursor++;
+    }
 }
 
 static void app_notepad_tick(Window* win, uint32_t ticks) {
     app_notepad_state_t* note = (app_notepad_state_t*)win->app_state;
-    int row = 0, col = 0, visual_row = 0;
-    int cursor_row = 0, cursor_col = 0;
-    int status_row = win->height - 1;
+    int row = 0, col = 0;
+    int text_h = max_int(1, win->height - 1);
+    int text_w = max_int(1, win->width);
+    int cursor_visual_row = -1, cursor_visual_col = 0;
+    (void)ticks;
     if (!note) return;
-
-    if (ticks - note->blink_tick >= 20) {
-        note->blink_tick = ticks;
-        note->cursor_visible = !note->cursor_visible;
-    }
-
-    notepad_cursor_to_line_col(note, note->cursor_pos, &cursor_row, &cursor_col);
-    if (cursor_row < note->scroll_row) note->scroll_row = cursor_row;
-    if (cursor_row >= note->scroll_row + status_row) {
-        note->scroll_row = cursor_row - status_row + 1;
-    }
-    if (note->scroll_row < 0) note->scroll_row = 0;
+    if (note->cursor < 0) note->cursor = 0;
+    if (note->cursor > note->len) note->cursor = note->len;
+    notepad_ensure_cursor_visible(win, note);
 
     gui_clear_window(win, VGA_COLOR_WHITE | (VGA_COLOR_BLACK << 4));
-    for (int i = 0; i < note->len && visual_row < win->height - 1; i++) {
-        char ch = note->text[i];
-        if (row < note->scroll_row) {
-            if (ch == '\n') { row++; col = 0; }
-            else {
+    for (int i = 0; i <= note->len; i++) {
+        int visual_row = row - note->scroll_row;
+        if (i == note->cursor && visual_row >= 0 && visual_row < text_h) {
+            cursor_visual_row = visual_row;
+            cursor_visual_col = min_int(col, text_w - 1);
+        }
+        if (i == note->len) break;
+
+        {
+            char ch = note->text[i];
+            if (row >= note->scroll_row) {
+                if (ch == '\n') {
+                    row++;
+                    col = 0;
+                    if (row - note->scroll_row >= text_h) break;
+                    continue;
+                }
+                if (col >= text_w) {
+                    row++;
+                    col = 0;
+                    if (row - note->scroll_row >= text_h) break;
+                }
+                if (row - note->scroll_row >= 0 && row - note->scroll_row < text_h) {
+                    int idx = (row - note->scroll_row) * win->width + col;
+                    if (idx >= 0 && idx < win->buffer_cells) {
+                        win->buffer[idx] = ((VGA_COLOR_WHITE | (VGA_COLOR_BLACK << 4)) << 8) | ch;
+                    }
+                }
                 col++;
-                if (col >= win->width) { row++; col = 0; }
+            } else {
+                notepad_advance_pos(ch, text_w, &row, &col);
             }
-            continue;
-        }
-        if (ch == '\n' || col >= win->width) {
-            visual_row++; col = 0;
-            if (ch == '\n') continue;
-        }
-        if (visual_row < win->height - 1 && col < win->width) {
-            int idx = visual_row * win->width + col;
-            if (idx >= 0 && idx < win->buffer_cells) {
-                win->buffer[idx] = ((VGA_COLOR_WHITE | (VGA_COLOR_BLACK << 4)) << 8) | ch;
-            }
-            col++;
         }
     }
 
-    if (note->cursor_visible) {
-        int draw_row = cursor_row - note->scroll_row;
-        int draw_col = cursor_col;
-        if (draw_row >= 0 && draw_row < status_row && draw_col >= 0 && draw_col < win->width) {
-            int idx = draw_row * win->width + draw_col;
-            if (idx >= 0 && idx < win->buffer_cells) {
-                win->buffer[idx] = ((VGA_COLOR_BLACK | (VGA_COLOR_LIGHT_GREY << 4)) << 8) | '_';
-            }
+    if (cursor_visual_row >= 0 && cursor_visual_row < text_h) {
+        int idx = cursor_visual_row * win->width + cursor_visual_col;
+        if (idx >= 0 && idx < win->buffer_cells) {
+            win->buffer[idx] = ((VGA_COLOR_BLACK | (VGA_COLOR_LIGHT_CYAN << 4)) << 8) | '_';
         }
     }
 
@@ -950,65 +896,45 @@ static void app_notepad_tick(Window* win, uint32_t ticks) {
 
 static void app_notepad_key(Window* win, char key) {
     app_notepad_state_t* note = (app_notepad_state_t*)win->app_state;
-    int row, col, max_row;
     if (!note) return;
     if ((unsigned char)key == KEY_F2) { notepad_save_file(note); return; }
+    if (note->cursor < 0) note->cursor = 0;
+    if (note->cursor > note->len) note->cursor = note->len;
     if ((unsigned char)key == KEY_LEFT) {
-        if (note->cursor_pos > 0) note->cursor_pos--;
+        if (note->cursor > 0) note->cursor--;
         note->preferred_col = -1;
-        note->cursor_visible = 1;
+        notepad_ensure_cursor_visible(win, note);
         return;
     }
     if ((unsigned char)key == KEY_RIGHT) {
-        if (note->cursor_pos < note->len) note->cursor_pos++;
+        if (note->cursor < note->len) note->cursor++;
         note->preferred_col = -1;
-        note->cursor_visible = 1;
+        notepad_ensure_cursor_visible(win, note);
         return;
     }
-    if ((unsigned char)key == KEY_UP) {
-        notepad_cursor_to_line_col(note, note->cursor_pos, &row, &col);
+    if ((unsigned char)key == KEY_UP || (unsigned char)key == KEY_DOWN) {
+        int row, col;
+        int target_row;
+        int text_w = max_int(1, win->width);
+        notepad_cursor_to_row_col(note, text_w, &row, &col);
         if (note->preferred_col < 0) note->preferred_col = col;
-        if (row > 0) note->cursor_pos = notepad_line_col_to_cursor(note, row - 1, note->preferred_col);
-        note->cursor_visible = 1;
-        return;
-    }
-    if ((unsigned char)key == KEY_DOWN) {
-        notepad_cursor_to_line_col(note, note->cursor_pos, &row, &col);
-        if (note->preferred_col < 0) note->preferred_col = col;
-        max_row = row;
-        for (int i = note->cursor_pos; i < note->len; i++) {
-            if (note->text[i] == '\n') { max_row++; break; }
-        }
-        note->cursor_pos = notepad_line_col_to_cursor(note, max_row, note->preferred_col);
-        note->cursor_visible = 1;
+        target_row = row + (((unsigned char)key == KEY_UP) ? -1 : 1);
+        if (target_row < 0) target_row = 0;
+        note->cursor = notepad_row_col_to_cursor(note, text_w, target_row, note->preferred_col);
+        notepad_ensure_cursor_visible(win, note);
         return;
     }
     if ((unsigned char)key == KEY_BACKSPACE || (unsigned char)key == 127) {
-        if (note->cursor_pos > 0 && note->len > 0) {
-            for (int i = note->cursor_pos - 1; i < note->len; i++) {
-                note->text[i] = note->text[i + 1];
-            }
-            note->len--;
-            note->cursor_pos--;
-            note->dirty = 1;
-        }
+        notepad_backspace_at_cursor(note);
         note->preferred_col = -1;
-        note->cursor_visible = 1;
+        notepad_ensure_cursor_visible(win, note);
         return;
     }
     if (key == '\r') key = '\n';
     if ((unsigned char)key < 32 && key != '\n') return;
-    if (note->len < NOTE_MAX_TEXT - 1) {
-        for (int i = note->len; i > note->cursor_pos; i--) {
-            note->text[i] = note->text[i - 1];
-        }
-        note->text[note->cursor_pos++] = key;
-        note->len++;
-        note->text[note->len] = '\0';
-        note->dirty = 1;
-        note->preferred_col = -1;
-        note->cursor_visible = 1;
-    }
+    notepad_insert_at_cursor(note, key);
+    note->preferred_col = -1;
+    notepad_ensure_cursor_visible(win, note);
 }
 
 void gui_init(void) {
@@ -1268,7 +1194,6 @@ static Window* launch_app(launcher_item_t item, const char* arg) {
             app_terminal_state_t* s = (app_terminal_state_t*)kmalloc(sizeof(app_terminal_state_t));
             if (s) {
                 memset(s, 0, sizeof(*s));
-                s->history_nav_offset = -1;
                 gui_shell_push_line(s, "GooberOS GUI shell (FS-backed)");
                 gui_shell_push_line(s, "Type 'help' for commands.");
                 win->app_state = s;
@@ -1284,14 +1209,13 @@ static Window* launch_app(launcher_item_t item, const char* arg) {
             if (s) {
                 memset(s, 0, sizeof(*s));
                 s->preferred_col = -1;
-                s->cursor_visible = 1;
                 if (arg && arg[0]) {
                     notepad_load_file(s, arg);
                 } else {
                     strcpy(s->text, "Window editor ready...");
                     s->len = (int)strlen(s->text);
+                    s->cursor = s->len;
                 }
-                s->cursor_pos = s->len;
                 win->app_state = s;
                 win->app_type = GUI_APP_NOTEPAD;
                 win->on_tick = app_notepad_tick;
@@ -1362,25 +1286,8 @@ void gui_run(void) {
         uint32_t ticks = timer_ticks();
         if (keyboard_has_char()) {
             char c = keyboard_read_char();
-            int ctrl = keyboard_is_ctrl_active();
-            if (c == KEY_ESC) {
-                gui_running = 0;
-            } else if (ctrl && (c == 'q' || c == 'Q')) {
-                gui_running = 0;
-            } else if (ctrl && (c == 'w' || c == 'W')) {
-                if (focused_window) {
-                    gui_close_window(focused_window);
-                    set_focused_window(top_active_window());
-                }
-            } else if (ctrl && (c == 'm' || c == 'M')) {
-                if (focused_window) toggle_window_maximize(focused_window);
-            } else if (ctrl && (c == 'e' || c == 'E')) {
-                start_menu_open = !start_menu_open;
-            } else if (c == '\t') {
-                focus_cycle_next();
-            } else if (focused_window && focused_window->on_key) {
-                focused_window->on_key(focused_window, c);
-            }
+            if (c == KEY_ESC) gui_running = 0;
+            else if (focused_window && focused_window->on_key) focused_window->on_key(focused_window, c);
         }
 
         input_event_t event;

@@ -57,7 +57,6 @@ void keyboard_interrupt_handler(void) {
 
     if (scancode == 0xE0) {
         extended = 1;
-        outb(0x20, 0x20); // EOI
         return;
     }
 
@@ -118,7 +117,6 @@ void keyboard_interrupt_handler(void) {
     }
 
     extended = 0;
-    outb(0x20, 0x20); // EOI
 }
 
 int keyboard_has_char(void) {

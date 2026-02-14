@@ -25,8 +25,14 @@ extern char keyboard_read_char();
 extern uint8_t cursor_row;
 extern uint8_t cursor_col;
 
+#ifndef EMBED_INSTALL_ISO
+#define EMBED_INSTALL_ISO 0
+#endif
+
+#if EMBED_INSTALL_ISO
 extern unsigned char _binary_GooberOSx86_iso_start;
 extern unsigned char _binary_GooberOSx86_iso_end;
+#endif
 
 extern FileHandle* fs_open(const char* filename);
 extern size_t fs_read(FileHandle* fh, uint8_t* buffer, size_t bytes);
@@ -278,6 +284,7 @@ static void list_devices() {
 }
 
 static void install_iso_to_drive(uint8_t drive) {
+#if EMBED_INSTALL_ISO
     unsigned char* iso_start = &_binary_GooberOSx86_iso_start;
     unsigned char* iso_end = &_binary_GooberOSx86_iso_end;
     size_t iso_size = (size_t)(iso_end - iso_start);
@@ -300,6 +307,11 @@ static void install_iso_to_drive(uint8_t drive) {
         }
     }
     print("done\n");
+#else
+    (void)drive;
+    print("install: embedded ISO not present in this build.\n");
+    print("Rebuild with EMBED_INSTALL_ISO=1 to enable raw install.\n");
+#endif
 }
 
 static void execute_command(const char* cmd) {
@@ -328,7 +340,7 @@ static void execute_command(const char* cmd) {
     }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\ngui\ncolor\n");
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall (optional embed)\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\ngui\ncolor\n");
     } else if (!strcmp_local(cmd, "gui")) {
         gui_run();
         prompt();

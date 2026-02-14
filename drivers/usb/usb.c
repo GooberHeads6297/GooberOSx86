@@ -16,7 +16,6 @@ void usb_init(void) {
     usb_enumerate_devices();
 
     if (usb_hid_has_pointer_device()) {
-        input_set_usb_pointer_active(1);
         print("USB HID pointer ready.\n");
     } else {
         input_set_usb_pointer_active(0);
@@ -29,6 +28,11 @@ void usb_init(void) {
 void usb_poll(void) {
     if (!usb_initialized) return;
     usb_host_poll();
+    if (!usb_host_is_healthy() && usb_hid_has_pointer_device()) {
+        usb_hid_register_boot_pointer(0, 0);
+        input_set_usb_pointer_active(0);
+        print("USB poll: pointer soft-disabled, PS/2 fallback active.\n");
+    }
 }
 
 int usb_has_pointer_device(void) {

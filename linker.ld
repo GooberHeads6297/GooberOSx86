@@ -6,7 +6,7 @@ SECTIONS {
     _kernel_start = .;
 
     .text : {
-        *(.multiboot)
+        KEEP(*(.multiboot))
         *(.text*)
     }
 

@@ -105,8 +105,6 @@ __attribute__((naked)) void irq0_handler_asm() {
 }
 
 void irq1_handler_main() {
-    volatile uint8_t scancode = inb(0x60);
-    (void)scancode;
     keyboard_interrupt_handler();
 }
 

@@ -2,16 +2,11 @@
 #define KEYBOARD_H
 
 #include <stdint.h>
-#include <stdbool.h>
 
 void keyboard_init(void);
 void keyboard_interrupt_handler(void);
 char keyboard_read_char(void);
 int keyboard_has_char(void);
-bool keyboard_is_pressed(uint8_t scancode);
-bool keyboard_is_shift_active(void);
-bool keyboard_is_ctrl_active(void);
-bool keyboard_is_alt_active(void);
 
 /* Key codes produced by the keyboard driver */
 #define KEY_ESC     0x1B
