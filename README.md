@@ -9,8 +9,8 @@ ________________________________
 ### Built-in Task Manager 
 (At the moment not neccesary becasue the only thing runnnig is the Kernel itself.)
 
-<img width="858" height="411" alt="imageselect" src="https://github.com/user-attachments/assets/6dcc429d-36e9-4d9f-9652-5c11f3f8782a" />
 
+<img width="3840" height="2160" alt="TaskManagerUpdate" src="https://github.com/user-attachments/assets/7856bcc9-8228-492b-a3ce-ba765fc7cafb" />
 
 ________________________________
 
@@ -26,6 +26,19 @@ ________________________________
 <img width="835" height="354" alt="ImageEditor" src="https://github.com/user-attachments/assets/e8d2dc58-3b94-4217-b09f-59b8ca868698" />
 
 ________________________________
+
+### Built-in Display Manager using VGA + File Explorer
+
+<img width="3840" height="2160" alt="screenExplorer" src="https://github.com/user-attachments/assets/0c9d12ea-2870-4c57-aace-c748b706aaa0" />
+
+________________________________
+
+### Text Editor Integration with GUI
+
+<img width="3840" height="2160" alt="TextEdit" src="https://github.com/user-attachments/assets/67997362-36f6-4fe4-ab9e-f5244c3c8498" />
+
+________________________________
+
 
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
