@@ -42,8 +42,8 @@ ________________________________
 
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
-Release: 0.11.3 (sha256 only shows the one for the latest release)
-c641bca55064b5d7f03c062ac15825e6d4ee97fa2be87fc7cfcbf6b831465956
+Release: 0.11.4 (sha256 only shows the one for the latest release)
+sha256:2ea2a42745bac2ea2e6208f80cad6ccb73542b903e667e6091e20e8d17e0a887
 
   Install with USB:  (Use FAT32)
 |---------------------------------------|
