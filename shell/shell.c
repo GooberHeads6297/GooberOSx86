@@ -1,4 +1,4 @@
-#include "../kernel.h"
+#include "shell.h"
 #include <stddef.h>
 #include "../drivers/io/io.h"
 #include "../games/snake.h"
@@ -20,7 +20,6 @@ static uint8_t current_color = VGA_COLOR_LIGHT_GREEN;
 #define SCREEN_COLS 80
 #define SCREEN_ROWS 25
 
-extern void print(const char*);
 extern char keyboard_read_char();
 extern uint8_t cursor_row;
 extern uint8_t cursor_col;
@@ -78,6 +77,32 @@ static uint16_t prev_cell_value = 0;
 static int cursor_enabled = 1;
 static int cursor_drawn = 0;
 static uint32_t last_blink_tick = 0;
+static shell_clear_sink_t redirected_clear_sink = NULL;
+static void* redirected_output_ctx = NULL;
+
+static int shell_output_redirect_active(void) {
+    return redirected_clear_sink != NULL;
+}
+
+void shell_set_redirect(kernel_print_sink_t write_sink, shell_clear_sink_t clear_sink, void* ctx) {
+    kernel_set_print_sink(write_sink, ctx);
+    redirected_clear_sink = clear_sink;
+    redirected_output_ctx = ctx;
+}
+
+void shell_clear_redirect(void) {
+    kernel_clear_print_sink();
+    redirected_clear_sink = NULL;
+    redirected_output_ctx = NULL;
+}
+
+static void shell_clear_display(void) {
+    if (redirected_clear_sink) {
+        redirected_clear_sink(redirected_output_ctx);
+        return;
+    }
+    clear_screen();
+}
 
 static void put_cell(int r, int c, char ch, uint8_t attr) {
     if (r < 0 || c < 0 || r >= SCREEN_ROWS || c >= SCREEN_COLS) return;
@@ -314,16 +339,21 @@ static void install_iso_to_drive(uint8_t drive) {
 #endif
 }
 
-static void execute_command(const char* cmd) {
+void execute_command(const char* cmd) {
+    int redirected = shell_output_redirect_active();
     if (!cmd) return;
 
-    restore_prev_cursor_cell();
-    move_cursor(cursor_row, cursor_col);
-    cursor_enabled = 0;
+    if (!redirected) {
+        restore_prev_cursor_cell();
+        move_cursor(cursor_row, cursor_col);
+        cursor_enabled = 0;
+    }
 
     if (cmd[0] == '\0') {
-        cursor_enabled = 1;
-        draw_cursor();
+        if (!redirected) {
+            cursor_enabled = 1;
+            draw_cursor();
+        }
         return;
     }
     {
@@ -342,8 +372,12 @@ static void execute_command(const char* cmd) {
     if (!strcmp_local(cmd, "help")) {
         print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall (optional embed)\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\ngui\ncolor\n");
     } else if (!strcmp_local(cmd, "gui")) {
-        gui_run();
-        prompt();
+        if (redirected) {
+            print("Already in GUI mode.\n");
+        } else {
+            gui_run();
+            prompt();
+        }
     } else if (!strncmp_local(cmd, "color ", 6)) {
         const char* args = cmd + 6;
         uint32_t val;
@@ -354,7 +388,7 @@ static void execute_command(const char* cmd) {
             print("Usage: color <hex>\nExample: color 0A (Green on Black)\n");
         }
     } else if (!strcmp_local(cmd, "cls")) {
-        clear_screen();
+        shell_clear_display();
         cursor_row = 0;
         cursor_col = 0;
     } else if (!strncmp_local(cmd, "echo ", 5)) {
@@ -549,7 +583,7 @@ static void execute_command(const char* cmd) {
             print("edit: Filename required\n");
         } else {
             run_editor(filename);
-            clear_screen();
+            shell_clear_display();
             vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
             cursor_row = 0;
             cursor_col = 0;
@@ -588,8 +622,10 @@ static void execute_command(const char* cmd) {
 
 
 
-    cursor_enabled = 1;
-    draw_cursor();
+    if (!redirected) {
+        cursor_enabled = 1;
+        draw_cursor();
+    }
 }
 
 

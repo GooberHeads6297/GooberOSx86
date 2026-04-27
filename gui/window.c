@@ -6,6 +6,7 @@
 #include "../fs/filesystem.h"
 #include "../lib/memory.h"
 #include "../lib/string.h"
+#include "../shell/shell.h"
 
 typedef struct {
     int tick_count;
@@ -108,6 +109,8 @@ static const char* launcher_labels[LAUNCH_COUNT] = {
 };
 
 static Window* launch_app(launcher_item_t item, const char* arg);
+static void app_shell_tick(Window* win, uint32_t ticks);
+static void app_shell_key(Window* win, char key);
 
 static int min_int(int a, int b) { return (a < b) ? a : b; }
 static int max_int(int a, int b) { return (a > b) ? a : b; }
@@ -255,6 +258,58 @@ static void gui_shell_scroll_to_bottom(app_terminal_state_t* state, int view_h) 
     if (!state) return;
     max_top = max_int(0, state->line_count - view_h);
     state->scroll_top = max_top;
+}
+
+static app_terminal_state_t* gui_shell_capture_state = NULL;
+static char gui_shell_capture_line[TERM_LINE_LEN];
+static int gui_shell_capture_len = 0;
+
+static void gui_shell_capture_flush_line(int force_blank) {
+    if (!gui_shell_capture_state) return;
+    if (gui_shell_capture_len > 0 || force_blank) {
+        gui_shell_capture_line[gui_shell_capture_len] = '\0';
+        gui_shell_push_line(gui_shell_capture_state, gui_shell_capture_line);
+        gui_shell_capture_len = 0;
+        gui_shell_capture_line[0] = '\0';
+    }
+}
+
+static void gui_shell_capture_begin(app_terminal_state_t* state) {
+    gui_shell_capture_state = state;
+    gui_shell_capture_len = 0;
+    gui_shell_capture_line[0] = '\0';
+}
+
+static void gui_shell_capture_end(app_terminal_state_t* state, int view_h) {
+    (void)state;
+    gui_shell_capture_flush_line(0);
+    gui_shell_capture_state = NULL;
+    gui_shell_scroll_to_bottom(state, view_h);
+}
+
+static void gui_shell_capture_write(const char* text, void* ctx) {
+    app_terminal_state_t* state = (app_terminal_state_t*)ctx;
+    if (!state || !text) return;
+    if (gui_shell_capture_state != state) gui_shell_capture_begin(state);
+    for (int i = 0; text[i] != '\0'; i++) {
+        char ch = text[i];
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            gui_shell_capture_flush_line(1);
+            continue;
+        }
+        if (gui_shell_capture_len >= TERM_LINE_LEN - 1) gui_shell_capture_flush_line(0);
+        gui_shell_capture_line[gui_shell_capture_len++] = ch;
+    }
+}
+
+static void gui_shell_capture_clear(void* ctx) {
+    app_terminal_state_t* state = (app_terminal_state_t*)ctx;
+    if (!state) return;
+    state->line_count = 0;
+    state->scroll_top = 0;
+    gui_shell_capture_len = 0;
+    gui_shell_capture_line[0] = '\0';
 }
 
 static void parse_two_args(const char* in, char* a, int a_len, char* b, int b_len) {
@@ -656,7 +711,8 @@ static void app_explorer_key(Window* win, char key) {
 }
 
 static void app_shell_execute(Window* shell_win, app_terminal_state_t* state) {
-    char cmd[TERM_LINE_LEN], a[64], b[128], line[TERM_LINE_LEN];
+    char cmd[TERM_LINE_LEN], line[TERM_LINE_LEN];
+    const char* exec_cmd = cmd;
     int view_h;
     if (!shell_win || !state) return;
     view_h = max_int(1, shell_win->height - 1);
@@ -667,52 +723,8 @@ static void app_shell_execute(Window* shell_win, app_terminal_state_t* state) {
         append_limited(line, cmd, TERM_LINE_LEN);
         gui_shell_push_line(state, line);
     }
-    if (strcmp(cmd, "help") == 0) {
-        gui_shell_push_line(state, "help,pwd,cd,mkdir,rmdir,new,del,read,write,edit");
-        gui_shell_push_line(state, "snake,cubeDip,explorer");
-    } else if (strcmp(cmd, "clear") == 0) {
-        state->line_count = 0;
-        state->scroll_top = 0;
-    } else if (strcmp(cmd, "pwd") == 0) {
+    if (strcmp(cmd, "pwd") == 0) {
         gui_shell_push_line(state, fs_get_cwd());
-    } else if (starts_with(cmd, "echo ")) {
-        gui_shell_push_line(state, cmd + 5);
-    } else if (strcmp(cmd, "cd ..") == 0) {
-        if (fs_cd_up() == 0) gui_shell_push_line(state, "ok");
-        else gui_shell_push_line(state, "cd failed");
-    } else if (starts_with(cmd, "cd ")) {
-        if (fs_change_dir(cmd + 3) == 0) gui_shell_push_line(state, "ok");
-        else gui_shell_push_line(state, "cd failed");
-    } else if (starts_with(cmd, "mkdir ")) {
-        if (fs_create_dir(cmd + 6) == 0) gui_shell_push_line(state, "dir created");
-        else gui_shell_push_line(state, "mkdir failed");
-    } else if (starts_with(cmd, "rmdir ")) {
-        if (fs_delete_dir(cmd + 6) == 0) gui_shell_push_line(state, "dir removed");
-        else gui_shell_push_line(state, "rmdir failed");
-    } else if (starts_with(cmd, "new ")) {
-        if (fs_create(cmd + 4) == 0) gui_shell_push_line(state, "file created");
-        else gui_shell_push_line(state, "new failed");
-    } else if (starts_with(cmd, "del ")) {
-        if (fs_delete(cmd + 4) == 0) gui_shell_push_line(state, "file deleted");
-        else gui_shell_push_line(state, "del failed");
-    } else if (starts_with(cmd, "write ")) {
-        parse_two_args(cmd + 6, a, sizeof(a), b, sizeof(b));
-        if (a[0] == '\0') gui_shell_push_line(state, "write <file> <text>");
-        else if (fs_write(a, (const uint8_t*)b, strlen(b)) == 0) gui_shell_push_line(state, "written");
-        else gui_shell_push_line(state, "write failed");
-    } else if (starts_with(cmd, "read ")) {
-        FileHandle* fh = fs_open(cmd + 5);
-        if (!fh) {
-            gui_shell_push_line(state, "read failed");
-        } else {
-            uint8_t buf[64];
-            size_t n;
-            while ((n = fs_read(fh, buf, sizeof(buf) - 1)) > 0) {
-                buf[n] = '\0';
-                gui_shell_push_line(state, (const char*)buf);
-            }
-            fs_close(fh);
-        }
     } else if (starts_with(cmd, "edit ")) {
         if (!launch_app(LAUNCH_NOTEPAD, cmd + 5)) gui_shell_push_line(state, "failed to launch editor");
     } else if (strcmp(cmd, "snake") == 0) {
@@ -721,10 +733,19 @@ static void app_shell_execute(Window* shell_win, app_terminal_state_t* state) {
         launch_app(LAUNCH_CUBEDIP, NULL);
     } else if (strcmp(cmd, "explorer") == 0) {
         launch_app(LAUNCH_EXPLORER, NULL);
-    } else if (strcmp(cmd, "ls") == 0) {
-        gui_shell_push_line(state, "ls unavailable in window shell (use shell mode)");
+    } else if (strcmp(cmd, "clear") == 0) {
+        exec_cmd = "cls";
+        gui_shell_capture_begin(state);
+        shell_set_redirect(gui_shell_capture_write, gui_shell_capture_clear, state);
+        execute_command(exec_cmd);
+        shell_clear_redirect();
+        gui_shell_capture_end(state, view_h);
     } else if (strlen(cmd) > 0) {
-        gui_shell_push_line(state, "Unknown command");
+        gui_shell_capture_begin(state);
+        shell_set_redirect(gui_shell_capture_write, gui_shell_capture_clear, state);
+        execute_command(exec_cmd);
+        shell_clear_redirect();
+        gui_shell_capture_end(state, view_h);
     }
     state->input_len = 0;
     state->input_cursor = 0;

@@ -1,3 +1,4 @@
+#include "kernel.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "drivers/timer/timer.h"
@@ -55,6 +56,8 @@ extern void irq12_handler_asm();
 extern void isr32_stub();
 
 static unsigned int update_counter = 0;
+static kernel_print_sink_t print_sink = NULL;
+static void* print_sink_ctx = NULL;
 
 void pic_remap() {
     uint8_t a1 = inb(0x21);
@@ -122,7 +125,21 @@ static void print_char(char c) {
     vga_put_char(c);
 }
 
+void kernel_set_print_sink(kernel_print_sink_t sink, void* ctx) {
+    print_sink = sink;
+    print_sink_ctx = ctx;
+}
+
+void kernel_clear_print_sink(void) {
+    print_sink = NULL;
+    print_sink_ctx = NULL;
+}
+
 void print(const char* str) {
+    if (print_sink) {
+        print_sink(str, print_sink_ctx);
+        return;
+    }
     for (size_t i = 0; str[i] != '\0'; i++)
         print_char(str[i]);
 }
