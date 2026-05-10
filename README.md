@@ -65,7 +65,7 @@ c641bca55064b5d7f03c062ac15825e6d4ee97fa2be87fc7cfcbf6b831465956
 
   1. Intended first target: BIOS/legacy VirtualBox HDD installs.
   2. The direct in-kernel write path currently targets ATA disks.
-  3. eMMC/NVMe/AHCI installation work still needs dedicated write support.
+  3. NVMe/AHCI installation work still needs dedicated write support. (eMMC support now works 🥳)
 
 
       
