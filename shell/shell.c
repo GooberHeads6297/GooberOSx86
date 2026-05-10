@@ -13,7 +13,7 @@
 #include "../drivers/keyboard/keyboard.h"
 #include "../drivers/timer/timer.h"
 #include "../gui/window.h"
-#include "../drivers/storage/bios_disk.h"
+#include "../drivers/storage/storage.h"
 
 #define PROMPT_COLOR VGA_COLOR_BLUE
 static uint8_t current_color = VGA_COLOR_LIGHT_GREEN;
@@ -286,56 +286,623 @@ static int parse_hex(const char* s, uint32_t* out) {
     return 0;
 }
 
-static void list_devices() {
-    bios_disk_scan();
-    int count = bios_disk_count();
-    if (count <= 0) {
-        print("No BIOS drives detected.\n");
+static void print_hex_u32(uint32_t value, int pad_to_eight) {
+    char out[9];
+    int started = pad_to_eight ? 1 : 0;
+    int pos = 0;
+
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        uint8_t nibble = (uint8_t)((value >> shift) & 0xF);
+        if (!started && nibble == 0 && shift != 0) continue;
+        started = 1;
+        out[pos++] = (char)(nibble < 10 ? ('0' + nibble) : ('a' + (nibble - 10)));
+    }
+
+    if (pos == 0) out[pos++] = '0';
+    out[pos] = '\0';
+    print(out);
+}
+
+static void print_u64(uint64_t value) {
+    uint32_t high = (uint32_t)(value >> 32);
+    print("0x");
+    if (high != 0) {
+        print_hex_u32(high, 0);
+        print_hex_u32((uint32_t)(value & 0xFFFFFFFFU), 1);
         return;
     }
-    print("BIOS drives:\n");
+    print_hex_u32((uint32_t)(value & 0xFFFFFFFFU), 0);
+}
+
+static uint16_t read_le16(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t read_le32(const uint8_t* p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int parse_u32_token(const char* s, uint32_t* out) {
+    if (!s || !*s || !out) return -1;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return parse_hex(s, out);
+    *out = (uint32_t)atoi(s);
+    return 0;
+}
+
+static const storage_device_info_t* get_storage_device_by_id(int device_index) {
+    storage_scan();
+    return storage_get(device_index);
+}
+
+static size_t install_image_size_bytes(void) {
+#if EMBED_INSTALL_ISO
+    return (size_t)(&_binary_GooberOSx86_iso_end - &_binary_GooberOSx86_iso_start);
+#else
+    return 0;
+#endif
+}
+
+static size_t install_image_sector_count(void) {
+    size_t bytes = install_image_size_bytes();
+    return bytes == 0 ? 0 : (bytes + 511) / 512;
+}
+
+static int install_image_available(void) {
+#if EMBED_INSTALL_ISO
+    return install_image_size_bytes() > 0;
+#else
+    return 0;
+#endif
+}
+
+static void list_devices() {
+    storage_scan();
+    int count = storage_count();
+    if (count <= 0) {
+        print("No storage hardware detected.\n");
+        return;
+    }
+    print("Storage hardware:\n");
     for (int i = 0; i < count; i++) {
-        const bios_drive_info_t* d = bios_disk_get(i);
+        const storage_device_info_t* d = storage_get(i);
         if (!d || !d->present) continue;
-        print("  Drive 0x");
+        print("  [");
         char buf[16];
-        itoa(d->drive, buf, 16);
+        itoa(i, buf, 10);
         print(buf);
-        print(" (sector size ");
-        itoa((int)d->sector_size, buf, 10);
-        print(buf);
-        print(")\n");
+        print("] ");
+        print(storage_type_name(d->type));
+        print(" on ");
+        print(storage_bus_name(d->bus));
+        print(" (");
+        print(d->location);
+        print(")");
+        if (d->model[0] != '\0') {
+            print(" - ");
+            print(d->model);
+        }
+        print(" [");
+        print(storage_backend_name(d->backend));
+        print(", ");
+        print(storage_install_state_name(d->install_state));
+        print("]");
+        if (d->selectable) {
+            print(" [install target]");
+        }
+        print("\n");
     }
 }
 
-static void install_iso_to_drive(uint8_t drive) {
-#if EMBED_INSTALL_ISO
-    unsigned char* iso_start = &_binary_GooberOSx86_iso_start;
-    unsigned char* iso_end = &_binary_GooberOSx86_iso_end;
-    size_t iso_size = (size_t)(iso_end - iso_start);
-    size_t total_sectors = (iso_size + 511) / 512;
+static void list_pending_install_paths(void) {
+    int count = storage_count();
+    int printed = 0;
 
-    print("Writing ISO to drive 0x");
+    for (int i = 0; i < count; i++) {
+        const storage_device_info_t* d = storage_get(i);
+        if (!d || !d->present || d->install_state == STORAGE_INSTALL_STATE_READY) continue;
+        if (!printed) {
+            print("Blocked storage paths:\n");
+            printed = 1;
+        }
+        print("  ");
+        print(storage_type_name(d->type));
+        print(" - ");
+        print(d->location);
+        print(" [");
+        print(storage_backend_name(d->backend));
+        print("] ");
+        print(storage_install_state_reason(d));
+        print("\n");
+    }
+}
+
+static void list_install_targets(void) {
+    storage_scan();
+    int count = storage_target_count();
+
+    if (count <= 0) {
+        print("No installable storage targets detected in-kernel.\n");
+        list_pending_install_paths();
+        return;
+    }
+
+    print("Install targets:\n");
+    for (int i = 0; i < count; i++) {
+        const storage_device_info_t* d = storage_get_target(i);
+        char buf[16];
+        if (!d) continue;
+
+        print("  [");
+        itoa(i, buf, 10);
+        print(buf);
+        print("] ");
+        print(storage_type_name(d->type));
+        print(" - ");
+        print(d->model[0] ? d->model : "Unnamed device");
+        print(" (");
+        print(d->location);
+        print(") [");
+        print(storage_backend_name(d->backend));
+        print("]\n");
+    }
+    list_pending_install_paths();
+}
+
+static void print_install_help(void) {
+    print("install commands:\n");
+    print("  install list\n");
+    print("  install info <target-id>\n");
+    print("  install write <target-id> YES\n");
+    print("  install host\n");
+    print("\n");
+    print("Direct disk install currently supports ATA HDD/SSD targets in BIOS-style\n");
+    print("VM setups. eMMC/AHCI/NVMe still need their own write paths.\n");
+}
+
+static void print_storage_device_info(const char* heading, const storage_device_info_t* d, int display_index) {
     char buf[16];
-    itoa(drive, buf, 16);
-    print(buf);
-    print("... ");
 
-    for (size_t i = 0; i < total_sectors; i++) {
-        const void* src = iso_start + (i * 512);
-        if (bios_write_lba(drive, (uint64_t)i, 1, src) != 0) {
-            print("\ninstall: write failed at LBA ");
+    if (!d) {
+        return;
+    }
+
+    print(heading);
+    print(" [");
+    itoa(display_index, buf, 10);
+    print(buf);
+    print("]\n");
+    print("  Type: ");
+    print(storage_type_name(d->type));
+    print("\n");
+    print("  Backend: ");
+    print(storage_backend_name(d->backend));
+    print("\n");
+    print("  Install state: ");
+    print(storage_install_state_name(d->install_state));
+    print("\n");
+    print("  Bus: ");
+    print(storage_bus_name(d->bus));
+    print("\n");
+    if (d->bus == STORAGE_BUS_PCI) {
+        print("  PCI: ");
+        itoa((int)d->pci_bus, buf, 10);
+        print(buf);
+        print(":");
+        itoa((int)d->pci_slot, buf, 10);
+        print(buf);
+        print(":");
+        itoa((int)d->pci_func, buf, 10);
+        print(buf);
+        print("\n");
+        print("  BAR0: 0x");
+        print_hex_u32(d->bar0, 0);
+        print("\n");
+        print("  Class: 0x");
+        print_hex_u32(d->class_code, 0);
+        print(" / Subclass: 0x");
+        print_hex_u32(d->sub_class, 0);
+        print(" / ProgIF: 0x");
+        print_hex_u32(d->prog_if, 0);
+        print("\n");
+    }
+    print("  Location: ");
+    print(d->location);
+    print("\n");
+    print("  Model: ");
+    print(d->model[0] ? d->model : "Unknown");
+    print("\n");
+    print("  Sector size: ");
+    itoa((int)d->sector_size, buf, 10);
+    print(buf);
+    print("\n");
+    print("  Sectors: ");
+    print_u64(d->sectors);
+    print("\n");
+    print("  Reason: ");
+    print(storage_install_state_reason(d));
+    print("\n");
+    if (d->backend == STORAGE_BACKEND_SDHCI) {
+        print("  Init step: ");
+        itoa((int)d->init_step, buf, 10);
+        print(buf);
+        print("\n");
+        print("  Last status: 0x");
+        print_hex_u32(d->last_status, 0);
+        print("\n");
+    }
+    print("  Direct kernel install: ");
+    if (!d->direct_install_supported) {
+        print("not supported on this device path\n");
+    } else if (!install_image_available()) {
+        print("installer image not embedded in this build\n");
+    } else {
+        print("ready\n");
+    }
+    print("  Install image sectors: ");
+    itoa((int)install_image_sector_count(), buf, 10);
+    print(buf);
+    print("\n");
+}
+
+static void print_install_target_info(int target_index) {
+    const storage_device_info_t* d;
+    storage_scan();
+    d = storage_get_target(target_index);
+    if (!d) {
+        print("install: target not found\n");
+        return;
+    }
+    print_storage_device_info("Target", d, target_index);
+}
+
+static void print_disk_device_info(int device_index) {
+    const storage_device_info_t* d = get_storage_device_by_id(device_index);
+    if (!d) {
+        print("disk: device not found\n");
+        return;
+    }
+    print_storage_device_info("Device", d, device_index);
+}
+
+static void print_host_install_help(void) {
+    print("Host-side install flow:\n");
+    print("  1. Build the project: ./build.sh\n");
+    print("  2. List host disks: ./build.sh list-devices\n");
+    print("  3. Mount the target filesystem.\n");
+    print("  4. Install GRUB + kernel:\n");
+    print("     ./build.sh install --device /dev/sdX --mount /mnt/goober\n");
+    print("\n");
+    print("This copies kernel.bin and grub.cfg into /boot and runs grub-install\n");
+    print("against the selected disk.\n");
+}
+
+static void print_disk_help(void) {
+    print("disk commands:\n");
+    print("  disk info <device-id>\n");
+    print("  disk partitions <device-id>\n");
+    print("  disk probe-write <device-id> YES\n");
+    print("  disk wipe-table <device-id> YES\n");
+    print("  disk zero <device-id> <start-lba> <count> YES\n");
+    print("\n");
+    print("Device IDs come from the `devices` command, not `install list`.\n");
+}
+
+static void print_partition_type_name(uint8_t type) {
+    if (type == 0x00) print("Unused");
+    else if (type == 0x07) print("NTFS/exFAT/HPFS");
+    else if (type == 0x0B || type == 0x0C) print("FAT32");
+    else if (type == 0x83) print("Linux");
+    else if (type == 0x82) print("Linux swap");
+    else if (type == 0xEE) print("GPT protective");
+    else if (type == 0xEF) print("EFI system");
+    else if (type == 0xAF) print("Apple HFS+");
+    else print("Unknown");
+}
+
+static void print_mbr_partitions(const uint8_t* sector0) {
+    char buf[16];
+    int found = 0;
+
+    print("MBR partitions:\n");
+    for (int i = 0; i < 4; i++) {
+        const uint8_t* entry = sector0 + 446 + (i * 16);
+        uint8_t type = entry[4];
+        uint32_t start_lba = read_le32(entry + 8);
+        uint32_t sectors = read_le32(entry + 12);
+        if (type == 0 || sectors == 0) continue;
+        found = 1;
+        print("  [");
+        itoa(i, buf, 10);
+        print(buf);
+        print("] type 0x");
+        print_hex_u32(type, 0);
+        print(" ");
+        print_partition_type_name(type);
+        print(", start ");
+        itoa((int)start_lba, buf, 10);
+        print(buf);
+        print(", sectors ");
+        itoa((int)sectors, buf, 10);
+        print(buf);
+        if (entry[0] == 0x80) print(", bootable");
+        print("\n");
+    }
+    if (!found) print("  No populated MBR entries.\n");
+}
+
+static void print_gpt_partitions(const storage_device_info_t* d) {
+    uint8_t sector[512];
+    uint8_t entry_sector[512];
+    char buf[16];
+
+    if (storage_read_sector(d, 1, sector) != 0) {
+        print("disk: failed to read GPT header\n");
+        return;
+    }
+    if (strncmp_local((const char*)sector, "EFI PART", 8) != 0) {
+        print("disk: GPT signature not present\n");
+        return;
+    }
+
+    {
+        uint32_t entry_lba = read_le32(sector + 72);
+        uint32_t entry_count = read_le32(sector + 80);
+        uint32_t entry_size = read_le32(sector + 84);
+        uint32_t max_entries = entry_count > 8 ? 8 : entry_count;
+        int printed = 0;
+
+        print("GPT partitions (first ");
+        itoa((int)max_entries, buf, 10);
+        print(buf);
+        print(" entries scanned):\n");
+
+        if (entry_size < 128) {
+            print("  Entry size too small to parse.\n");
+            return;
+        }
+
+        for (uint32_t i = 0; i < max_entries; i++) {
+            uint32_t byte_offset = i * entry_size;
+            uint32_t sector_lba = entry_lba + (byte_offset / 512U);
+            uint32_t sector_offset = byte_offset % 512U;
+            const uint8_t* entry;
+            uint64_t first_lba;
+            uint64_t last_lba;
+            char name[37];
+            int name_pos = 0;
+
+            if (storage_read_sector(d, sector_lba, entry_sector) != 0) {
+                print("  Failed to read GPT entry sector.\n");
+                return;
+            }
+            entry = entry_sector + sector_offset;
+            if (entry[0] == 0 && entry[1] == 0 && entry[2] == 0 && entry[3] == 0 &&
+                entry[4] == 0 && entry[5] == 0 && entry[6] == 0 && entry[7] == 0) {
+                continue;
+            }
+
+            first_lba = (uint64_t)read_le32(entry + 32) | ((uint64_t)read_le32(entry + 36) << 32);
+            last_lba = (uint64_t)read_le32(entry + 40) | ((uint64_t)read_le32(entry + 44) << 32);
+
+            for (int n = 0; n < 36; n++) {
+                uint16_t ch = read_le16(entry + 56 + (n * 2));
+                if (ch == 0) break;
+                name[name_pos++] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+            }
+            name[name_pos] = '\0';
+
+            printed = 1;
+            print("  [");
             itoa((int)i, buf, 10);
+            print(buf);
+            print("] first ");
+            print_u64(first_lba);
+            print(", last ");
+            print_u64(last_lba);
+            if (name[0]) {
+                print(", name ");
+                print(name);
+            }
+            print("\n");
+        }
+
+        if (!printed) print("  No populated GPT entries found in scanned range.\n");
+    }
+}
+
+static void disk_show_partitions(int device_index) {
+    const storage_device_info_t* d = get_storage_device_by_id(device_index);
+    uint8_t sector0[512];
+
+    if (!d) {
+        print("disk: device not found\n");
+        return;
+    }
+    if (storage_read_sector(d, 0, sector0) != 0) {
+        print("disk: failed to read sector 0 from device\n");
+        return;
+    }
+    if (sector0[510] != 0x55 || sector0[511] != 0xAA) {
+        print("disk: sector 0 does not contain an MBR signature\n");
+        return;
+    }
+
+    print_mbr_partitions(sector0);
+    for (int i = 0; i < 4; i++) {
+        const uint8_t* entry = sector0 + 446 + (i * 16);
+        if (entry[4] == 0xEE) {
+            print_gpt_partitions(d);
+            break;
+        }
+    }
+}
+
+static void disk_zero_range(const storage_device_info_t* d, uint32_t start_lba, uint32_t count) {
+    uint8_t zero_sector[512];
+    char buf[16];
+
+    memset(zero_sector, 0, sizeof(zero_sector));
+    if (!d) {
+        print("disk: device not found\n");
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (storage_write_sector(d, start_lba + i, zero_sector) != 0) {
+            print("disk: write failed at LBA ");
+            itoa((int)(start_lba + i), buf, 10);
             print(buf);
             print("\n");
             return;
         }
     }
-    print("done\n");
-#else
-    (void)drive;
-    print("install: embedded ISO not present in this build.\n");
-    print("Rebuild with EMBED_INSTALL_ISO=1 to enable raw install.\n");
+    if (storage_flush(d) != 0) {
+        print("disk: flush failed after zeroing\n");
+        return;
+    }
+    print("disk: zero complete\n");
+}
+
+static void disk_probe_write(int device_index) {
+    const storage_device_info_t* d = get_storage_device_by_id(device_index);
+    uint8_t original[512];
+    uint8_t modified[512];
+    uint8_t verify[512];
+    uint32_t lba = 1;
+
+    if (!d) {
+        print("disk: device not found\n");
+        return;
+    }
+    if (d->sectors != 0 && d->sectors <= 1) lba = 0;
+
+    if (storage_read_sector(d, lba, original) != 0) {
+        print("disk: failed to read probe sector\n");
+        return;
+    }
+
+    memcpy(modified, original, sizeof(modified));
+    modified[0] ^= 0x5A;
+    modified[1] ^= 0xA5;
+    modified[2] ^= 0x3C;
+    modified[3] ^= 0xC3;
+
+    if (storage_write_sector(d, lba, modified) != 0) {
+        print("disk: probe write failed\n");
+        return;
+    }
+    if (storage_flush(d) != 0) {
+        print("disk: probe flush failed\n");
+        return;
+    }
+    if (storage_read_sector(d, lba, verify) != 0) {
+        print("disk: probe verify read failed\n");
+        return;
+    }
+    if (verify[0] != modified[0] || verify[1] != modified[1] ||
+        verify[2] != modified[2] || verify[3] != modified[3]) {
+        print("disk: probe verify mismatch\n");
+    } else {
+        print("disk: probe write verified\n");
+    }
+
+    if (storage_write_sector(d, lba, original) != 0 || storage_flush(d) != 0) {
+        print("disk: failed to restore original probe sector\n");
+        return;
+    }
+    print("disk: original probe sector restored\n");
+}
+
+static void disk_wipe_table(int device_index) {
+    const storage_device_info_t* d = get_storage_device_by_id(device_index);
+    uint32_t head_count;
+
+    if (!d) {
+        print("disk: device not found\n");
+        return;
+    }
+    head_count = (d->sectors != 0 && d->sectors < 34) ? (uint32_t)d->sectors : 34U;
+    disk_zero_range(d, 0, head_count);
+    if (d->sectors > 34) {
+        uint32_t tail_count = d->sectors > 33 ? 33U : (uint32_t)d->sectors;
+        disk_zero_range(d, (uint32_t)(d->sectors - tail_count), tail_count);
+    }
+}
+
+static void install_write_target(int target_index) {
+    const storage_device_info_t* d;
+    char buf[16];
+
+    storage_scan();
+    d = storage_get_target(target_index);
+    if (!d) {
+        print("install: target not found\n");
+        return;
+    }
+    if (!d->direct_install_supported) {
+        print("install: selected target does not support direct kernel install\n");
+        return;
+    }
+    if (!install_image_available()) {
+        print("install: installer image not embedded in this build.\n");
+        print("Rebuild with EMBED_INSTALL_ISO=1 to enable direct disk installs.\n");
+        return;
+    }
+
+#if EMBED_INSTALL_ISO
+    {
+        unsigned char* image = &_binary_GooberOSx86_iso_start;
+        size_t image_bytes = install_image_size_bytes();
+        size_t image_sectors = install_image_sector_count();
+        uint8_t sector[512];
+
+        if (image_sectors == 0) {
+            print("install: embedded image is empty\n");
+            return;
+        }
+        if (d->sectors != 0 && d->sectors < image_sectors) {
+            print("install: target is smaller than installer image\n");
+            return;
+        }
+
+        print("install: writing hybrid boot image to target [");
+        itoa(target_index, buf, 10);
+        print(buf);
+        print("] ");
+        print(d->model[0] ? d->model : "Unnamed device");
+        print("\n");
+
+        for (size_t sector_index = 0; sector_index < image_sectors; sector_index++) {
+            size_t offset = sector_index * 512;
+            size_t remaining = image_bytes - offset;
+            size_t copy = remaining >= 512 ? 512 : remaining;
+
+            memset(sector, 0, sizeof(sector));
+            memcpy(sector, image + offset, copy);
+
+            if (storage_write_sector(d, (uint32_t)sector_index, sector) != 0) {
+                print("install: write failed at sector ");
+                itoa((int)sector_index, buf, 10);
+                print(buf);
+                print("\n");
+                return;
+            }
+
+            if ((sector_index & 127U) == 0) {
+                print(".");
+            }
+        }
+
+        if (storage_flush(d) != 0) {
+            print("\ninstall: disk flush failed\n");
+            return;
+        }
+
+        print("\ninstall: complete\n");
+        print("install: the target should now boot in BIOS/legacy mode.\n");
+    }
 #endif
 }
 
@@ -370,7 +937,7 @@ void execute_command(const char* cmd) {
     }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall (optional embed)\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\ngui\ncolor\n");
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall\ndisk\npartitions\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\ngui\ncolor\n");
     } else if (!strcmp_local(cmd, "gui")) {
         if (redirected) {
             print("Already in GUI mode.\n");
@@ -544,37 +1111,124 @@ void execute_command(const char* cmd) {
         }
     } else if (!strcmp_local(cmd, "devices")) {
         list_devices();
-    } else if (!strncmp_local(cmd, "install ", 8)) {
-        const char* args = cmd + 8;
-        while (*args == ' ') args++;
-        if (*args == '\0') {
-            print("install: drive required (e.g. install 0x80 YES)\n");
+    } else if (!strcmp_local(cmd, "disk")) {
+        print_disk_help();
+    } else if (!strcmp_local(cmd, "partitions")) {
+        print("partitions: device id required\n");
+    } else if (!strncmp_local(cmd, "partitions ", 11)) {
+        disk_show_partitions(atoi(cmd + 11));
+    } else if (!strcmp_local(cmd, "disk info")) {
+        print("disk: device id required\n");
+    } else if (!strncmp_local(cmd, "disk info ", 10)) {
+        print_disk_device_info(atoi(cmd + 10));
+    } else if (!strcmp_local(cmd, "disk partitions")) {
+        print("disk: device id required\n");
+    } else if (!strncmp_local(cmd, "disk partitions ", 16)) {
+        disk_show_partitions(atoi(cmd + 16));
+    } else if (!strncmp_local(cmd, "disk probe-write ", 17)) {
+        const char* arg = cmd + 17;
+        char device_buf[16] = {0};
+        size_t i = 0;
+        while (arg[i] && arg[i] != ' ' && i < sizeof(device_buf) - 1) {
+            device_buf[i] = arg[i];
+            i++;
+        }
+        device_buf[i] = '\0';
+        while (arg[i] == ' ') i++;
+        if (device_buf[0] == '\0') {
+            print("disk: device id required\n");
+        } else if (!(arg[i] == 'Y' && arg[i + 1] == 'E' && arg[i + 2] == 'S' && arg[i + 3] == '\0')) {
+            print("disk: add YES to confirm probe-write\n");
         } else {
-            const char* drive_str = args;
-            while (*args && *args != ' ') args++;
-            char tmp[16] = {0};
-            size_t len = (size_t)(args - drive_str);
-            if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
-            for (size_t i = 0; i < len; i++) tmp[i] = drive_str[i];
-            tmp[len] = '\0';
+            disk_probe_write(atoi(device_buf));
+        }
+    } else if (!strncmp_local(cmd, "disk wipe-table ", 16)) {
+        const char* arg = cmd + 16;
+        char device_buf[16] = {0};
+        size_t i = 0;
+        while (arg[i] && arg[i] != ' ' && i < sizeof(device_buf) - 1) {
+            device_buf[i] = arg[i];
+            i++;
+        }
+        device_buf[i] = '\0';
+        while (arg[i] == ' ') i++;
+        if (device_buf[0] == '\0') {
+            print("disk: device id required\n");
+        } else if (!(arg[i] == 'Y' && arg[i + 1] == 'E' && arg[i + 2] == 'S' && arg[i + 3] == '\0')) {
+            print("disk: add YES to confirm partition-table wipe\n");
+        } else {
+            disk_wipe_table(atoi(device_buf));
+        }
+    } else if (!strncmp_local(cmd, "disk zero ", 10)) {
+        const char* arg = cmd + 10;
+        char device_buf[16] = {0};
+        char start_buf[16] = {0};
+        char count_buf[16] = {0};
+        uint32_t start_lba = 0;
+        uint32_t count = 0;
+        size_t i = 0;
+        size_t j = 0;
 
-            uint32_t drive_val = 0;
-            int parse_ok = 0;
-            if (tmp[0] == '0' && (tmp[1] == 'x' || tmp[1] == 'X')) {
-                parse_ok = (parse_hex(tmp, &drive_val) == 0);
-            } else {
-                drive_val = (uint32_t)atoi(tmp);
-                parse_ok = 1;
-            }
+        while (arg[i] && arg[i] != ' ' && i < sizeof(device_buf) - 1) {
+            device_buf[i] = arg[i];
+            i++;
+        }
+        device_buf[i] = '\0';
+        while (arg[i] == ' ') i++;
+        while (arg[i] && arg[i] != ' ' && j < sizeof(start_buf) - 1) {
+            start_buf[j++] = arg[i++];
+        }
+        start_buf[j] = '\0';
+        while (arg[i] == ' ') i++;
+        j = 0;
+        while (arg[i] && arg[i] != ' ' && j < sizeof(count_buf) - 1) {
+            count_buf[j++] = arg[i++];
+        }
+        count_buf[j] = '\0';
+        while (arg[i] == ' ') i++;
 
-            while (*args == ' ') args++;
-            if (!parse_ok) {
-                print("install: invalid drive\n");
-            } else if (!(args[0] == 'Y' && args[1] == 'E' && args[2] == 'S' && args[3] == '\0')) {
-                print("install: add YES to confirm (destructive)\n");
-            } else {
-                install_iso_to_drive((uint8_t)drive_val);
-            }
+        if (device_buf[0] == '\0' || start_buf[0] == '\0' || count_buf[0] == '\0') {
+            print("disk: usage disk zero <device-id> <start-lba> <count> YES\n");
+        } else if (!(arg[i] == 'Y' && arg[i + 1] == 'E' && arg[i + 2] == 'S' && arg[i + 3] == '\0')) {
+            print("disk: add YES to confirm zero write\n");
+        } else if (parse_u32_token(start_buf, &start_lba) != 0 || parse_u32_token(count_buf, &count) != 0 || count == 0) {
+            print("disk: invalid start/count\n");
+        } else {
+            disk_zero_range(get_storage_device_by_id(atoi(device_buf)), start_lba, count);
+        }
+    } else if (!strcmp_local(cmd, "install")) {
+        print_install_help();
+    } else if (!strcmp_local(cmd, "install list")) {
+        list_install_targets();
+    } else if (!strcmp_local(cmd, "install info")) {
+        print("install: target id required\n");
+    } else if (!strcmp_local(cmd, "install host")) {
+        print_host_install_help();
+    } else if (!strncmp_local(cmd, "install info ", 13)) {
+        const char* arg = cmd + 13;
+        if (*arg == '\0') {
+            print("install: target id required\n");
+        } else {
+            print_install_target_info(atoi(arg));
+        }
+    } else if (!strncmp_local(cmd, "install write ", 14)) {
+        const char* arg = cmd + 14;
+        char target_buf[16] = {0};
+        size_t i = 0;
+
+        while (arg[i] && arg[i] != ' ' && i < sizeof(target_buf) - 1) {
+            target_buf[i] = arg[i];
+            i++;
+        }
+        target_buf[i] = '\0';
+        while (arg[i] == ' ') i++;
+
+        if (target_buf[0] == '\0') {
+            print("install: target id required\n");
+        } else if (!(arg[i] == 'Y' && arg[i + 1] == 'E' && arg[i + 2] == 'S' && arg[i + 3] == '\0')) {
+            print("install: add YES to confirm destructive disk write\n");
+        } else {
+            install_write_target(atoi(target_buf));
         }
     } else if (!strncmp_local(cmd, "edit ", 5)) {
         const char* filename = cmd + 5;

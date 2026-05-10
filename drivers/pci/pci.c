@@ -8,6 +8,18 @@
 
 extern void print(const char* str);
 
+uint8_t pci_read_config_byte(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
+    uint32_t dword = pci_read_config_dword(bus, slot, func, offset);
+    uint8_t shift = (uint8_t)((offset & 3U) * 8U);
+    return (uint8_t)((dword >> shift) & 0xFFU);
+}
+
+uint16_t pci_read_config_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
+    uint32_t dword = pci_read_config_dword(bus, slot, func, offset);
+    uint8_t shift = (uint8_t)((offset & 2U) * 8U);
+    return (uint16_t)((dword >> shift) & 0xFFFFU);
+}
+
 uint32_t pci_read_config_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
     uint32_t address;
     uint32_t lbus  = (uint32_t)bus;
@@ -18,6 +30,14 @@ uint32_t pci_read_config_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t 
     
     outl(PCI_CONFIG_ADDRESS, address);
     return inl(PCI_CONFIG_DATA);
+}
+
+void pci_write_config_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value) {
+    uint32_t current = pci_read_config_dword(bus, slot, func, offset);
+    uint8_t shift = (uint8_t)((offset & 2U) * 8U);
+    uint32_t mask = (uint32_t)0xFFFF << shift;
+    uint32_t updated = (current & ~mask) | ((uint32_t)value << shift);
+    pci_write_config_dword(bus, slot, func, offset, updated);
 }
 
 void pci_write_config_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) {

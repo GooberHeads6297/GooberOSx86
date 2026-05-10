@@ -42,26 +42,30 @@ ________________________________
 
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
-Release: 0.11.4 (sha256 only shows the one for the latest release)
-sha256:2ea2a42745bac2ea2e6208f80cad6ccb73542b903e667e6091e20e8d17e0a887
+Release: 0.11.3 (sha256 only shows the one for the latest release)
+c641bca55064b5d7f03c062ac15825e6d4ee97fa2be87fc7cfcbf6b831465956
 
-  Install with USB:  (Use FAT32)
-|---------------------------------------|
-|    *Use Rufus                         |
-|       *Don't use ISO Image mode       |
-|    1. Use DD image mode               |
-|    2. Select MBR/BIOS using Rufus     |
-|    3. Boot from MBR/Legacy using BIOS |
+  Install with GRUB on a storage device:
 
+  1. Build the project: `./build.sh`
+  2. Inspect host devices: `./build.sh list-devices`
+  3. Mount the target partition or filesystem.
+  4. Install kernel + GRUB:
+     `./build.sh install --device /dev/sdX --mount /mnt/goober`
+  5. Boot the selected disk in BIOS/Legacy mode.
 
+  In-kernel storage visibility:
 
-  Install via CD/DVD:
+  1. Run `devices` to list detected storage hardware.
+  2. Run `install list` to show storage targets the kernel can identify.
+  3. Run `install info <id>` for details about one target.
+  4. Run `install write <id> YES` to raw-write the hybrid boot image to an ATA HDD/SSD target.
 
-  1. Burn disc image
-  2. Fallow magical windows prompts
-  3. Boot into BIOS
-  4. Set to Legacy or MBR
-  5. Boot into DVD/CD with OS image via bootloader or BIOS
+  Current direct-install scope:
+
+  1. Intended first target: BIOS/legacy VirtualBox HDD installs.
+  2. The direct in-kernel write path currently targets ATA disks.
+  3. eMMC/NVMe/AHCI installation work still needs dedicated write support.
 
 
       

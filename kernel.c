@@ -8,6 +8,7 @@
 #include "drivers/video/vga.h"
 #include "drivers/input/input.h"
 #include "drivers/pci/pci.h"
+#include "drivers/storage/storage.h"
 #include "drivers/usb/usb.h"
 #include "taskmgr/process.h"
 #include "lib/memory.h"
@@ -175,6 +176,7 @@ void kernel_main() {
     input_init();
     mouse_init();
     pci_init();
+    storage_init();
     usb_init();
     fs_init();
 
