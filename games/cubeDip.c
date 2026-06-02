@@ -62,8 +62,12 @@ static void reset_game() {
     vga_set_cursor(VGA_HEIGHT - 1, 0);
 }
 
+/*
+ * Phase 4 (item 5): writes go through vga_text_putc so the VGA-passthrough
+ * shim can intercept on x64 / UEFI; x86 BIOS path unchanged.
+ */
 static void draw_char(int x, int y, char c, uint8_t color) {
-    vga_put_char_at(c, x + x_offset, y + y_offset, color);
+    vga_text_putc(c, x + x_offset, y + y_offset, color);
 }
 
 static void clear_playfield_area() {
@@ -71,7 +75,7 @@ static void clear_playfield_area() {
     int total_h = HEIGHT + 2;
     for (int yy = 0; yy < total_h; yy++)
         for (int xx = 0; xx < total_w; xx++)
-            vga_put_char_at(' ', x_offset + xx, y_offset + yy, 0x0F);
+            vga_text_putc(' ', x_offset + xx, y_offset + yy, 0x0F);
 }
 
 static void draw_border() {
@@ -210,17 +214,17 @@ static void update_piece() {
 }
 
 static void draw_score() {
-    for (int x = 0; x < VGA_WIDTH; x++) vga_put_char_at(' ', x, 0, 0x0F);
+    for (int x = 0; x < VGA_WIDTH; x++) vga_text_putc(' ', x, 0, 0x0F);
     const char *str = "Score: ";
     int i = 0;
-    while (str[i]) vga_put_char_at(str[i], i++, 0, 0x0F);
+    while (str[i]) { vga_text_putc(str[i], i, 0, 0x0F); i++; }
     int s = score, digits[10], dcount = 0;
     if (s == 0) digits[dcount++] = 0;
     while (s > 0 && dcount < 10) {
         digits[dcount++] = s % 10;
         s /= 10;
     }
-    for (int j = dcount - 1; j >= 0; j--) vga_put_char_at('0' + digits[j], i++, 0, 0x0F);
+    for (int j = dcount - 1; j >= 0; j--) vga_text_putc('0' + digits[j], i++, 0, 0x0F);
 }
 
 static void game_over_screen() {
@@ -229,7 +233,7 @@ static void game_over_screen() {
     int start_x = (VGA_WIDTH - len) / 2;
     int y = y_offset + HEIGHT + 2;
     for (int i = 0; i < len; i++)
-        vga_put_char_at(msg[i], start_x + i, y, 0x0C);
+        vga_text_putc(msg[i], start_x + i, y, 0x0C);
 }
 
 static unsigned int last_drop_time = 0;

@@ -45,4 +45,19 @@ int fs_write(const char* filename, const uint8_t* data, size_t size);
 const char* fs_get_cwd(void);
 const Directory* fs_get_current_dir(void);
 
+/*
+ * Directory-explicit operations. These behave exactly like their current-dir
+ * counterparts above, but act on a caller-supplied directory handle instead of
+ * the global working directory. This lets the VESA desktop own a fixed folder
+ * (see fs_get_desktop_dir) without being disturbed by File Explorer navigation.
+ */
+Directory* fs_get_desktop_dir(void);
+Directory* fs_get_cwd_dir(void);
+Directory* fs_dir_find_child(Directory* dir, const char* name);
+void fs_set_current_dir(Directory* dir);
+FileHandle* fs_dir_open(Directory* dir, const char* filename);
+int fs_dir_create(Directory* dir, const char* filename);
+int fs_dir_create_dir(Directory* dir, const char* dirname);
+int fs_dir_write(Directory* dir, const char* filename, const uint8_t* data, size_t size);
+
 #endif

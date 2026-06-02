@@ -20,24 +20,31 @@ static int player_score = 0, ai_score = 0;
 
 static int exit_game = 0;
 
+/*
+ * Phase 4 (item 5): writes go through vga_text_putc so the VGA-passthrough
+ * shim can redirect them into the 80x25 virtual cell grid that a VESA
+ * window composites through the 8x16 font on x64 / UEFI. The x86 BIOS
+ * path is unaffected; vga_text_putc forwards directly to vga_put_char_at
+ * when the shim is not armed.
+ */
 static void draw_paddle(int x, int y) {
     for (int i = 0; i < PADDLE_HEIGHT; i++) {
-        vga_put_char_at(PADDLE_CHAR, x, y + i, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
+        vga_text_putc(PADDLE_CHAR, x, y + i, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
     }
 }
 
 static void erase_paddle(int x, int y) {
     for (int i = 0; i < PADDLE_HEIGHT; i++) {
-        vga_put_char_at(' ', x, y + i, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
+        vga_text_putc(' ', x, y + i, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
     }
 }
 
 static void draw_ball(int x, int y) {
-    vga_put_char_at(BALL_CHAR, x, y, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
+    vga_text_putc(BALL_CHAR, x, y, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
 }
 
 static void erase_ball(int x, int y) {
-    vga_put_char_at(' ', x, y, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
+    vga_text_putc(' ', x, y, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
 }
 
 static void reset_ball(void) {
@@ -108,20 +115,20 @@ void run_pong_game(void) {
         char score_str[16];
         itoa(player_score, score_str, 10);
         for (int i = 0; score_str[i] != '\0'; i++) {
-            vga_put_char_at(score_str[i], 8 + i, 0, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
+            vga_text_putc(score_str[i], 8 + i, 0, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
         }
         const char* player_label = "Player: ";
         for (int i = 0; player_label[i] != '\0'; i++) {
-            vga_put_char_at(player_label[i], i, 0, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
+            vga_text_putc(player_label[i], i, 0, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
         }
         
         itoa(ai_score, score_str, 10);
         for (int i = 0; score_str[i] != '\0'; i++) {
-            vga_put_char_at(score_str[i], 20 + i, 0, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
+            vga_text_putc(score_str[i], 20 + i, 0, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
         }
         const char* ai_label = "AI: ";
         for (int i = 0; ai_label[i] != '\0'; i++) {
-            vga_put_char_at(ai_label[i], 16 + i, 0, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
+            vga_text_putc(ai_label[i], 16 + i, 0, VGA_COLOR_LIGHT_RED | (VGA_COLOR_BLACK << 4));
         }
         timer_sleep(25);
     }

@@ -144,9 +144,14 @@ static void cast_ray(int col, int dir_x, int dir_y) {
     else if (dist <= 20) { shade = '-'; color = VGA_COLOR_DARK_GREY; }
     else { shade = '.'; color = VGA_COLOR_DARK_GREY; }
 
+    /*
+     * Phase 4 (item 5): writes go through vga_text_putc so the passthrough
+     * shim can intercept on x64. x86 BIOS path: vga_text_putc forwards
+     * directly to vga_put_char_at, no behavioural change.
+     */
     for (int y = 0; y < SCREEN_H; y++) {
         if (y >= start && y <= end) {
-            vga_put_char_at(shade, col, y, color | (VGA_COLOR_BLACK << 4));
+            vga_text_putc(shade, col, y, color | (VGA_COLOR_BLACK << 4));
         } else if (y > end) {
             int floor_dist = y - end;
             char floor_shade;
@@ -156,9 +161,9 @@ static void cast_ray(int col, int dir_x, int dir_y) {
             else if (floor_dist < 10){ floor_shade = ':'; floor_color = VGA_COLOR_DARK_GREY; }
             else if (floor_dist < 16){ floor_shade = '\''; floor_color = VGA_COLOR_BLACK; }
             else                     { floor_shade = ','; floor_color = VGA_COLOR_BLACK; }
-            vga_put_char_at(floor_shade, col, y, floor_color | (VGA_COLOR_BLACK << 4));
+            vga_text_putc(floor_shade, col, y, floor_color | (VGA_COLOR_BLACK << 4));
         } else {
-            vga_put_char_at(' ', col, y, VGA_COLOR_BLACK | (VGA_COLOR_BLACK << 4));
+            vga_text_putc(' ', col, y, VGA_COLOR_BLACK | (VGA_COLOR_BLACK << 4));
         }
     }
 }

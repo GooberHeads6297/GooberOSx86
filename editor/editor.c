@@ -140,23 +140,30 @@ static void move_cursor_down(void) {
     cursor = line_col_to_cursor(cl + 1, preferred_col);
 }
 
+/*
+ * Phase 4 (item 5): all editor writes go through vga_text_putc, which
+ * either lands on 0xB8000 (x86 BIOS path, unchanged) or is redirected
+ * into the VGA-passthrough shim's virtual cell grid (x64 / UEFI path)
+ * so the VESA window class can composite the 80x25 cells through the
+ * 8x16 font into the panel pixel grid.
+ */
 static void draw_status(const char* extra) {
     for (int x = 0; x < COLS; x++)
-        vga_put_char_at(' ', x, STATUS_ROW, attr_status);
+        vga_text_putc(' ', x, STATUS_ROW, attr_status);
     int x = 0;
     const char* p = "Editing: ";
-    while (*p && x < COLS) { vga_put_char_at(*p++, x++, STATUS_ROW, attr_status); }
+    while (*p && x < COLS) { vga_text_putc(*p++, x++, STATUS_ROW, attr_status); }
     if (edit_filename) {
         const char* fn = edit_filename;
         while (*fn && x < COLS) {
-            vga_put_char_at(*fn++, x++, STATUS_ROW, attr_status);
+            vga_text_putc(*fn++, x++, STATUS_ROW, attr_status);
         }
     }
     p = " | F2 save, ESC exit";
-    while (*p && x < COLS) { vga_put_char_at(*p++, x++, STATUS_ROW, attr_status); }
+    while (*p && x < COLS) { vga_text_putc(*p++, x++, STATUS_ROW, attr_status); }
     if (extra) {
         while (*extra && x < COLS) {
-            vga_put_char_at(*extra++, x++, STATUS_ROW, attr_status);
+            vga_text_putc(*extra++, x++, STATUS_ROW, attr_status);
         }
     }
 }
@@ -167,13 +174,13 @@ static void render(void) {
         int line_idx = view_line + row;
         int y = TEXT_START_ROW + row;
         for (int x = 0; x < COLS; x++)
-            vga_put_char_at(' ', x, y, attr_normal);
+            vga_text_putc(' ', x, y, attr_normal);
         if (line_idx >= 0 && (size_t)line_idx < line_count) {
             size_t start = get_line_start((size_t)line_idx);
             size_t end = get_line_end((size_t)line_idx);
             int col = 0;
             for (size_t i = start; i < end && col < COLS; i++, col++)
-                vga_put_char_at(editor_buf[i] == '\n' ? ' ' : editor_buf[i], col, y, attr_normal);
+                vga_text_putc(editor_buf[i] == '\n' ? ' ' : editor_buf[i], col, y, attr_normal);
         }
     }
     size_t cur_line, cur_col;
@@ -183,7 +190,7 @@ static void render(void) {
         int y = TEXT_START_ROW + disp_line;
         int x = cur_col < (size_t)COLS ? (int)cur_col : COLS - 1;
         vga_set_cursor(y, x);
-        vga_put_char_at('_', x, y, VGA_COLOR_WHITE | (VGA_COLOR_BLACK << 4));
+        vga_text_putc('_', x, y, VGA_COLOR_WHITE | (VGA_COLOR_BLACK << 4));
     }
 }
 
@@ -271,7 +278,7 @@ void run_editor(const char* filename) {
     vga_set_text_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     for (int y = 0; y < 25; y++)
         for (int x = 0; x < 80; x++)
-            vga_put_char_at(' ', x, y, attr_normal);
+            vga_text_putc(' ', x, y, attr_normal);
     while (!exit_editor) {
         handle_input();
         ensure_cursor_visible();

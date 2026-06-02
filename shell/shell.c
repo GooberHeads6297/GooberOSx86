@@ -1,19 +1,28 @@
 #include "shell.h"
 #include <stddef.h>
 #include "../drivers/io/io.h"
+/*
+ * Phase 3f closes the Phase 3 umbrella: storage / editor / taskmgr / games
+ * are now linked under -m64 alongside the existing x86 build, so the
+ * arch-conditional include block + shell_deferred_3f stubs that 3e used
+ * are gone. Both arches see the same parser bodies. The bios_disk.c +
+ * bios_int13.s real-mode INT 13h path stays x86-only (it physically can't
+ * link into long mode); on x64 the storage stack reaches USB / SDHCI /
+ * AHCI / NVMe / ATA-PIO devices through the controller drivers.
+ */
 #include "../games/snake.h"
 #include "../games/cubeDip.h"
 #include "../games/pong.h"
 #include "../games/doom.h"
 #include "../editor/editor.h"
 #include "../taskmgr/taskmgr.h"
+#include "../drivers/storage/storage.h"
 #include "../fs/filesystem.h"
 #include "../lib/string.h"
 #include "../drivers/video/vga.h"
 #include "../drivers/keyboard/keyboard.h"
 #include "../drivers/timer/timer.h"
 #include "../gui/window.h"
-#include "../drivers/storage/storage.h"
 
 #define PROMPT_COLOR VGA_COLOR_BLUE
 static uint8_t current_color = VGA_COLOR_LIGHT_GREEN;
@@ -253,11 +262,191 @@ static void set_input_line(const char* text) {
     draw_cursor();
 }
 
+/*
+ * Phase 3f x64 reboot: try the ACPI 5.0 RESET_REG GAS first (the spec-
+ * mandated path on UEFI systems where the 8042 controller may be a
+ * legacy emulation hole), fall back to the 8042 keyboard-controller
+ * reset, and finally cli/hlt forever if neither path took effect.
+ *
+ * The ACPI parsing is intentionally conservative: BIOS RSDP search in
+ * the EBDA / 0xE0000-0xFFFFF window, then walk RSDT / XSDT for the
+ * FADT, validate ResetReg.Address.SpaceId is 0 (system memory) /
+ * 1 (system I/O) / 2 (PCI config), and write RESET_VALUE there. PCI
+ * config is uncommon on real Bay Trail-class hardware; we skip it
+ * (returns 0, falls through to 8042). System memory writes through
+ * the identity-mapped low 4 GiB; system I/O uses outb. Any failure
+ * (no FADT, RESET_REG_SUP not in FADT flags, unsupported SpaceId,
+ * malformed table) falls through.
+ */
+#ifdef __x86_64__
+typedef struct __attribute__((packed)) {
+    char     signature[8];
+    uint8_t  checksum;
+    char     oem_id[6];
+    uint8_t  revision;
+    uint32_t rsdt_address;
+    uint32_t length;
+    uint64_t xsdt_address;
+    uint8_t  ext_checksum;
+    uint8_t  reserved[3];
+} acpi_rsdp_t;
+
+typedef struct __attribute__((packed)) {
+    char     signature[4];
+    uint32_t length;
+    uint8_t  revision;
+    uint8_t  checksum;
+    char     oem_id[6];
+    char     oem_table_id[8];
+    uint32_t oem_revision;
+    uint32_t creator_id;
+    uint32_t creator_revision;
+} acpi_sdt_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  address_space_id;     /* 0=mem, 1=io, 2=pci */
+    uint8_t  bit_width;
+    uint8_t  bit_offset;
+    uint8_t  access_size;
+    uint64_t address;
+} acpi_gas_t;
+
+#define ACPI_FADT_FLAG_RESET_REG_SUP (1u << 10)
+
+static acpi_rsdp_t* acpi_find_rsdp(void) {
+    /* Search the EBDA (low KB at 0x40E pointer*16) and the 1 MB-1 - 0xE0000
+     * BIOS region for the "RSD PTR " 8-byte signature on a 16-byte boundary.
+     * The 0x40E read goes through a uintptr_t-typed pointer to suppress the
+     * gcc -Warray-bounds warning that fires when reading from a numeric
+     * constant address (it sees the cast-through-int as "address zero"). */
+    static const char sig[8] = { 'R','S','D',' ','P','T','R',' ' };
+    volatile uint16_t* ebda_seg_ptr = (volatile uint16_t*)(uintptr_t)0x40Eu;
+    uint16_t ebda_seg = *ebda_seg_ptr;
+    uintptr_t ebda_base = (uintptr_t)((uint32_t)ebda_seg << 4u);
+    uintptr_t scan_ranges[][2] = {
+        { ebda_base, ebda_base + 1024u },
+        { 0xE0000u, 0x100000u },
+    };
+    for (int r = 0; r < 2; r++) {
+        if (scan_ranges[r][0] == 0) continue;
+        for (uintptr_t p = scan_ranges[r][0]; p + 8u <= scan_ranges[r][1]; p += 16u) {
+            const char* s = (const char*)p;
+            int match = 1;
+            for (int i = 0; i < 8; i++) if (s[i] != sig[i]) { match = 0; break; }
+            if (match) return (acpi_rsdp_t*)p;
+        }
+    }
+    return 0;
+}
+
+static const acpi_sdt_header_t* acpi_find_table_via_rsdt(uintptr_t rsdt_addr,
+                                                         const char* sig4) {
+    if (!rsdt_addr) return 0;
+    const acpi_sdt_header_t* rsdt = (const acpi_sdt_header_t*)rsdt_addr;
+    uint32_t entries = (rsdt->length - sizeof(*rsdt)) / 4u;
+    const uint32_t* arr = (const uint32_t*)((const uint8_t*)rsdt + sizeof(*rsdt));
+    for (uint32_t i = 0; i < entries; i++) {
+        const acpi_sdt_header_t* hdr = (const acpi_sdt_header_t*)(uintptr_t)arr[i];
+        if (hdr && hdr->signature[0] == sig4[0] && hdr->signature[1] == sig4[1] &&
+            hdr->signature[2] == sig4[2] && hdr->signature[3] == sig4[3]) return hdr;
+    }
+    return 0;
+}
+
+static const acpi_sdt_header_t* acpi_find_table_via_xsdt(uintptr_t xsdt_addr,
+                                                         const char* sig4) {
+    if (!xsdt_addr) return 0;
+    const acpi_sdt_header_t* xsdt = (const acpi_sdt_header_t*)xsdt_addr;
+    uint32_t entries = (xsdt->length - sizeof(*xsdt)) / 8u;
+    const uint64_t* arr = (const uint64_t*)((const uint8_t*)xsdt + sizeof(*xsdt));
+    for (uint32_t i = 0; i < entries; i++) {
+        const acpi_sdt_header_t* hdr = (const acpi_sdt_header_t*)(uintptr_t)arr[i];
+        if (hdr && hdr->signature[0] == sig4[0] && hdr->signature[1] == sig4[1] &&
+            hdr->signature[2] == sig4[2] && hdr->signature[3] == sig4[3]) return hdr;
+    }
+    return 0;
+}
+
+/*
+ * Try the ACPI 5.0 ResetReg path. Returns 1 if a write was issued (caller
+ * then halt-loops because reset is in flight); 0 if any prerequisite was
+ * missing -- caller falls through to the 8042 reset.
+ */
+static int acpi_reset_attempt(void) {
+    acpi_rsdp_t* rsdp = acpi_find_rsdp();
+    if (!rsdp) {
+        print("[shell] reboot: ACPI RSDP not found; falling back\n");
+        return 0;
+    }
+    const acpi_sdt_header_t* fadt = 0;
+    if (rsdp->revision >= 2u && rsdp->xsdt_address)
+        fadt = acpi_find_table_via_xsdt((uintptr_t)rsdp->xsdt_address, "FACP");
+    if (!fadt && rsdp->rsdt_address)
+        fadt = acpi_find_table_via_rsdt((uintptr_t)rsdp->rsdt_address, "FACP");
+    if (!fadt) {
+        print("[shell] reboot: ACPI FADT not found; falling back\n");
+        return 0;
+    }
+    /* FADT layout: ACPI 2.0+ adds RESET_REG at offset 116 (GAS) and
+     * RESET_VALUE at offset 128 (uint8). The "Flags" field at offset 112
+     * tells us whether RESET_REG is supported. */
+    const uint8_t* fadt_bytes = (const uint8_t*)fadt;
+    if (fadt->length < 129u) {
+        print("[shell] reboot: FADT too short for ResetReg; falling back\n");
+        return 0;
+    }
+    uint32_t flags = (uint32_t)fadt_bytes[112]
+                   | ((uint32_t)fadt_bytes[113] << 8)
+                   | ((uint32_t)fadt_bytes[114] << 16)
+                   | ((uint32_t)fadt_bytes[115] << 24);
+    if (!(flags & ACPI_FADT_FLAG_RESET_REG_SUP)) {
+        print("[shell] reboot: FADT.Flags lacks RESET_REG_SUP; falling back\n");
+        return 0;
+    }
+    acpi_gas_t reset_reg;
+    /* Copy out via byte loads to avoid any unaligned trap on hostile FADTs. */
+    {
+        uint8_t* dst = (uint8_t*)&reset_reg;
+        for (size_t i = 0; i < sizeof(reset_reg); i++) dst[i] = fadt_bytes[116 + i];
+    }
+    uint8_t reset_value = fadt_bytes[128];
+    print("[shell] reboot: ACPI RESET_REG attempt\n");
+
+    if (reset_reg.address_space_id == 1u) {       /* system I/O */
+        outb((uint16_t)reset_reg.address, reset_value);
+    } else if (reset_reg.address_space_id == 0u) { /* system memory */
+        *(volatile uint8_t*)(uintptr_t)reset_reg.address = reset_value;
+    } else {
+        print("[shell] reboot: unsupported ACPI ResetReg space; falling back\n");
+        return 0;
+    }
+    return 1;
+}
+#endif /* __x86_64__ */
+
 static void reboot() {
     __asm__ volatile ("cli");
+#ifdef __i386__
+    /* Original 32-bit path: load an invalid IDT then int3 -> triple fault. */
     struct { uint16_t limit; uint32_t base; } __attribute__((packed)) idt_ptr = {0, 0};
     __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
     __asm__ volatile ("int3\nud2\n");
+#else
+    /*
+     * Phase 3f x64 reboot path. Try ACPI 5.0 RESET_REG first (spec path on
+     * UEFI systems), then the 8042 keyboard-controller reset (universal
+     * PC chipset path), and finally cli/hlt forever as a last resort.
+     */
+    if (!acpi_reset_attempt()) {
+        print("[shell] reboot: pulsing 8042 keyboard-controller reset (x64 fallback)\n");
+        /* Drain the 8042 input buffer first so the reset pulse isn't lost. */
+        for (int i = 0; i < 16; i++) {
+            if ((inb(0x64) & 0x02) == 0) break;
+            (void)inb(0x60);
+        }
+        outb(0x64, 0xFE);
+    }
+#endif
     while (1) __asm__ volatile ("hlt");
 }
 
@@ -332,6 +521,13 @@ static int parse_u32_token(const char* s, uint32_t* out) {
     return 0;
 }
 
+/*
+ * Phase 3f: the storage / install / disk command helpers reach into the
+ * drivers/storage stack (storage.c / sdhci.c on both arches; bios_disk.c
+ * is real-mode-only and stays x86-gated). The 3e shell_deferred_3f shim
+ * is gone; both arches see the same command bodies. The bios_disk path
+ * is preserved x86-only via #ifdef inside the install flow if needed.
+ */
 static const storage_device_info_t* get_storage_device_by_id(int device_index) {
     storage_scan();
     return storage_get(device_index);
@@ -834,6 +1030,7 @@ static void disk_wipe_table(int device_index) {
 static void install_write_target(int target_index) {
     const storage_device_info_t* d;
     char buf[16];
+    (void)buf;  /* used only when EMBED_INSTALL_ISO=1 */
 
     storage_scan();
     d = storage_get_target(target_index);

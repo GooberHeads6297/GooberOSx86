@@ -47,8 +47,12 @@ static int point_equal(Point a, Point b) {
     return a.x == b.x && a.y == b.y;
 }
 
+/*
+ * Phase 4 (item 5): writes go through vga_text_putc so the VGA-passthrough
+ * shim can intercept them on x64 / UEFI. x86 BIOS path unchanged.
+ */
 static void draw_char(int x, int y, char c, uint8_t color) {
-    vga_put_char_at(c, x + 25, y + 2, color);
+    vga_text_putc(c, x + 25, y + 2, color);
 }
 
 static void draw_border() {
@@ -64,12 +68,12 @@ static void draw_border() {
 
 static void draw_score() {
     for (int x = 0; x < VGA_WIDTH; x++) {
-        vga_put_char_at(' ', x, 0, 0x0F);
+        vga_text_putc(' ', x, 0, 0x0F);
     }
     const char *score_str = "Score: ";
     int i = 0;
     while (score_str[i]) {
-        vga_put_char_at(score_str[i], i, 0, 0x0F);
+        vga_text_putc(score_str[i], i, 0, 0x0F);
         i++;
     }
     int s = score;
@@ -84,7 +88,7 @@ static void draw_score() {
         }
     }
     for (int j = dcount - 1; j >= 0; j--) {
-        vga_put_char_at('0' + digits[j], i++, 0, 0x0F);
+        vga_text_putc('0' + digits[j], i++, 0, 0x0F);
     }
 }
 
@@ -124,7 +128,7 @@ static void game_over_screen() {
     int start_x = (VGA_WIDTH - len) / 2;
     int y = HEIGHT + 3;
     for (int i = 0; i < len; i++) {
-        vga_put_char_at(msg[i], start_x + i, y, 0x0C);
+        vga_text_putc(msg[i], start_x + i, y, 0x0C);
     }
 }
 
