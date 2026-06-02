@@ -1,16 +1,18 @@
-# GooberOSx86
+# GooberOSx86 | GooberOSx64
 Simple OS with a Kernel and a Shell (W.I.P)
 
-<img width="397" height="138" alt="imageStart" src="https://github.com/user-attachments/assets/7598db4d-5243-41c1-84ba-0f8388f031cc" />
+<img width="181" height="37" alt="image" src="https://github.com/user-attachments/assets/bb6f39ea-2ec5-4dac-89eb-c1a8875393e1" />
+
 
 
 ________________________________
 
 ### Built-in Task Manager 
-(At the moment not neccesary becasue the only thing runnnig is the Kernel itself.)
+(At the moment not neccesary becasue the only thing running is the Kernel itself.)
 
 
-<img width="3840" height="2160" alt="TaskManagerUpdate" src="https://github.com/user-attachments/assets/7856bcc9-8228-492b-a3ce-ba765fc7cafb" />
+<img width="957" height="489" alt="image" src="https://github.com/user-attachments/assets/03ff41db-e101-4bfc-a215-05318dfee3bf" />
+
 
 ________________________________
 
@@ -19,11 +21,28 @@ ________________________________
 
 <img width="693" height="270" alt="ImageMemfilesystem" src="https://github.com/user-attachments/assets/4e2f3cc1-fcf3-4ec6-a14c-ce4ea1cce921" />
 
+### VGA GUI Filesystem Support 
+
+<img width="670" height="609" alt="image" src="https://github.com/user-attachments/assets/e21c76f2-51bb-4e28-b8e0-826d1e304bb7" />
+
+
+### Vesa Driver Support with File Explorer
+
+<img width="718" height="532" alt="image" src="https://github.com/user-attachments/assets/8a1e0d9c-0e7a-417a-a9b8-19e3e2b26072" />
+
+
 ________________________________
 
-### Integrated Text Editor (Currenntly In Development)
+### Integrated Text Editor (Interactive with Memory-Based Filesystem)
 
 <img width="835" height="354" alt="ImageEditor" src="https://github.com/user-attachments/assets/e8d2dc58-3b94-4217-b09f-59b8ca868698" />
+
+### VGA GUI Support For Text Editor
+
+### Vesa Driver Support With Text Editor
+
+<img width="937" height="564" alt="image" src="https://github.com/user-attachments/assets/19c269da-e20e-4d07-8493-f31ae9650b83" />
+
 
 ________________________________
 
@@ -33,11 +52,24 @@ ________________________________
 
 ________________________________
 
-### Text Editor Integration with GUI
+### Device and simple Storage ennumeration for hybrid ISO installation (Currently Works on x86 release)
 
-<img width="3840" height="2160" alt="TextEdit" src="https://github.com/user-attachments/assets/67997362-36f6-4fe4-ab9e-f5244c3c8498" />
+<img width="1380" height="676" alt="image" src="https://github.com/user-attachments/assets/3205fecb-9024-42ab-9579-6459fcf1756f" />
 
-________________________________
+_________________________________
+
+### Light and Dark Mode for VESA supported Display Manager (Both x86 and x64)
+
+## Light Mode
+
+<img width="1315" height="988" alt="image" src="https://github.com/user-attachments/assets/4ea13897-5f76-41c9-ac27-835f03d99591" />
+
+## Dark Mode
+
+<img width="1315" height="988" alt="image" src="https://github.com/user-attachments/assets/711bc0a6-9a9b-44c6-8af6-5196121cc237" />
+
+
+_________________________________
 
 
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
