@@ -74,8 +74,12 @@ _________________________________
 
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
-Release: 0.11.5 (sha256 only shows the one for the latest release)
-802df6ae35109f057163d37c072072695bbc9177e7f033b48b491a6bce6e5180
+Release x86: 0.11.7 (sha256 only shows the one for the latest release)
+7f5abfdb83297968f2d71c587d15ceed8cf40d02218ff8c40f638e1a792d180a
+
+Release x86_x64: 0.11.7 (sha256 only shows the one for the latest release)
+7f5abfdb83297968f2d71c587d15ceed8cf40d02218ff8c40f638e1a792d180a
+ 
 
   Install with GRUB on a storage device:
 
