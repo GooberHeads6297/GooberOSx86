@@ -41,6 +41,7 @@ int fs_create(const char* filename);
 int fs_delete(const char* filename);
 int fs_delete_dir(const char* dirname);
 int fs_create_dir(const char* dirname);
+int fs_rename(const char* old_name, const char* new_name);
 int fs_write(const char* filename, const uint8_t* data, size_t size);
 const char* fs_get_cwd(void);
 const Directory* fs_get_current_dir(void);
@@ -58,6 +59,7 @@ void fs_set_current_dir(Directory* dir);
 FileHandle* fs_dir_open(Directory* dir, const char* filename);
 int fs_dir_create(Directory* dir, const char* filename);
 int fs_dir_create_dir(Directory* dir, const char* dirname);
+int fs_dir_rename(Directory* dir, const char* old_name, const char* new_name);
 int fs_dir_write(Directory* dir, const char* filename, const uint8_t* data, size_t size);
 
 #endif

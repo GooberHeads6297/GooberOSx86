@@ -224,54 +224,66 @@ static int bochs_init(uint32_t req_w, uint32_t req_h, uint8_t req_bpp,
         return 0;
     }
 
-    uint32_t w = req_w ? req_w : BOCHS_DEFAULT_WIDTH;
-    uint32_t h = req_h ? req_h : BOCHS_DEFAULT_HEIGHT;
-    uint8_t  bpp = req_bpp ? req_bpp : BOCHS_DEFAULT_BPP;
+    uint32_t modes[][2] = {
+        { req_w, req_h },
+        { BOCHS_DEFAULT_WIDTH, BOCHS_DEFAULT_HEIGHT },
+        { 1280, 720 },
+        { 800, 600 },
+        { 640, 480 }
+    };
+    uint8_t bpp = req_bpp ? req_bpp : BOCHS_DEFAULT_BPP;
+    uintptr_t base = bochs_lfb_base();
 
     /* Only 32/24/16 bpp are programmable here; clamp anything else to 32. */
     if (bytes_per_pixel(bpp) == 0 || bpp == 15) bpp = 32;
-    /* Keep within safe-mode bounds shared with the inherited path. */
-    if (w < 320) w = 320;
-    if (h < 200) h = 200;
-    if (w > 1920) w = 1920;
-    if (h > 1200) h = 1200;
 
-    dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
-    dispi_write(VBE_DISPI_INDEX_XRES, (uint16_t)w);
-    dispi_write(VBE_DISPI_INDEX_YRES, (uint16_t)h);
-    dispi_write(VBE_DISPI_INDEX_BPP, (uint16_t)bpp);
-    dispi_write(VBE_DISPI_INDEX_VIRT_WIDTH, (uint16_t)w);
-    dispi_write(VBE_DISPI_INDEX_VIRT_HEIGHT, (uint16_t)h);
-    dispi_write(VBE_DISPI_INDEX_X_OFFSET, 0);
-    dispi_write(VBE_DISPI_INDEX_Y_OFFSET, 0);
-    dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
-
-    /* Verify the device latched the geometry we asked for. The dispi model
-     * clamps to supported values, so a mismatch means the mode was refused. */
-    uint16_t got_w = dispi_read(VBE_DISPI_INDEX_XRES);
-    uint16_t got_h = dispi_read(VBE_DISPI_INDEX_YRES);
-    uint16_t got_bpp = dispi_read(VBE_DISPI_INDEX_BPP);
-    if (got_w != (uint16_t)w || got_h != (uint16_t)h || got_bpp != (uint16_t)bpp) {
-        display_set_error("Bochs/dispi: device rejected the requested mode.\n");
-        /* Leave the device disabled so we don't sit in a half-set mode. */
-        dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
-        return 0;
-    }
-
-    uintptr_t base = bochs_lfb_base();
     if (!base) {
         display_set_error("Bochs/dispi: no linear framebuffer aperture found.\n");
-        dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
         return 0;
     }
 
-    out->framebuffer_addr = base;
-    out->width = w;
-    out->height = h;
-    out->pitch = w * bytes_per_pixel(bpp);
-    out->bpp = bpp;
-    out->format = fmt_for_bpp(bpp);
-    return 1;
+    for (int m = 0; m < (int)(sizeof(modes) / sizeof(modes[0])); m++) {
+        uint32_t w = modes[m][0] ? modes[m][0] : BOCHS_DEFAULT_WIDTH;
+        uint32_t h = modes[m][1] ? modes[m][1] : BOCHS_DEFAULT_HEIGHT;
+
+        /* Keep within safe-mode bounds shared with the inherited path. */
+        if (w < 320) w = 320;
+        if (h < 200) h = 200;
+        if (w > 1920) w = 1920;
+        if (h > 1200) h = 1200;
+
+        dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+        dispi_write(VBE_DISPI_INDEX_XRES, (uint16_t)w);
+        dispi_write(VBE_DISPI_INDEX_YRES, (uint16_t)h);
+        dispi_write(VBE_DISPI_INDEX_BPP, (uint16_t)bpp);
+        dispi_write(VBE_DISPI_INDEX_VIRT_WIDTH, (uint16_t)w);
+        dispi_write(VBE_DISPI_INDEX_VIRT_HEIGHT, (uint16_t)h);
+        dispi_write(VBE_DISPI_INDEX_X_OFFSET, 0);
+        dispi_write(VBE_DISPI_INDEX_Y_OFFSET, 0);
+        dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
+
+        /* Verify the device latched the geometry we asked for. The dispi model
+         * clamps to supported values, so a mismatch means the mode was refused. */
+        uint16_t got_w = dispi_read(VBE_DISPI_INDEX_XRES);
+        uint16_t got_h = dispi_read(VBE_DISPI_INDEX_YRES);
+        uint16_t got_bpp = dispi_read(VBE_DISPI_INDEX_BPP);
+        if (got_w != (uint16_t)w || got_h != (uint16_t)h || got_bpp != (uint16_t)bpp) {
+            display_set_error("Bochs/dispi: device rejected a candidate mode.\n");
+            continue;
+        }
+
+        out->framebuffer_addr = base;
+        out->width = w;
+        out->height = h;
+        out->pitch = w * bytes_per_pixel(bpp);
+        out->bpp = bpp;
+        out->format = fmt_for_bpp(bpp);
+        return 1;
+    }
+
+    dispi_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+    display_set_error("Bochs/dispi: no recommended mode was accepted.\n");
+    return 0;
 }
 
 static const display_driver_ops_t bochs_ops = {

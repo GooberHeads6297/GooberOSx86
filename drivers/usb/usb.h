@@ -141,6 +141,7 @@ typedef struct {
     uint8_t  class_code;
     uint8_t  subclass;
     uint8_t  protocol;
+    uint8_t  interface_number;
     uint8_t  max_packet_size;
     uint8_t  ep_in;          /* IN endpoint address for interrupt */
     uint8_t  ep_out;         /* OUT endpoint address */

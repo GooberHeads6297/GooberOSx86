@@ -92,6 +92,52 @@ int pci_find_usb_controllers(usb_pci_controller_t* out, int max_out) {
     return found;
 }
 
+static int pci_is_intel_lpss_i2c(uint16_t vendor_id, uint16_t device_id,
+                                 uint8_t base_class, uint8_t sub_class) {
+    if (vendor_id == 0x8086) {
+        /* Bay Trail LPSS I2C controller IDs are commonly 0x0F41..0x0F45. */
+        if (device_id >= 0x0F41 && device_id <= 0x0F45) return 1;
+        /* Many Intel LPSS I2C devices report as "serial bus, other". */
+        if (base_class == 0x0C && sub_class == 0x80) return 1;
+    }
+    return 0;
+}
+
+int pci_find_i2c_controllers(i2c_pci_controller_t* out, int max_out) {
+    int found = 0;
+
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t id = pci_read_config_dword(bus, slot, func, 0);
+                uint16_t vendor_id = (uint16_t)(id & 0xFFFF);
+                uint16_t device_id = (uint16_t)((id >> 16) & 0xFFFF);
+                if (vendor_id == 0xFFFF) continue;
+
+                uint32_t class_code = pci_read_config_dword(bus, slot, func, 0x08);
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                uint8_t sub_class = (class_code >> 16) & 0xFF;
+
+                if (!pci_is_intel_lpss_i2c(vendor_id, device_id, base_class, sub_class)) {
+                    continue;
+                }
+
+                if (out && found < max_out) {
+                    out[found].bus = (uint8_t)bus;
+                    out[found].slot = slot;
+                    out[found].func = func;
+                    out[found].vendor_id = vendor_id;
+                    out[found].device_id = device_id;
+                    out[found].bar0 = pci_read_config_dword(bus, slot, func, 0x10);
+                    out[found].bar1 = pci_read_config_dword(bus, slot, func, 0x14);
+                }
+                found++;
+            }
+        }
+    }
+    return found;
+}
+
 int pci_find_display_controllers(pci_display_device_t* out, int max_out) {
     int found = 0;
 

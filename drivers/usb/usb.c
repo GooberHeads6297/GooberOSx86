@@ -123,7 +123,8 @@ void usb_init(void) {
         }
         if (usb_hid_has_keyboard_device()) {
             found_keyboard = 1;
-            break;
+            usb_print("USB enum: keyboard present; continuing host fallback chain for pointer.\n");
+            continue;
         }
         usb_print("USB enum: candidate had no boot HID input, trying next host.\n");
     }

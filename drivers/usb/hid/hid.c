@@ -10,6 +10,21 @@ static int pointer_present = 0;
 static int touchpad_present = 0;
 static int keyboard_present = 0;
 static uint8_t last_keys[6];
+static uint32_t pointer_report_count = 0;
+static uint32_t keyboard_report_count = 0;
+
+typedef struct {
+    uint8_t present;
+    uint8_t is_touchpad;
+    uint8_t port;
+    uint8_t address;
+    uint8_t endpoint;
+    uint16_t max_packet;
+    uint8_t interval;
+} hid_boot_endpoint_state_t;
+
+static hid_boot_endpoint_state_t pointer_state;
+static hid_boot_endpoint_state_t keyboard_state;
 
 /* Single output sink shared by attach/detach so the hot-plug log format is
  * canonical across all callers (boot scan + hot-plug poll). */
@@ -17,12 +32,40 @@ static void hid_serial(const char* s) { while (*s) outb(0xE9, *s++); }
 static void hid_print(const char* s) { print(s); hid_serial(s); }
 
 static void hid_print_int(int n) {
-    char buf[6];
+    char tmp[12];
+    char buf[12];
+    int i = 0;
+    int j = 0;
     if (n < 0) { hid_print("-"); n = -n; }
-    if (n >= 100) { buf[0] = '0' + (n / 100); buf[1] = '0' + ((n / 10) % 10); buf[2] = '0' + (n % 10); buf[3] = 0; }
-    else if (n >= 10) { buf[0] = '0' + (n / 10); buf[1] = '0' + (n % 10); buf[2] = 0; }
-    else { buf[0] = '0' + n; buf[1] = 0; }
+    if (n == 0) {
+        hid_print("0");
+        return;
+    }
+    while (n > 0 && i < (int)sizeof(tmp)) {
+        tmp[i++] = (char)('0' + (n % 10));
+        n /= 10;
+    }
+    while (i > 0 && j < (int)sizeof(buf) - 1) {
+        buf[j++] = tmp[--i];
+    }
+    buf[j] = 0;
     hid_print(buf);
+}
+
+static void hid_print_endpoint(const char* label, const hid_boot_endpoint_state_t* s) {
+    hid_print("[usb-hid] ");
+    hid_print(label);
+    hid_print(": port=");
+    hid_print_int((int)s->port);
+    hid_print(" addr=");
+    hid_print_int((int)s->address);
+    hid_print(" ep=");
+    hid_print_int((int)s->endpoint);
+    hid_print(" maxpkt=");
+    hid_print_int((int)s->max_packet);
+    hid_print(" interval=");
+    hid_print_int((int)s->interval);
+    hid_print(s->is_touchpad ? " touchpad=1\n" : " touchpad=0\n");
 }
 
 static const char hid_key_ascii[128] = {
@@ -63,18 +106,56 @@ void usb_hid_init(void) {
     pointer_present = 0;
     touchpad_present = 0;
     keyboard_present = 0;
+    pointer_state.present = 0;
+    keyboard_state.present = 0;
+    pointer_report_count = 0;
+    keyboard_report_count = 0;
     for (int i = 0; i < 6; i++) last_keys[i] = 0;
 }
 
 void usb_hid_register_boot_pointer(uint8_t present, uint8_t is_touchpad) {
+    usb_hid_register_boot_pointer_detail(present, is_touchpad, 0, 0, 0, 0, 0);
+}
+
+void usb_hid_register_boot_pointer_detail(uint8_t present, uint8_t is_touchpad,
+                                          uint8_t port, uint8_t address,
+                                          uint8_t endpoint, uint16_t max_packet,
+                                          uint8_t interval) {
     pointer_present = present ? 1 : 0;
     touchpad_present = (present && is_touchpad) ? 1 : 0;
+    pointer_state.present = pointer_present;
+    pointer_state.is_touchpad = touchpad_present;
+    pointer_state.port = port;
+    pointer_state.address = address;
+    pointer_state.endpoint = endpoint;
+    pointer_state.max_packet = max_packet;
+    pointer_state.interval = interval;
+    if (pointer_present) {
+        pointer_report_count = 0;
+        hid_print_endpoint("boot pointer attached", &pointer_state);
+    }
 }
 
 void usb_hid_register_boot_keyboard(uint8_t present) {
+    usb_hid_register_boot_keyboard_detail(present, 0, 0, 0, 0, 0);
+}
+
+void usb_hid_register_boot_keyboard_detail(uint8_t present, uint8_t port,
+                                           uint8_t address, uint8_t endpoint,
+                                           uint16_t max_packet, uint8_t interval) {
     keyboard_present = present ? 1 : 0;
+    keyboard_state.present = keyboard_present;
+    keyboard_state.is_touchpad = 0;
+    keyboard_state.port = port;
+    keyboard_state.address = address;
+    keyboard_state.endpoint = endpoint;
+    keyboard_state.max_packet = max_packet;
+    keyboard_state.interval = interval;
     if (!keyboard_present) {
         for (int i = 0; i < 6; i++) last_keys[i] = 0;
+    } else {
+        keyboard_report_count = 0;
+        hid_print_endpoint("boot keyboard attached", &keyboard_state);
     }
 }
 
@@ -89,6 +170,10 @@ static void usb_hid_handle_keyboard_report(const uint8_t* report, uint8_t length
     if (!report || length < 8 || !keyboard_present) return;
     uint8_t modifiers = report[0];
     int shifted = (modifiers & ((1U << 1) | (1U << 5))) != 0;
+    if (keyboard_report_count == 0) {
+        hid_print("[usb-hid] first keyboard interrupt report received.\n");
+    }
+    keyboard_report_count++;
 
     for (int i = 2; i < 8; i++) {
         uint8_t key = report[i];
@@ -130,6 +215,17 @@ void usb_hid_handle_boot_report(const uint8_t* report, uint8_t length) {
     int dy = -(int)((int8_t)report[2]);
     int8_t wheel = (length >= 4) ? (int8_t)report[3] : 0;
 
+    if (pointer_report_count == 0) {
+        hid_print("[usb-hid] first pointer interrupt report: dx=");
+        hid_print_int(dx);
+        hid_print(" dy=");
+        hid_print_int(dy);
+        hid_print(" buttons=");
+        hid_print_int((int)buttons);
+        hid_print("\n");
+    }
+    pointer_report_count++;
+
     input_report_pointer_delta(
         touchpad_present ? INPUT_DEVICE_USB_TOUCHPAD : INPUT_DEVICE_USB_MOUSE,
         dx,
@@ -152,7 +248,7 @@ int usb_hid_has_keyboard_device(void) {
 
 void usb_hid_attach(int port, uint8_t address, int protocol) {
     if (protocol == USB_HID_PROTOCOL_MOUSE) {
-        usb_hid_register_boot_pointer(1, 0);
+        /* enumerate_device() already registered endpoint/address details. */
         input_set_usb_pointer_active(1);
         hid_print("[usb] hotplug: port-");
         hid_print_int(port);
@@ -160,7 +256,6 @@ void usb_hid_attach(int port, uint8_t address, int protocol) {
         hid_print_int((int)address);
         hid_print(", class=HID, protocol=mouse, attaching to HID driver\n");
     } else if (protocol == USB_HID_PROTOCOL_KEYBOARD) {
-        usb_hid_register_boot_keyboard(1);
         hid_print("[usb] hotplug: port-");
         hid_print_int(port);
         hid_print(" connect, addr=");

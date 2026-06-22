@@ -19,7 +19,7 @@ static uint32_t tsc_cycles_per_ms = 0;
 static int      tsc_calibrated = 0;
 
 /* Number of PIT ticks (10 ms each at 100 Hz) to average TSC over at init. */
-#define TSC_CAL_TICKS 10
+#define TSC_CAL_TICKS 3
 
 /*
  * Absolute spin ceiling for the bounded fixed-delay helper. Sized so it never
@@ -88,7 +88,7 @@ void timer_calibrate_tsc(void) {
     /*
      * Bound the calibration spins so that if IRQ0 is somehow not advancing
      * the tick, we fall back to the PIT-tick path instead of hanging here.
-     * The ceiling is huge relative to the ~100 ms we actually expect to wait.
+     * The ceiling is huge relative to the ~30 ms we actually expect to wait.
      */
     uint32_t guard;
 
@@ -105,7 +105,7 @@ void timer_calibrate_tsc(void) {
     uint64_t c1 = rdtsc();
 
     uint64_t elapsed = c1 - c0;
-    /* A 10-tick (100 ms) window stays well under 2^32 cycles for realistic
+    /* A short PIT-tick window stays well under 2^32 cycles for realistic
      * CPU clocks, so reduce to 32 bits before the constant-divisor divide. */
     uint32_t elapsed32 = (uint32_t)elapsed;
     if ((elapsed >> 32) != 0) {

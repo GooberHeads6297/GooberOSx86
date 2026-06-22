@@ -21,7 +21,7 @@
 #   - GooberOSx86-x64.iso   Hybrid BIOS + UEFI ISO (independent from x86 ISO).
 #
 # Sub-commands (positional, defaults to "build"):
-#   build           Compile + link + ISO.
+#   build           Compile + link + ISO (with embedded installer image).
 #   list-devices    Print host block devices (shared with x86 path).
 #   install         Install to a mounted target device (grub --target=x86_64-efi).
 #
@@ -42,7 +42,7 @@ cd "${REPO_ROOT}"
 BUILD_DIR=build64
 ISO_DIR=iso64
 ISO_OUTPUT="GooberOSx86-x64.iso"
-EMBED_INSTALL_ISO="${EMBED_INSTALL_ISO:-0}"   # off until Phase 3 wires installer back in
+EMBED_INSTALL_ISO="${EMBED_INSTALL_ISO:-1}"
 CC="${X64_CC:-gcc}"
 LD="${X64_LD:-ld}"
 NASM="nasm"
@@ -255,6 +255,8 @@ EOF
 }
 
 build_image() {
+  local embed_requested="${EMBED_INSTALL_ISO}"
+
   print_migration_banner
 
   if ! build_kernel 0 ""; then
@@ -266,6 +268,16 @@ build_image() {
     exit 1
   fi
   create_iso_hybrid
+
+  if [ "${embed_requested}" = "1" ]; then
+    rm -f "${BUILD_DIR}/osimage.o"
+    ${LD} -m elf_x86_64 -r -b binary "${ISO_OUTPUT}" -o "${BUILD_DIR}/osimage.o"
+    if ! build_kernel 1 "${BUILD_DIR}/osimage.o"; then
+      echo "[x] x64 build failed while embedding installer ISO." >&2
+      exit 1
+    fi
+    create_iso_hybrid
+  fi
 }
 
 # Phase 3b kernel: the unified kernel.c orchestrator is now the long-mode
@@ -309,9 +321,8 @@ build_kernel() {
   set_embed_defs "${embed_flag}"
   mkdir -p "${BUILD_DIR}"
 
-  # The osimage_obj plumbing is preserved for symmetry with the x86 builder
-  # but Phase 1/2/3a/3b do not embed an installer image. Suppress warning.
-  : "${osimage_obj}"
+  # osimage_obj is present on the second build pass when EMBED_INSTALL_ISO=1.
+  # The shell's `install write <target-id> YES` command streams it to disk.
 
   echo "[x64] Assembling Phase 1 boot stubs (elf64)..."
   ${NASM} -f elf64 boot64.s -o "${BUILD_DIR}/boot64.o"
@@ -357,13 +368,31 @@ build_kernel() {
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/pci \
     -c drivers/video/intel_gfx.c -o "${BUILD_DIR}/intel_gfx.o"
 
+  # textcon: 80x25 text-console abstraction with VGA (0xB8000) and
+  # framebuffer (8x16 font into the top-left of the GOP LFB) backends.
+  # Required to give the x64 VGA-compatibility GRUB entries a visible,
+  # interactive shell on both legacy BIOS and UEFI hardware.
+  echo "[x64] Compiling drivers/video/textcon.c (text-console backends) under -m64..."
+  compile_c -I. -Idrivers/io -Idrivers/video \
+    -c drivers/video/textcon.c -o "${BUILD_DIR}/textcon.o"
+
   echo "[x64] Compiling Phase 3c drivers (input, keyboard, mouse) under -m64..."
   compile_c -I. -Idrivers/io \
     -c drivers/input/input.c -o "${BUILD_DIR}/input.o"
+  compile_c -I. -Idrivers/io -Idrivers/input -Idrivers/acpi -Idrivers/hid -Idrivers/i2c -Ilib \
+    -c drivers/input/touchpad.c -o "${BUILD_DIR}/touchpad.o"
   compile_c -I. -Idrivers/io \
     -c drivers/keyboard/keyboard.c -o "${BUILD_DIR}/keyboard.o"
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/input \
     -c drivers/mouse/mouse.c -o "${BUILD_DIR}/mouse.o"
+
+  echo "[x64] Compiling ACPI + I2C HID touchpad support under -m64..."
+  compile_c -I. -Idrivers/io -Ilib \
+    -c drivers/acpi/acpi.c -o "${BUILD_DIR}/acpi.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/timer -Ilib \
+    -c drivers/i2c/designware.c -o "${BUILD_DIR}/i2c_designware.o"
+  compile_c -I. -Idrivers/io -Idrivers/i2c -Ilib \
+    -c drivers/hid/i2c_hid.c -o "${BUILD_DIR}/i2c_hid.o"
 
   echo "[x64] Compiling Phase 3d drivers/pci/pci.c (real PCI scan) under -m64..."
   compile_c -I. -Idrivers/io -Ilib \
@@ -530,7 +559,12 @@ build_kernel() {
       "${BUILD_DIR}/native_fb.o" \
       "${BUILD_DIR}/vesa.o" \
       "${BUILD_DIR}/intel_gfx.o" \
+      "${BUILD_DIR}/textcon.o" \
       "${BUILD_DIR}/input.o" \
+      "${BUILD_DIR}/touchpad.o" \
+      "${BUILD_DIR}/acpi.o" \
+      "${BUILD_DIR}/i2c_designware.o" \
+      "${BUILD_DIR}/i2c_hid.o" \
       "${BUILD_DIR}/keyboard.o" \
       "${BUILD_DIR}/mouse.o" \
       "${BUILD_DIR}/pci.o" \
@@ -558,7 +592,8 @@ build_kernel() {
       "${BUILD_DIR}/snake.o" \
       "${BUILD_DIR}/cubeDip.o" \
       "${BUILD_DIR}/pong.o" \
-      "${BUILD_DIR}/doom.o"
+      "${BUILD_DIR}/doom.o" \
+      ${osimage_obj}
 
   echo "[+] x64 Kernel built: ${BUILD_DIR}/kernel.bin"
   return 0

@@ -14,6 +14,16 @@ typedef struct {
     uint32_t bar1;
 } usb_pci_controller_t;
 
+typedef struct {
+    uint8_t bus;
+    uint8_t slot;
+    uint8_t func;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint32_t bar0;
+    uint32_t bar1;
+} i2c_pci_controller_t;
+
 /*
  * A PCI display controller (base class 0x03). Reports all six raw BARs so a
  * display driver can pick out the linear-framebuffer aperture and the MMIO
@@ -33,6 +43,7 @@ typedef struct {
 
 void pci_init(void);
 int pci_find_usb_controllers(usb_pci_controller_t* out, int max_out);
+int pci_find_i2c_controllers(i2c_pci_controller_t* out, int max_out);
 
 /*
  * Enumerate PCI display controllers (base class 0x03). Returns the number

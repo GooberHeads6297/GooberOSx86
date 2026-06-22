@@ -3,20 +3,17 @@
 #include "../drivers/keyboard/keyboard.h"
 #include "../drivers/mouse/mouse.h"
 #include "../drivers/input/input.h"
+#include "../drivers/input/touchpad.h"
 #include "../drivers/timer/timer.h"
 #include "../drivers/usb/usb.h"
 #include "../fs/filesystem.h"
 #include "../lib/string.h"
 #include "../kernel.h"
 
-/*
- * Parse gooberos.theme=<light|dark> from the kernel cmdline. Light is a much
- * safer default on marginal LCD panels because pure white is the easiest
- * color for a poorly-syncing display to render legibly.
- */
+/* Parse gooberos.theme=<original|dark|light>. Original is the shell-first default. */
 static int vdesk_initial_theme_from_cmdline(void) {
     const char* cmdline = kernel_boot_cmdline();
-    if (!cmdline) return 0;
+    if (!cmdline) return VDESK_APPEARANCE_ORIGINAL;
     const char* p = cmdline;
     while (*p) {
         while (*p == ' ' || *p == '\t') p++;
@@ -25,31 +22,43 @@ static int vdesk_initial_theme_from_cmdline(void) {
         while (needle[i] && p[i] && needle[i] == p[i]) i++;
         if (!needle[i]) {
             const char* v = p + i;
-            if (v[0] == 'l' && v[1] == 'i') return 1; /* light */
-            return 0;
+            if (v[0] == 'l' && v[1] == 'i') return VDESK_APPEARANCE_LIGHT;
+            if (v[0] == 'd' && v[1] == 'a') return VDESK_APPEARANCE_MODERN_DARK;
+            return VDESK_APPEARANCE_ORIGINAL;
         }
         while (*p && *p != ' ' && *p != '\t') p++;
     }
-    return 0;
+    return VDESK_APPEARANCE_ORIGINAL;
 }
 
 static VDesktop desktop;
 static int new_file_count = 1;
 static int new_bitmap_count = 1;
 static int new_folder_count = 1;
+static int shell_output_color_index = 0;
+static int shell_input_color_index = 0;
+
+static void clear_icon_selection(void);
+
+static const VTheme original_theme = {
+    0x05090D, 0x061B3A, 0x12325F, 0x071018, 0x7FD88A, 0x254F8E,
+    0x09131A, 0x000000, 0x153C7A, 0x102235, 0xD7E8FF, 0x7FD88A,
+    0x5AA96A, 0x0D2C5C, 0x4D8F5D, 0x071A33, 0x000000, 0x315E9B,
+    0x081520, 0x000000, 0x67B878, 0x5B7FDB, 0x5F9568
+};
 
 static const VTheme dark_theme = {
     0x202124, 0x16181C, 0x30343B, 0x252A31, 0xF1F3F4, 0x3A7BD5,
     0x2B3038, 0x1F2329, 0x0A64D8, 0x3A3F47, 0xFFFFFF, 0xE8EAED,
     0x9AA0A6, 0x050608, 0x4B5563, 0x111318, 0x050608, 0x4C8BF5,
-    0x343A42
+    0x343A42, 0x000000, 0x00AA00, 0x0000AA, 0x9AA0A6
 };
 
 static const VTheme light_theme = {
     0xEAF2F8, 0xECEFF4, 0xFFFFFF, 0xFFFFFF, 0x111827, 0x2D6CDF,
     0xF3F4F6, 0xFFFFFF, 0x1B68D2, 0x9CA3AF, 0xFFFFFF, 0x111827,
     0x4B5563, 0x2F343D, 0xFFFFFF, 0x7B8190, 0x5A6070, 0x2563EB,
-    0xE5E7EB
+    0xE5E7EB, 0xFFFFFF, 0x008000, 0x0000AA, 0x4B5563
 };
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -57,8 +66,14 @@ static const VTheme light_theme = {
 #define ABS(a) ((a) < 0 ? -(a) : (a))
 #define CLAMP(v, lo, hi) MAX((lo), MIN((hi), (v)))
 
+#define VCTX_DESKTOP 0
+#define VCTX_ICON    1
+#define VCTX_TASKBAR 2
+
 static const VTheme* theme(void) {
-    return desktop.theme_mode ? &light_theme : &dark_theme;
+    if (desktop.appearance == VDESK_APPEARANCE_LIGHT) return &light_theme;
+    if (desktop.appearance == VDESK_APPEARANCE_MODERN_DARK) return &dark_theme;
+    return &original_theme;
 }
 
 void vdesk_mark_dirty(int x, int y, int w, int h) {
@@ -123,6 +138,18 @@ void vdesk_draw_text(int x, int y, const char* str, color_t fg, color_t bg) {
     vesa_draw_string(x, y, str, fg, bg);
 }
 
+static int original_appearance(void) {
+    return desktop.appearance == VDESK_APPEARANCE_ORIGINAL;
+}
+
+static void draw_soft_corners(int x, int y, int w, int h, color_t bg) {
+    if (!original_appearance() || w < 8 || h < 8) return;
+    vdesk_draw_rect(x, y, 2, 2, bg);
+    vdesk_draw_rect(x + w - 2, y, 2, 2, bg);
+    vdesk_draw_rect(x, y + h - 2, 2, 2, bg);
+    vdesk_draw_rect(x + w - 2, y + h - 2, 2, 2, bg);
+}
+
 /* ---- Desktop state ---- */
 
 void vdesk_init(int screen_w, int screen_h) {
@@ -135,7 +162,21 @@ void vdesk_init(int screen_w, int screen_h) {
     desktop.context_open = 0;
     desktop.context_x = 0;
     desktop.context_y = 0;
-    desktop.theme_mode = vdesk_initial_theme_from_cmdline();
+    desktop.context_kind = VCTX_DESKTOP;
+    desktop.context_target_icon = -1;
+    desktop.context_target_window_id = 0;
+    desktop.rename_open = 0;
+    desktop.rename_target_kind = VICON_FOLDER;
+    desktop.rename_old_name[0] = '\0';
+    desktop.rename_input[0] = '\0';
+    desktop.rename_len = 0;
+    desktop.rename_status = 0;
+    desktop.appearance = vdesk_initial_theme_from_cmdline();
+    desktop.theme_mode = (desktop.appearance == VDESK_APPEARANCE_LIGHT);
+    desktop.primary_shell_id = 0;
+    desktop.shell_first_mode = 1;
+    desktop.desktop_experience_visible = 1;
+    desktop.taskbar_position = VDESK_TASKBAR_TOP;
     /*
      * Phase 4 (display polish, item 2): target frame budget driven by the
      * gooberos.display.fps=N cmdline knob (default 60 Hz -> 16 ms/frame).
@@ -168,6 +209,8 @@ void vdesk_init(int screen_w, int screen_h) {
     desktop.mouse_buttons = 0;
     desktop.running = 1;
     memset(&desktop.metrics, 0, sizeof(desktop.metrics));
+    desktop.metrics.theme_mode = desktop.theme_mode;
+    desktop.metrics.appearance = desktop.appearance;
     vdesk_mark_full_dirty();
 
     for (int i = 0; i < MAX_VWINDOWS; i++) {
@@ -185,6 +228,15 @@ static VWindow* get_window(int id) {
             return &desktop.windows[i];
     }
     return NULL;
+}
+
+int vdesk_workspace_top(void) {
+    return desktop.taskbar_position == VDESK_TASKBAR_TOP ? TASKBAR_HEIGHT : 0;
+}
+
+int vdesk_workspace_bottom(void) {
+    return desktop.taskbar_position == VDESK_TASKBAR_BOTTOM ?
+           desktop.screen_h - TASKBAR_HEIGHT : desktop.screen_h;
 }
 
 static void remove_z(int id) {
@@ -206,6 +258,101 @@ void vdesk_bring_to_front(VWindow* win) {
             desktop.windows[i].focused = 0;
     }
     win->focused = 1;
+}
+
+void vdesk_set_primary_shell(VWindow* win) {
+    if (!win) return;
+    mark_window_dirty(win);
+    desktop.primary_shell_id = win->id;
+    win->has_close = 0;
+    win->has_minimize = 0;
+    win->has_maximize = 0;
+    win->saved_x = win->x;
+    win->saved_y = win->y;
+    win->saved_w = win->width;
+    win->saved_h = win->height;
+    win->x = 0;
+    win->y = vdesk_workspace_top();
+    win->width = desktop.screen_w;
+    win->height = vdesk_workspace_bottom() - vdesk_workspace_top();
+    win->maximized = 1;
+    vdesk_bring_to_front(win);
+    vdesk_mark_full_dirty();
+}
+
+int vdesk_has_active_app_focus(void) {
+    for (int i = 0; i < MAX_VWINDOWS; i++) {
+        VWindow* w = &desktop.windows[i];
+        if (!w->visible || w->minimized || !w->focused) continue;
+        if (w->id != desktop.primary_shell_id) return 1;
+    }
+    return 0;
+}
+
+void vdesk_focus_primary_shell(void) {
+    VWindow* shell = get_window(desktop.primary_shell_id);
+    if (!desktop.shell_first_mode || !shell || !shell->visible) return;
+    shell->minimized = 0;
+    vdesk_bring_to_front(shell);
+    vdesk_mark_full_dirty();
+}
+
+static int should_auto_focus_primary_shell(void) {
+    return desktop.shell_first_mode && !desktop.desktop_experience_visible;
+}
+
+void vdesk_tile_window(VWindow* win) {
+    (void)win;
+    int ids[MAX_VWINDOWS];
+    int count = 0;
+    for (int i = 0; i < MAX_VWINDOWS; i++) {
+        VWindow* w = &desktop.windows[i];
+        if (!w->visible || w->minimized) continue;
+        if (w->id == desktop.primary_shell_id) continue;
+        ids[count++] = w->id;
+    }
+    if (count <= 0) return;
+
+    int gap = 8;
+    int top = vdesk_workspace_top();
+    int bottom = vdesk_workspace_bottom();
+    int region_x = desktop.screen_w / 2;
+    int region_w = desktop.screen_w - region_x - gap;
+    int rows = count;
+    if (rows > 3) rows = 3;
+    int cols = (count + rows - 1) / rows;
+    if (cols < 1) cols = 1;
+    if (region_w < 240) {
+        region_x = gap;
+        region_w = desktop.screen_w - gap * 2;
+    }
+
+    int avail_w = region_w - gap * (cols - 1);
+    int avail_h = bottom - top - gap * (rows + 1);
+    if (avail_w < cols * 160 || avail_h < rows * 110) return;
+
+    int tile_w = avail_w / cols;
+    int tile_h = avail_h / rows;
+    if (tile_w > 460) tile_w = 460;
+    if (tile_h > 300) tile_h = 300;
+    for (int i = 0; i < count; i++) {
+        VWindow* w = get_window(ids[i]);
+        if (!w) continue;
+        int col = i % cols;
+        int row = (i / cols) % rows;
+        mark_window_dirty(w);
+        w->x = region_x + col * (tile_w + gap);
+        w->y = top + gap + row * (tile_h + gap);
+        w->width = tile_w;
+        w->height = tile_h;
+        w->maximized = 0;
+        w->saved_x = w->x;
+        w->saved_y = w->y;
+        w->saved_w = w->width;
+        w->saved_h = w->height;
+        mark_window_dirty(w);
+    }
+    vdesk_mark_full_dirty();
 }
 
 VWindow* vdesk_window_at(int x, int y) {
@@ -234,14 +381,15 @@ static int point_in_close(VWindow* win, int x, int y) {
 
 static int point_in_maximize(VWindow* win, int x, int y) {
     if (!win || !win->has_maximize) return 0;
-    int bx = win->x + win->width - 34;
+    int bx = win->x + win->width - (win->has_close ? 34 : 18);
     int by = win->y + 2;
     return (x >= bx && x < bx + 14 && y >= by && y < by + 14);
 }
 
 static int point_in_minimize(VWindow* win, int x, int y) {
     if (!win || !win->has_minimize) return 0;
-    int bx = win->x + win->width - 50;
+    int bx = win->x + win->width - (win->has_close ? 50 : 34);
+    if (!win->has_maximize) bx = win->x + win->width - (win->has_close ? 34 : 18);
     int by = win->y + 2;
     return (x >= bx && x < bx + 14 && y >= by && y < by + 14);
 }
@@ -261,9 +409,9 @@ static void vdesk_toggle_maximize(VWindow* win) {
         win->saved_w = win->width;
         win->saved_h = win->height;
         win->x = 0;
-        win->y = 0;
+        win->y = vdesk_workspace_top();
         win->width = desktop.screen_w;
-        win->height = desktop.screen_h - TASKBAR_HEIGHT;
+        win->height = vdesk_workspace_bottom() - vdesk_workspace_top();
         win->maximized = 1;
     }
     win->drag_active = 0;
@@ -272,9 +420,15 @@ static void vdesk_toggle_maximize(VWindow* win) {
 
 static void vdesk_minimize_window(VWindow* win) {
     if (!win) return;
+    if (win->id == desktop.primary_shell_id) {
+        vdesk_focus_primary_shell();
+        return;
+    }
     win->minimized = 1;
     win->drag_active = 0;
     win->focused = 0;
+    if (should_auto_focus_primary_shell() && win->id != desktop.primary_shell_id)
+        vdesk_focus_primary_shell();
     vdesk_mark_full_dirty();
 }
 
@@ -293,6 +447,14 @@ VWindow* vdesk_create_window(const char* title, int x, int y, int w, int h) {
     if (idx < 0) return NULL;
 
     VWindow* win = &desktop.windows[idx];
+    int top = vdesk_workspace_top();
+    int bottom = vdesk_workspace_bottom();
+    if (y < top) y = top + 2;
+    if (h > bottom - top) h = bottom - top;
+    if (y + h > bottom) y = bottom - h;
+    if (x < 0) x = 0;
+    if (w > desktop.screen_w) w = desktop.screen_w;
+    if (x + w > desktop.screen_w) x = desktop.screen_w - w;
     win->id = desktop.next_id++;
     win->x = x;
     win->y = y;
@@ -330,11 +492,17 @@ VWindow* vdesk_create_window(const char* title, int x, int y, int w, int h) {
 
 void vdesk_close_window(VWindow* win) {
     if (!win || !win->visible) return;
+    if (win->id == desktop.primary_shell_id) {
+        vdesk_focus_primary_shell();
+        return;
+    }
     win->visible = 0;
     win->minimized = 0;
     mark_window_dirty(win);
     remove_z(win->id);
     desktop.window_count--;
+    if (should_auto_focus_primary_shell() && !vdesk_has_active_app_focus())
+        vdesk_focus_primary_shell();
 }
 
 void vdesk_set_app_launcher(void (*launcher)(VDeskAppId app_id)) {
@@ -388,8 +556,8 @@ static void place_file_icon(VDesktopIcon* icon, int slot) {
     int col_w = 80;
     int row_h = 72;
     int start_x = 110;
-    int start_y = 24;
-    int usable_h = desktop.screen_h - TASKBAR_HEIGHT - 64;
+    int start_y = vdesk_workspace_top() + 24;
+    int usable_h = vdesk_workspace_bottom() - vdesk_workspace_top() - 64;
     int rows = (usable_h - start_y) / row_h;
     if (rows < 1) rows = 1;
     int col = slot / rows;
@@ -481,8 +649,20 @@ void vdesk_refresh_desktop_items(int force) {
 }
 
 void vdesk_toggle_theme(void) {
-    desktop.theme_mode = desktop.theme_mode ? 0 : 1;
+    desktop.appearance = (desktop.appearance + 1) % VDESK_APPEARANCE_COUNT;
+    desktop.theme_mode = (desktop.appearance == VDESK_APPEARANCE_LIGHT);
     desktop.metrics.theme_mode = desktop.theme_mode;
+    desktop.metrics.appearance = desktop.appearance;
+    vdesk_mark_full_dirty();
+}
+
+void vdesk_set_appearance(int appearance) {
+    if (appearance < 0 || appearance >= VDESK_APPEARANCE_COUNT)
+        appearance = VDESK_APPEARANCE_ORIGINAL;
+    desktop.appearance = appearance;
+    desktop.theme_mode = (appearance == VDESK_APPEARANCE_LIGHT);
+    desktop.metrics.theme_mode = desktop.theme_mode;
+    desktop.metrics.appearance = desktop.appearance;
     vdesk_mark_full_dirty();
 }
 
@@ -495,7 +675,62 @@ const VDeskMetrics* vdesk_get_metrics(void) {
 }
 
 const char* vdesk_get_theme_name(void) {
-    return desktop.theme_mode ? "Light" : "Dark";
+    if (desktop.appearance == VDESK_APPEARANCE_LIGHT) return "Light";
+    if (desktop.appearance == VDESK_APPEARANCE_MODERN_DARK) return "Modern Dark";
+    return "Original";
+}
+
+static color_t shell_output_palette(int idx) {
+    static const color_t colors[] = {
+        0, 0x67B878, 0x8FD694, 0x88D8C0, 0xD6C76D, 0xC7D1D9
+    };
+    int count = (int)(sizeof(colors) / sizeof(colors[0]));
+    if (idx <= 0 || idx >= count) return theme()->shell_output;
+    return colors[idx];
+}
+
+static color_t shell_input_palette(int idx) {
+    static const color_t colors[] = {
+        0, 0x5B7FDB, 0x7FA6FF, 0x75D2FF, 0xB29DFF, 0xD7E8FF
+    };
+    int count = (int)(sizeof(colors) / sizeof(colors[0]));
+    if (idx <= 0 || idx >= count) return theme()->shell_input;
+    return colors[idx];
+}
+
+color_t vdesk_shell_bg_color(void) { return theme()->shell_bg; }
+color_t vdesk_shell_output_color(void) { return shell_output_palette(shell_output_color_index); }
+color_t vdesk_shell_input_color(void) { return shell_input_palette(shell_input_color_index); }
+color_t vdesk_shell_muted_color(void) { return theme()->shell_muted; }
+
+void vdesk_cycle_shell_output_color(void) {
+    shell_output_color_index = (shell_output_color_index + 1) % 6;
+    vdesk_mark_full_dirty();
+}
+
+void vdesk_cycle_shell_input_color(void) {
+    shell_input_color_index = (shell_input_color_index + 1) % 6;
+    vdesk_mark_full_dirty();
+}
+
+void vdesk_toggle_desktop_experience(void) {
+    VWindow* shell = get_window(desktop.primary_shell_id);
+    desktop.desktop_experience_visible = desktop.desktop_experience_visible ? 0 : 1;
+    clear_icon_selection();
+    if (desktop.desktop_experience_visible) {
+        if (shell) {
+            shell->minimized = 1;
+            shell->focused = 0;
+        }
+    } else if (shell) {
+        shell->minimized = 0;
+        vdesk_focus_primary_shell();
+    }
+    vdesk_mark_full_dirty();
+}
+
+int vdesk_desktop_experience_visible(void) {
+    return desktop.desktop_experience_visible;
 }
 
 /* ---- Render functions ---- */
@@ -503,13 +738,17 @@ const char* vdesk_get_theme_name(void) {
 static void render_titlebar(VWindow* win) {
     int bx = win->x, by = win->y, bw = win->width;
     const VTheme* t = theme();
+    int button_space = 6;
+    if (win->has_close) button_space += 16;
+    if (win->has_maximize) button_space += 16;
+    if (win->has_minimize) button_space += 16;
 
     vdesk_draw_rect(bx, by, bw, TITLEBAR_HEIGHT,
                     win->focused ? t->title_active_bg : t->title_inactive_bg);
 
     int tx = bx + 4;
     int ty = by + 3;
-    int text_w = bw - 60;
+    int text_w = bw - button_space;
     if (text_w > 0) {
         char display[64];
         int len = 0;
@@ -522,26 +761,20 @@ static void render_titlebar(VWindow* win) {
     }
 
     if (win->has_minimize) {
-        int mnx = bx + bw - 50, mny = by + 3;
-        vdesk_draw_rect(mnx, mny, 14, 14, t->button_bg);
-        vdesk_draw_border(mnx, mny, 14, 14, t->border_light, t->border_dark);
-        vdesk_draw_rect(mnx + 3, mny + 10, 8, 2, t->text);
+        int mx = bx + bw - (win->has_close ? 50 : 34);
+        if (!win->has_maximize) mx = bx + bw - (win->has_close ? 34 : 18);
+        int my = by + 3;
+        vdesk_draw_rect(mx, my, 14, 14, t->button_bg);
+        vdesk_draw_border(mx, my, 14, 14, t->border_light, t->border_dark);
+        vdesk_draw_text(mx + 4, my + 2, "_", t->text, t->button_bg);
     }
 
     if (win->has_maximize) {
-        int mxx = bx + bw - 34, mxy = by + 3;
-        vdesk_draw_rect(mxx, mxy, 14, 14, t->button_bg);
-        vdesk_draw_border(mxx, mxy, 14, 14, t->border_light, t->border_dark);
-        if (win->maximized) {
-            /* Overlapping rectangles to signal "restore". */
-            vdesk_draw_border(mxx + 5, mxy + 2, 6, 6, t->text, t->text);
-            vdesk_draw_rect(mxx + 2, mxy + 5, 7, 7, t->button_bg);
-            vdesk_draw_border(mxx + 2, mxy + 5, 7, 7, t->text, t->text);
-        } else {
-            vdesk_draw_rect(mxx + 3, mxy + 3, 8, 8, t->button_bg);
-            vdesk_draw_border(mxx + 3, mxy + 3, 8, 8, t->text, t->text);
-            vdesk_draw_rect(mxx + 3, mxy + 3, 8, 2, t->text);
-        }
+        int mx = bx + bw - (win->has_close ? 34 : 18);
+        int my = by + 3;
+        vdesk_draw_rect(mx, my, 14, 14, t->button_bg);
+        vdesk_draw_border(mx, my, 14, 14, t->border_light, t->border_dark);
+        vdesk_draw_text(mx + 4, my + 2, win->maximized ? "R" : "O", t->text, t->button_bg);
     }
 
     if (win->has_close) {
@@ -566,6 +799,7 @@ static void render_window_border(VWindow* win) {
                       t->border_light, t->border_dark);
     vdesk_draw_rect(x + BORDER_SIZE - 1, y + TITLEBAR_HEIGHT - 1,
                     w - (BORDER_SIZE - 1) * 2, 1, t->border_dark);
+    draw_soft_corners(x, y, w, h, t->desktop_bg);
 }
 
 static void render_client_area(VWindow* win) {
@@ -592,7 +826,7 @@ static void render_window(VWindow* win) {
 
 static void render_desktop(void) {
     vdesk_draw_rect(0, 0, desktop.screen_w,
-                    desktop.screen_h - TASKBAR_HEIGHT, theme()->desktop_bg);
+                    desktop.screen_h, theme()->desktop_bg);
 }
 
 /* ---- Taskbar window buttons (Windows-95 style) ---- */
@@ -610,7 +844,8 @@ static int taskbar_button_rect(int slot, int* bx, int* bw) {
 }
 
 static void render_taskbar(void) {
-    int ty = desktop.screen_h - TASKBAR_HEIGHT;
+    int ty = (desktop.taskbar_position == VDESK_TASKBAR_TOP) ?
+             0 : desktop.screen_h - TASKBAR_HEIGHT;
     const VTheme* t = theme();
 
     vdesk_draw_rect(0, ty, desktop.screen_w, TASKBAR_HEIGHT, t->taskbar_bg);
@@ -621,6 +856,7 @@ static void render_taskbar(void) {
     vdesk_draw_border(2, ty + 2, start_w, TASKBAR_HEIGHT - 4,
                       t->border_light, t->border_dark);
     vdesk_draw_rect(3, ty + 3, start_w - 2, TASKBAR_HEIGHT - 6, t->button_bg);
+    draw_soft_corners(2, ty + 2, start_w, TASKBAR_HEIGHT - 4, t->taskbar_bg);
 
     vdesk_draw_text(8, ty + 6, "Start", t->text, t->button_bg);
 
@@ -638,6 +874,7 @@ static void render_taskbar(void) {
         vdesk_draw_border(bx, by, bw, bh,
                           active ? t->border_dark : t->border_light,
                           active ? t->border_light : t->border_dark);
+        draw_soft_corners(bx, by, bw, bh, t->taskbar_bg);
 
         char label[18];
         int li = 0;
@@ -651,7 +888,8 @@ static void render_taskbar(void) {
 }
 
 static int taskbar_button_click(int mx, int my) {
-    int ty = desktop.screen_h - TASKBAR_HEIGHT;
+    int ty = (desktop.taskbar_position == VDESK_TASKBAR_TOP) ?
+             0 : desktop.screen_h - TASKBAR_HEIGHT;
     if (my < ty + 3 || my >= ty + TASKBAR_HEIGHT - 3) return 0;
     if (mx < TASK_BTN_START) return 0;
 
@@ -666,6 +904,8 @@ static int taskbar_button_click(int mx, int my) {
                 vdesk_restore_window(w);
             } else if (w->focused) {
                 vdesk_minimize_window(w);
+                if (should_auto_focus_primary_shell() && !vdesk_has_active_app_focus())
+                    vdesk_focus_primary_shell();
             } else {
                 vdesk_bring_to_front(w);
                 vdesk_mark_full_dirty();
@@ -677,14 +917,33 @@ static int taskbar_button_click(int mx, int my) {
     return 0;
 }
 
+static VWindow* taskbar_window_at(int mx, int my) {
+    int ty = (desktop.taskbar_position == VDESK_TASKBAR_TOP) ?
+             0 : desktop.screen_h - TASKBAR_HEIGHT;
+    if (my < ty + 3 || my >= ty + TASKBAR_HEIGHT - 3) return NULL;
+    if (mx < TASK_BTN_START) return NULL;
+
+    int slot = 0;
+    for (int i = 0; i < MAX_VWINDOWS; i++) {
+        VWindow* w = &desktop.windows[i];
+        if (!w->visible) continue;
+        int bx, bw;
+        if (!taskbar_button_rect(slot, &bx, &bw)) break;
+        if (mx >= bx && mx < bx + bw) return w;
+        slot++;
+    }
+    return NULL;
+}
+
 static void render_start_menu(void) {
     if (!desktop.start_open) return;
     const VTheme* t = theme();
 
     int menu_w = 160;
-    int menu_h = 200;
+    int menu_h = 224;
     int mx = 2;
-    int my = desktop.screen_h - TASKBAR_HEIGHT - menu_h;
+    int my = (desktop.taskbar_position == VDESK_TASKBAR_TOP) ?
+             TASKBAR_HEIGHT : desktop.screen_h - TASKBAR_HEIGHT - menu_h;
 
     vdesk_draw_rect(mx, my, menu_w, menu_h, t->menu_bg);
     vdesk_draw_border(mx, my, menu_w, menu_h, t->border_light, t->border_outer);
@@ -692,35 +951,34 @@ static void render_start_menu(void) {
     vdesk_draw_text(mx + 4, my + 4, "GooberOS", VCOLOR_WHITE, t->menu_accent);
 
     const char* items[] = {"Shell", "File Explorer", "Text Editor", "System Info",
-                           "Task Manager", "System Settings", "Display Settings", "Paint"};
-    int n_items = 8;
+                           "Task Manager", "System Settings", "Display Settings", "Paint",
+                           desktop.desktop_experience_visible ? "Hide Desktop" : "Show Desktop"};
+    int n_items = 9;
     for (int i = 0; i < n_items; i++) {
         int iy = my + 24 + i * 22;
         vdesk_draw_rect(mx + 2, iy, menu_w - 4, 20, t->menu_bg);
         vdesk_draw_text(mx + 8, iy + 4, items[i], t->menu_fg, t->menu_bg);
     }
-
-    vdesk_draw_text(mx + 8, my + menu_h - 22, "Tab toggles theme", t->text_muted, t->menu_bg);
 }
 
 static int start_menu_hit(int x, int y) {
-    int ty = desktop.screen_h - TASKBAR_HEIGHT;
+    int ty = (desktop.taskbar_position == VDESK_TASKBAR_TOP) ?
+             0 : desktop.screen_h - TASKBAR_HEIGHT;
     return (y >= ty && y < ty + TASKBAR_HEIGHT && x >= 2 && x < 62);
 }
 
 static int start_menu_item_at(int x, int y) {
     if (!desktop.start_open) return -1;
     int menu_w = 160;
-    int menu_h = 200;
+    int menu_h = 224;
     int mx = 2;
-    int my = desktop.screen_h - TASKBAR_HEIGHT - menu_h;
+    int my = (desktop.taskbar_position == VDESK_TASKBAR_TOP) ?
+             TASKBAR_HEIGHT : desktop.screen_h - TASKBAR_HEIGHT - menu_h;
 
     if (x < mx || x >= mx + menu_w || y < my || y >= my + menu_h)
         return -1;
 
-    const char* items[] = {"Shell", "File Explorer", "Text Editor", "System Info",
-                           "Task Manager", "System Settings", "Display Settings", "Paint"};
-    int n_items = 8;
+    int n_items = 9;
     for (int i = 0; i < n_items; i++) {
         int iy = my + 24 + i * 22;
         if (y >= iy && y < iy + 20) return i;
@@ -738,6 +996,7 @@ static VDeskAppId start_item_to_app(int item) {
         case 5: return VDESK_APP_SYSTEM_SETTINGS;
         case 6: return VDESK_APP_DISPLAY_SETTINGS;
         case 7: return VDESK_APP_PAINT;
+        case 8: return VDESK_APP_SHELL;
         default: return VDESK_APP_SHELL;
     }
 }
@@ -763,6 +1022,7 @@ static void activate_icon(int idx) {
 }
 
 static int icon_at(int x, int y) {
+    if (!desktop.desktop_experience_visible) return -1;
     for (int i = desktop.icon_count - 1; i >= 0; i--) {
         VDesktopIcon* icon = &desktop.icons[i];
         if (x >= icon->x && x < icon->x + 64 &&
@@ -839,6 +1099,7 @@ static void render_icon_glyph(VDesktopIcon* icon) {
 }
 
 static void render_desktop_icons(void) {
+    if (!desktop.desktop_experience_visible) return;
     const VTheme* t = theme();
     for (int i = 0; i < desktop.icon_count; i++) {
         VDesktopIcon* icon = &desktop.icons[i];
@@ -857,6 +1118,8 @@ static int context_item_at(int x, int y) {
     int menu_w = 156;
     int item_h = 20;
     int count = 10;
+    if (desktop.context_kind == VCTX_ICON) count = 2;
+    else if (desktop.context_kind == VCTX_TASKBAR) count = 3;
     if (x < desktop.context_x || x >= desktop.context_x + menu_w ||
         y < desktop.context_y || y >= desktop.context_y + count * item_h)
         return -1;
@@ -866,14 +1129,29 @@ static int context_item_at(int x, int y) {
 static void render_context_menu(void) {
     if (!desktop.context_open) return;
     const VTheme* t = theme();
-    const char* items[] = {"New Folder", "New Text File", "Open Shell", "Open Editor",
-                           "New Bitmap", "Open Shell", "Open Editor", "File Explorer",
-                           "System Info", "Task Manager", "Display Settings", "System Settings"};
     int count = 10;
     int menu_w = 156;
     int item_h = 20;
     int x = desktop.context_x;
     int y = desktop.context_y;
+    const char* desktop_items[] = {"New Folder", "New Text File", "New Bitmap", "Open Shell",
+                                   "Open Editor", "File Explorer", "System Info", "Task Manager",
+                                   "Display Settings", "System Settings"};
+    const char* icon_items[] = {"Open", "Rename"};
+    const char* task_items[3];
+    const char** items = desktop_items;
+
+    if (desktop.context_kind == VCTX_ICON) {
+        items = icon_items;
+        count = 2;
+    } else if (desktop.context_kind == VCTX_TASKBAR) {
+        VWindow* win = get_window(desktop.context_target_window_id);
+        task_items[0] = (win && win->minimized) ? "Restore" : "Minimize";
+        task_items[1] = (win && win->maximized) ? "Restore Size" : "Maximize";
+        task_items[2] = "Close";
+        items = task_items;
+        count = 3;
+    }
 
     vdesk_draw_rect(x, y, menu_w, count * item_h, t->menu_bg);
     vdesk_draw_border(x, y, menu_w, count * item_h, t->border_light, t->border_outer);
@@ -881,6 +1159,81 @@ static void render_context_menu(void) {
         int iy = y + i * item_h;
         vdesk_draw_text(x + 8, iy + 4, items[i], t->menu_fg, t->menu_bg);
     }
+}
+
+static void rename_modal_rect(int* x, int* y, int* w, int* h) {
+    *w = 300;
+    *h = 136;
+    *x = (desktop.screen_w - *w) / 2;
+    *y = (desktop.screen_h - *h) / 2;
+    if (*y < vdesk_workspace_top() + 8) *y = vdesk_workspace_top() + 8;
+}
+
+static void render_modal_button(int x, int y, int w, int h, const char* label) {
+    const VTheme* t = theme();
+    vdesk_draw_rect(x, y, w, h, t->button_bg);
+    vdesk_draw_border(x, y, w, h, t->border_light, t->border_dark);
+    vdesk_draw_text(x + 8, y + 5, label, t->text, t->button_bg);
+}
+
+static void render_rename_modal(void) {
+    if (!desktop.rename_open) return;
+    const VTheme* t = theme();
+    int x, y, w, h;
+    rename_modal_rect(&x, &y, &w, &h);
+
+    vdesk_draw_rect(x, y, w, h, t->window_bg);
+    vdesk_draw_border(x, y, w, h, t->border_light, t->border_outer);
+    vdesk_draw_rect(x + 2, y + 2, w - 4, TITLEBAR_HEIGHT, t->title_active_bg);
+    vdesk_draw_text(x + 8, y + 5, "Rename", t->title_fg, t->title_active_bg);
+
+    vdesk_draw_text(x + 18, y + 34, "New name:", t->text, t->window_bg);
+    vdesk_draw_rect(x + 18, y + 54, w - 36, 22, t->client_bg);
+    vdesk_draw_border(x + 18, y + 54, w - 36, 22, t->border_dark, t->border_light);
+    vdesk_draw_text(x + 24, y + 58, desktop.rename_input, t->text, t->client_bg);
+    vdesk_draw_text(x + 24 + desktop.rename_len * 8, y + 58, "_", t->accent, t->client_bg);
+
+    if (desktop.rename_status) {
+        vdesk_draw_text(x + 18, y + 82, "Rename failed.", t->accent, t->window_bg);
+    }
+
+    render_modal_button(x + w - 170, y + h - 34, 70, 22, "Cancel");
+    render_modal_button(x + w - 90, y + h - 34, 72, 22, "Rename");
+}
+
+static void submit_rename_modal(void) {
+    if (!desktop.rename_open || desktop.rename_input[0] == '\0') {
+        desktop.rename_status = 1;
+        return;
+    }
+    if (fs_dir_rename(fs_get_desktop_dir(), desktop.rename_old_name,
+                      desktop.rename_input) == 0) {
+        desktop.rename_open = 0;
+        desktop.rename_status = 0;
+        vdesk_refresh_desktop_items(1);
+    } else {
+        desktop.rename_status = 1;
+    }
+    vdesk_mark_full_dirty();
+}
+
+static int rename_modal_click(int mx, int my) {
+    if (!desktop.rename_open) return 0;
+    int x, y, w, h;
+    rename_modal_rect(&x, &y, &w, &h);
+    if (mx < x || mx >= x + w || my < y || my >= y + h) return 1;
+    if (mx >= x + w - 170 && mx < x + w - 100 &&
+        my >= y + h - 34 && my < y + h - 12) {
+        desktop.rename_open = 0;
+        vdesk_mark_full_dirty();
+        return 1;
+    }
+    if (mx >= x + w - 90 && mx < x + w - 18 &&
+        my >= y + h - 34 && my < y + h - 12) {
+        submit_rename_modal();
+        return 1;
+    }
+    return 1;
 }
 
 static VDeskAppId context_item_to_app(int item) {
@@ -896,9 +1249,54 @@ static VDeskAppId context_item_to_app(int item) {
     }
 }
 
+static void open_rename_modal_for_icon(int icon_idx) {
+    if (icon_idx < 0 || icon_idx >= desktop.icon_count) return;
+    VDesktopIcon* icon = &desktop.icons[icon_idx];
+    if (icon->kind == VICON_APP) return;
+    desktop.rename_open = 1;
+    desktop.rename_target_kind = icon->kind;
+    strncpy(desktop.rename_old_name, icon->filename, VICON_NAME_MAX - 1);
+    desktop.rename_old_name[VICON_NAME_MAX - 1] = '\0';
+    strncpy(desktop.rename_input, icon->filename, VICON_NAME_MAX - 1);
+    desktop.rename_input[VICON_NAME_MAX - 1] = '\0';
+    desktop.rename_len = (int)strlen(desktop.rename_input);
+    desktop.rename_status = 0;
+    vdesk_mark_full_dirty();
+}
+
+static void context_run_icon_item(int item) {
+    int idx = desktop.context_target_icon;
+    if (idx < 0 || idx >= desktop.icon_count) return;
+    if (item == 0) activate_icon(idx);
+    else if (item == 1) open_rename_modal_for_icon(idx);
+}
+
+static void context_run_taskbar_item(int item) {
+    VWindow* win = get_window(desktop.context_target_window_id);
+    if (!win) return;
+    if (item == 0) {
+        if (win->minimized) vdesk_restore_window(win);
+        else vdesk_minimize_window(win);
+    } else if (item == 1) {
+        if (!win->minimized) vdesk_toggle_maximize(win);
+        else vdesk_restore_window(win);
+    } else if (item == 2) {
+        vdesk_close_window(win);
+    }
+}
+
 static void context_run_item(int item) {
     char name[32];
     char num[12];
+
+    if (desktop.context_kind == VCTX_ICON) {
+        context_run_icon_item(item);
+        return;
+    }
+    if (desktop.context_kind == VCTX_TASKBAR) {
+        context_run_taskbar_item(item);
+        return;
+    }
 
     /* New items are placed in the fixed Desktop folder (not whatever directory
      * File Explorer happens to be browsing) so they appear on the desktop. */
@@ -954,11 +1352,65 @@ static void render_mouse(void) {
 
 /* ---- Event handling ---- */
 
+static int handle_rename_key(char c) {
+    if (!desktop.rename_open) return 0;
+    if (c == KEY_ESC) {
+        desktop.rename_open = 0;
+        vdesk_mark_full_dirty();
+        return 1;
+    }
+    if (c == '\r' || c == '\n') {
+        submit_rename_modal();
+        return 1;
+    }
+    if ((unsigned char)c == KEY_BACKSPACE) {
+        if (desktop.rename_len > 0) {
+            desktop.rename_input[--desktop.rename_len] = '\0';
+            desktop.rename_status = 0;
+            vdesk_mark_full_dirty();
+        }
+        return 1;
+    }
+    if ((unsigned char)c >= 32 && (unsigned char)c <= 126 &&
+        desktop.rename_len < VICON_NAME_MAX - 1) {
+        desktop.rename_input[desktop.rename_len++] = c;
+        desktop.rename_input[desktop.rename_len] = '\0';
+        desktop.rename_status = 0;
+        vdesk_mark_full_dirty();
+        return 1;
+    }
+    return 1;
+}
+
 static void handle_keyboard(void) {
     if (!keyboard_has_char()) return;
 
     while (keyboard_has_char()) {
         char c = keyboard_read_char();
+
+        if (handle_rename_key(c)) continue;
+
+        if ((unsigned char)c == KEY_F1) {
+            vdesk_focus_primary_shell();
+            continue;
+        }
+        if ((unsigned char)c == KEY_F2 && !vdesk_has_active_app_focus()) {
+            launch_app(VDESK_APP_EXPLORER);
+            continue;
+        }
+        if ((unsigned char)c == KEY_F3 && !vdesk_has_active_app_focus()) {
+            launch_app(VDESK_APP_EDITOR);
+            continue;
+        }
+        if ((unsigned char)c == KEY_F4 && !vdesk_has_active_app_focus()) {
+            launch_app(VDESK_APP_TASK_MANAGER);
+            continue;
+        }
+        if ((unsigned char)c == KEY_F5) {
+            vdesk_refresh_desktop_items(1);
+            vdesk_mark_full_dirty();
+            continue;
+        }
 
         if (c == KEY_ESC) {
             if (desktop.context_open || desktop.start_open) {
@@ -974,10 +1426,12 @@ static void handle_keyboard(void) {
                     break;
                 }
             }
+            if (should_auto_focus_primary_shell() && !vdesk_has_active_app_focus())
+                vdesk_focus_primary_shell();
             return;
         }
 
-        if (c == '\t') {
+        if ((unsigned char)c == KEY_F9) {
             vdesk_toggle_theme();
             continue;
         }
@@ -990,6 +1444,8 @@ static void handle_keyboard(void) {
                 break;
             }
         }
+        if (should_auto_focus_primary_shell() && !vdesk_has_active_app_focus())
+            vdesk_focus_primary_shell();
     }
 }
 
@@ -1010,10 +1466,16 @@ static void handle_events(void) {
             int mx = desktop.mouse_x;
             int my = desktop.mouse_y;
 
+            if (rename_modal_click(mx, my)) {
+                desktop.context_open = 0;
+                desktop.start_open = 0;
+                continue;
+            }
+
             if (start_menu_hit(mx, my)) {
                 desktop.start_open = !desktop.start_open;
                 desktop.context_open = 0;
-                vdesk_mark_dirty(0, desktop.screen_h - TASKBAR_HEIGHT - 220, 180, 220 + TASKBAR_HEIGHT);
+                vdesk_mark_dirty(0, 0, 180, 248 + TASKBAR_HEIGHT);
                 continue;
             }
 
@@ -1032,6 +1494,10 @@ static void handle_events(void) {
                 if (item >= 0) {
                     desktop.start_open = 0;
                     vdesk_mark_full_dirty();
+                    if (item == 8) {
+                        vdesk_toggle_desktop_experience();
+                        continue;
+                    }
                     launch_app(start_item_to_app(item));
                     continue;
                 }
@@ -1090,6 +1556,8 @@ static void handle_events(void) {
                     icon->drag_off_y = my - icon->y;
                     vdesk_mark_dirty(icon->x - 2, icon->y - 2, 76, 70);
                 } else {
+                    if (should_auto_focus_primary_shell())
+                        vdesk_focus_primary_shell();
                     vdesk_mark_full_dirty();
                 }
             }
@@ -1113,12 +1581,35 @@ static void handle_events(void) {
         if (ev.type == INPUT_EVENT_BUTTON_DOWN && ev.button == INPUT_BUTTON_RIGHT) {
             int mx = desktop.mouse_x;
             int my = desktop.mouse_y;
-            if (!vdesk_window_at(mx, my)) {
+            if (desktop.rename_open) continue;
+            VWindow* task_win = taskbar_window_at(mx, my);
+            if (task_win && task_win->id != desktop.primary_shell_id) {
                 desktop.start_open = 0;
                 desktop.context_open = 1;
+                desktop.context_kind = VCTX_TASKBAR;
+                desktop.context_target_window_id = task_win->id;
+                desktop.context_target_icon = -1;
                 desktop.context_x = CLAMP(mx, 0, desktop.screen_w - 160);
-                desktop.context_y = CLAMP(my, 0, desktop.screen_h - TASKBAR_HEIGHT - 202);
+                desktop.context_y = CLAMP(my, vdesk_workspace_top(),
+                                          vdesk_workspace_bottom() - 62);
+                vdesk_mark_full_dirty();
+                continue;
+            } else if (task_win) {
+                continue;
+            }
+            if (!vdesk_window_at(mx, my)) {
+                int idx = icon_at(mx, my);
+                desktop.start_open = 0;
+                desktop.context_open = 1;
+                desktop.context_kind = (idx >= desktop.app_icon_count) ? VCTX_ICON : VCTX_DESKTOP;
+                desktop.context_target_icon = idx;
+                desktop.context_target_window_id = 0;
+                desktop.context_x = CLAMP(mx, 0, desktop.screen_w - 160);
+                desktop.context_y = CLAMP(my, vdesk_workspace_top(),
+                                          vdesk_workspace_bottom() - 202);
                 clear_icon_selection();
+                if (idx >= 0 && idx < desktop.icon_count)
+                    desktop.icons[idx].selected = 1;
                 vdesk_mark_full_dirty();
                 continue;
             }
@@ -1143,7 +1634,8 @@ static void handle_events(void) {
                     int nx = desktop.mouse_x - win->drag_off_x;
                     int ny = desktop.mouse_y - win->drag_off_y;
                     nx = CLAMP(nx, 0, desktop.screen_w - win->width - 2);
-                    ny = CLAMP(ny, 0, desktop.screen_h - TASKBAR_HEIGHT - win->height - 2);
+                    ny = CLAMP(ny, vdesk_workspace_top(),
+                               vdesk_workspace_bottom() - win->height - 2);
                     win->x = nx;
                     win->y = ny;
                     mark_window_dirty(win);
@@ -1158,8 +1650,9 @@ static void handle_events(void) {
                         desktop.icon_drag_moved = 1;
                     }
                     icon->x = CLAMP(desktop.mouse_x - icon->drag_off_x, 0, desktop.screen_w - 72);
-                    icon->y = CLAMP(desktop.mouse_y - icon->drag_off_y, 0,
-                                    desktop.screen_h - TASKBAR_HEIGHT - 64);
+                    icon->y = CLAMP(desktop.mouse_y - icon->drag_off_y,
+                                    vdesk_workspace_top(),
+                                    vdesk_workspace_bottom() - 64);
                     vdesk_mark_dirty(icon->x - 2, icon->y - 2, 76, 70);
                 }
             }
@@ -1198,6 +1691,7 @@ void vdesk_run(void) {
         int had_dirty;
 
         usb_poll();
+        touchpad_poll();
         update_metrics_pointer();
         handle_keyboard();
         handle_events();
@@ -1232,22 +1726,24 @@ void vdesk_run(void) {
 
         had_dirty = desktop.dirty;
         if (had_dirty) {
+            int dirty_x = desktop.dirty_x1;
+            int dirty_y = desktop.dirty_y1;
+            int dirty_w = desktop.dirty_x2 - desktop.dirty_x1;
+            int dirty_h = desktop.dirty_y2 - desktop.dirty_y1;
             desktop.metrics.last_dirty_x = desktop.dirty_x1;
             desktop.metrics.last_dirty_y = desktop.dirty_y1;
-            desktop.metrics.last_dirty_w = desktop.dirty_x2 - desktop.dirty_x1;
-            desktop.metrics.last_dirty_h = desktop.dirty_y2 - desktop.dirty_y1;
+            desktop.metrics.last_dirty_w = dirty_w;
+            desktop.metrics.last_dirty_h = dirty_h;
             desktop.dirty = 0;
             desktop.metrics.dirty_frames++;
 
             render_start = timer_ticks();
             /*
-             * Phase 4: render the FULL composite into the back-buffer
-             * every dirty frame. Dirty rects are kept as a "should we
-             * draw this frame at all?" gate, but the actual painting is
-             * the whole desktop -> windows -> taskbar -> cursor stack.
-             * The single whole-screen present below then publishes the
-             * frame in one shot, eliminating mid-frame tearing.
+             * Render the normal desktop stack through a VESA clip rectangle.
+             * This keeps each app renderer simple while avoiding full-screen
+             * memory writes and bus copies for ordinary input/cursor updates.
              */
+            vesa_set_clip(dirty_x, dirty_y, dirty_w, dirty_h);
             render_desktop();
             render_desktop_icons();
 
@@ -1259,14 +1755,16 @@ void vdesk_run(void) {
             render_taskbar();
             render_start_menu();
             render_context_menu();
+            render_rename_modal();
             /* Cursor sprite is the LAST step of the composite so it
              * always lands on top of every other surface. */
             render_mouse();
+            vesa_clear_clip();
             desktop.metrics.render_ticks = timer_ticks() - render_start;
 
             swap_start = timer_ticks();
-            /* Single tear-free whole-screen present. */
-            vesa_present();
+            /* Publish only the invalidated rectangle when a back-buffer exists. */
+            vesa_swap_rect(dirty_x, dirty_y, dirty_w, dirty_h);
             desktop.metrics.swap_ticks = timer_ticks() - swap_start;
         } else {
             desktop.metrics.skipped_frames++;

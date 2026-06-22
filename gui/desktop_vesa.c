@@ -40,50 +40,114 @@ static int client_width(VWindow* win) {
 
 /* ---- Shell app ---- */
 #define SHELL_MAX_LINES 60
-#define SHELL_LINE_LEN  80
+#define SHELL_LINE_LEN  256
+#define SHELL_HISTORY_SIZE 16
+#define SHELL_PAD_X      6
+#define SHELL_PAD_Y      4
+#define SHELL_SCROLLBAR_W 10
+#define SHELL_SCROLLBAR_GAP 4
+#define SHELL_LINE_OUTPUT 0
+#define SHELL_LINE_INPUT  1
+#define SHELL_LINE_MUTED  2
 
 typedef struct {
     char lines[SHELL_MAX_LINES][SHELL_LINE_LEN];
+    uint8_t line_kind[SHELL_MAX_LINES];
     int line_count;
     int scroll;
+    char history[SHELL_HISTORY_SIZE][SHELL_LINE_LEN];
+    int history_next;
+    int history_count;
+    int history_nav_offset;
+    char saved_input[SHELL_LINE_LEN];
+    char pending_output[SHELL_LINE_LEN];
+    int pending_len;
     char input[SHELL_LINE_LEN];
     int input_len;
     int input_pos;
 } ShellApp;
 
-static void shell_write_line(ShellApp* sa, const char* text) {
+static void open_explorer_window(void);
+static void open_editor_file(const char* filename, Directory* dir);
+static void open_editor_window(void);
+static void open_paint_window(void);
+static void open_taskmgr_window(void);
+static void open_display_settings_window(void);
+static void open_vga_console_window(void);
+
+static int shell_max_int(int a, int b) { return a > b ? a : b; }
+static int shell_min_int(int a, int b) { return a < b ? a : b; }
+static int shell_clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void shell_set_input(ShellApp* sa, const char* text) {
+    int i = 0;
+    if (!sa) return;
+    while (text && text[i] && i < SHELL_LINE_LEN - 1) {
+        sa->input[i] = text[i];
+        i++;
+    }
+    sa->input[i] = '\0';
+    sa->input_len = i;
+    sa->input_pos = i;
+}
+
+static int shell_history_index_from_offset(ShellApp* sa, int offset) {
+    return (sa->history_next - 1 - offset + SHELL_HISTORY_SIZE) % SHELL_HISTORY_SIZE;
+}
+
+static void shell_history_store(ShellApp* sa, const char* cmd) {
+    if (!sa || !cmd || !cmd[0]) return;
+    strncpy(sa->history[sa->history_next], cmd, SHELL_LINE_LEN - 1);
+    sa->history[sa->history_next][SHELL_LINE_LEN - 1] = '\0';
+    sa->history_next = (sa->history_next + 1) % SHELL_HISTORY_SIZE;
+    if (sa->history_count < SHELL_HISTORY_SIZE) sa->history_count++;
+    sa->history_nav_offset = -1;
+    sa->saved_input[0] = '\0';
+}
+
+static void shell_write_line_kind(ShellApp* sa, const char* text, uint8_t kind) {
     if (!sa || !text) return;
     if (sa->line_count < SHELL_MAX_LINES) {
         strncpy(sa->lines[sa->line_count], text, SHELL_LINE_LEN - 1);
         sa->lines[sa->line_count][SHELL_LINE_LEN - 1] = '\0';
+        sa->line_kind[sa->line_count] = kind;
         sa->line_count++;
     } else {
-        for (int i = 1; i < SHELL_MAX_LINES; i++)
+        for (int i = 1; i < SHELL_MAX_LINES; i++) {
             strcpy(sa->lines[i - 1], sa->lines[i]);
+            sa->line_kind[i - 1] = sa->line_kind[i];
+        }
         strncpy(sa->lines[SHELL_MAX_LINES - 1], text, SHELL_LINE_LEN - 1);
         sa->lines[SHELL_MAX_LINES - 1][SHELL_LINE_LEN - 1] = '\0';
+        sa->line_kind[SHELL_MAX_LINES - 1] = kind;
     }
     if (sa->scroll < sa->line_count - 1)
         sa->scroll = sa->line_count - 1;
 }
 
+static void shell_write_line(ShellApp* sa, const char* text) {
+    shell_write_line_kind(sa, text, SHELL_LINE_OUTPUT);
+}
+
 static void shell_capture_write(const char* text, void* ctx) {
     ShellApp* sa = (ShellApp*)ctx;
     if (!sa || !text) return;
-    char line[SHELL_LINE_LEN];
-    int li = 0;
-    for (int i = 0; text[i] && li < SHELL_LINE_LEN - 1; i++) {
+    for (int i = 0; text[i]; i++) {
         if (text[i] == '\n') {
-            line[li] = '\0';
-            shell_write_line(sa, line);
-            li = 0;
+            sa->pending_output[sa->pending_len] = '\0';
+            shell_write_line(sa, sa->pending_output);
+            sa->pending_len = 0;
+            sa->pending_output[0] = '\0';
         } else if (text[i] != '\r') {
-            line[li++] = text[i];
+            if (sa->pending_len < SHELL_LINE_LEN - 1) {
+                sa->pending_output[sa->pending_len++] = text[i];
+                sa->pending_output[sa->pending_len] = '\0';
+            }
         }
-    }
-    if (li > 0) {
-        line[li] = '\0';
-        shell_write_line(sa, line);
     }
 }
 
@@ -93,6 +157,7 @@ static void shell_do_exec(ShellApp* sa) {
 
     strncpy(cmd, sa->input, SHELL_LINE_LEN - 1);
     cmd[SHELL_LINE_LEN - 1] = '\0';
+    shell_history_store(sa, cmd);
 
     {
         char prompt[SHELL_LINE_LEN];
@@ -102,45 +167,100 @@ static void shell_do_exec(ShellApp* sa) {
         for (int i = 0; cmd[i] && pi < SHELL_LINE_LEN - 1; i++)
             prompt[pi++] = cmd[i];
         prompt[pi] = '\0';
-        shell_write_line(sa, prompt);
+        shell_write_line_kind(sa, prompt, SHELL_LINE_INPUT);
     }
 
     if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "cls") == 0) {
         sa->line_count = 0;
         sa->scroll = 0;
+    } else if (strcmp(cmd, "taskview") == 0) {
+        open_taskmgr_window();
+        vdesk_tile_window(NULL);
+        shell_write_line_kind(sa, "Opened native VESA Task Manager.", SHELL_LINE_MUTED);
+    } else if (strncmp(cmd, "edit ", 5) == 0) {
+        open_editor_file(cmd + 5, fs_get_cwd_dir());
+        vdesk_tile_window(NULL);
+        shell_write_line_kind(sa, "Opened native VESA Text Editor.", SHELL_LINE_MUTED);
+    } else if (strcmp(cmd, "edit") == 0) {
+        open_editor_window();
+        vdesk_tile_window(NULL);
+        shell_write_line_kind(sa, "Opened native VESA Text Editor.", SHELL_LINE_MUTED);
+    } else if (strcmp(cmd, "files") == 0 || strcmp(cmd, "explorer") == 0) {
+        open_explorer_window();
+        vdesk_tile_window(NULL);
+        shell_write_line_kind(sa, "Opened native VESA File Explorer.", SHELL_LINE_MUTED);
+    } else if (strcmp(cmd, "paint") == 0) {
+        open_paint_window();
+        vdesk_tile_window(NULL);
+        shell_write_line_kind(sa, "Opened native VESA Paint.", SHELL_LINE_MUTED);
+    } else if (strcmp(cmd, "settings") == 0 || strcmp(cmd, "gui") == 0) {
+        open_display_settings_window();
+        vdesk_tile_window(NULL);
+        shell_write_line_kind(sa, "Opened VESA Display Settings.", SHELL_LINE_MUTED);
     } else if (strcmp(cmd, "snakeGame.exe") == 0 ||
                strcmp(cmd, "cubeDip.exe") == 0 ||
                strcmp(cmd, "pong.exe") == 0 ||
-               strcmp(cmd, "doom.exe") == 0 ||
-               strcmp(cmd, "taskview") == 0 ||
-               strncmp(cmd, "edit ", 5) == 0 ||
-               strcmp(cmd, "gui") == 0) {
-        shell_write_line(sa, "VESA shell: blocking VGA apps are disabled here.");
-        shell_write_line(sa, "Use desktop icons, Start, or right-click menu instead.");
+               strcmp(cmd, "doom.exe") == 0) {
+        open_vga_console_window();
+        vdesk_tile_window(NULL);
+        shell_write_line_kind(sa, "Opened VGA Console surface for legacy app output.", SHELL_LINE_MUTED);
+        shell_write_line_kind(sa, "Native VESA game ports can now target this window model.", SHELL_LINE_MUTED);
     } else {
         shell_set_redirect(shell_capture_write, NULL, sa);
         execute_command(cmd);
         shell_clear_redirect();
+        if (sa->pending_len > 0) {
+            sa->pending_output[sa->pending_len] = '\0';
+            shell_write_line(sa, sa->pending_output);
+            sa->pending_len = 0;
+            sa->pending_output[0] = '\0';
+        }
     }
 
     sa->input_len = 0;
     sa->input_pos = 0;
     sa->input[0] = '\0';
+    sa->history_nav_offset = -1;
+}
+
+static void shell_draw_text_clipped(int x, int y, const char* text,
+                                    int max_cols, color_t fg, color_t bg) {
+    char buf[SHELL_LINE_LEN];
+    int i = 0;
+    if (max_cols <= 0) return;
+    if (max_cols >= SHELL_LINE_LEN) max_cols = SHELL_LINE_LEN - 1;
+    while (text && text[i] && i < max_cols) {
+        buf[i] = text[i];
+        i++;
+    }
+    buf[i] = '\0';
+    vdesk_draw_text(x, y, buf, fg, bg);
 }
 
 static void shell_render(VWindow* win, int cx, int cy, int cw, int ch) {
     ShellApp* sa = (ShellApp*)win->user_data;
+    const VTheme* theme = vdesk_get_theme();
     if (!sa) return;
 
     int char_w = 8;
     int char_h = 16;
-    int cols = cw / char_w;
-    int rows = ch / char_h;
+    int text_x = cx + SHELL_PAD_X;
+    int text_y = cy + SHELL_PAD_Y;
+    int text_w = cw - SHELL_PAD_X * 2 - SHELL_SCROLLBAR_W - SHELL_SCROLLBAR_GAP;
+    int text_h = ch - SHELL_PAD_Y * 2;
+    int cols = text_w / char_w;
+    int rows = text_h / char_h;
     if (cols < 2 || rows < 2) return;
 
-    vdesk_draw_rect(cx, cy, cw, ch, VCOLOR_BLACK);
+    color_t shell_bg = vdesk_shell_bg_color();
+    color_t shell_output = vdesk_shell_output_color();
+    color_t shell_input = vdesk_shell_input_color();
+    color_t shell_muted = vdesk_shell_muted_color();
+
+    vdesk_draw_rect(cx, cy, cw, ch, shell_bg);
 
     int draw_lines = rows - 1;
+    int max_scroll = shell_max_int(0, sa->line_count - draw_lines);
     if (sa->scroll > sa->line_count - draw_lines)
         sa->scroll = sa->line_count - draw_lines;
     if (sa->scroll < 0) sa->scroll = 0;
@@ -148,8 +268,36 @@ static void shell_render(VWindow* win, int cx, int cy, int cw, int ch) {
     for (int r = 0; r < draw_lines; r++) {
         int src = sa->scroll + r;
         if (src >= 0 && src < sa->line_count) {
-            vdesk_draw_text(cx + 2, cy + r * char_h, sa->lines[src],
-                           VCOLOR_GREEN, VCOLOR_BLACK);
+            color_t fg = shell_output;
+            if (sa->line_kind[src] == SHELL_LINE_INPUT) fg = shell_input;
+            else if (sa->line_kind[src] == SHELL_LINE_MUTED) fg = shell_muted;
+            shell_draw_text_clipped(text_x, text_y + r * char_h,
+                                    sa->lines[src], cols,
+                                    fg, shell_bg);
+        }
+    }
+
+    {
+        int sb_x = cx + cw - SHELL_PAD_X - SHELL_SCROLLBAR_W;
+        int sb_y = text_y;
+        int sb_h = draw_lines * char_h;
+        int thumb_h = sb_h;
+        int thumb_y = sb_y;
+
+        if (sb_h > 0) {
+            vdesk_draw_rect(sb_x, sb_y, SHELL_SCROLLBAR_W, sb_h, theme->border_dark);
+            vdesk_draw_border(sb_x, sb_y, SHELL_SCROLLBAR_W, sb_h,
+                              theme->border_light, shell_bg);
+            if (sa->line_count > draw_lines) {
+                thumb_h = (sb_h * draw_lines) / shell_max_int(1, sa->line_count);
+                if (thumb_h < 16) thumb_h = 16;
+                if (thumb_h > sb_h) thumb_h = sb_h;
+                thumb_y = sb_y + (sa->scroll * shell_max_int(1, sb_h - thumb_h)) /
+                                  shell_max_int(1, max_scroll);
+            }
+            vdesk_draw_rect(sb_x + 2, thumb_y + 2,
+                            SHELL_SCROLLBAR_W - 4, thumb_h - 4,
+                            theme->accent);
         }
     }
 
@@ -158,21 +306,21 @@ static void shell_render(VWindow* win, int cx, int cy, int cw, int ch) {
         prompt[0] = '>';
         prompt[1] = ' ';
         int pi = 2;
-        int max_c = (cols > 4) ? cols - 4 : 0;
+        int max_c = (cols > 3) ? cols - 3 : 0;
         for (int i = 0; i < sa->input_len && pi < max_c + 2 && pi < 126; i++)
             prompt[pi++] = sa->input[i];
+        prompt[pi] = '\0';
 
         int cursor_display = sa->input_pos + 2;
         if (cursor_display < pi) {
             char old = prompt[cursor_display];
             prompt[cursor_display] = '_';
-            vdesk_draw_text(cx + 2, cy + (rows - 1) * char_h, prompt,
-                           VCOLOR_WHITE, VCOLOR_BLACK);
+            shell_draw_text_clipped(text_x, text_y + (rows - 1) * char_h,
+                                    prompt, cols, shell_input, shell_bg);
             prompt[cursor_display] = old;
         } else {
-            prompt[pi] = '\0';
-            vdesk_draw_text(cx + 2, cy + (rows - 1) * char_h, prompt,
-                           VCOLOR_WHITE, VCOLOR_BLACK);
+            shell_draw_text_clipped(text_x, text_y + (rows - 1) * char_h,
+                                    prompt, cols, shell_input, shell_bg);
         }
     }
 }
@@ -198,6 +346,30 @@ static void shell_key(VWindow* win, char key) {
         if (sa->input_pos < sa->input_len) sa->input_pos++;
         return;
     }
+    if ((unsigned char)key == KEY_UP) {
+        if (sa->history_count > 0) {
+            if (sa->history_nav_offset < 0) {
+                strncpy(sa->saved_input, sa->input, SHELL_LINE_LEN - 1);
+                sa->saved_input[SHELL_LINE_LEN - 1] = '\0';
+                sa->history_nav_offset = 0;
+            } else if (sa->history_nav_offset < sa->history_count - 1) {
+                sa->history_nav_offset++;
+            }
+            shell_set_input(sa, sa->history[shell_history_index_from_offset(sa, sa->history_nav_offset)]);
+        }
+        return;
+    }
+    if ((unsigned char)key == KEY_DOWN) {
+        if (sa->history_count > 0 && sa->history_nav_offset >= 0) {
+            sa->history_nav_offset--;
+            if (sa->history_nav_offset < 0) {
+                shell_set_input(sa, sa->saved_input);
+            } else {
+                shell_set_input(sa, sa->history[shell_history_index_from_offset(sa, sa->history_nav_offset)]);
+            }
+        }
+        return;
+    }
     if (key == '\r' || key == '\n') {
         shell_do_exec(sa);
         return;
@@ -209,6 +381,7 @@ static void shell_key(VWindow* win, char key) {
             sa->input[sa->input_pos] = key;
             sa->input_len++;
             sa->input_pos++;
+            sa->history_nav_offset = -1;
         }
     }
 }
@@ -221,11 +394,38 @@ static void shell_scroll(VWindow* win, int amount) {
     if (sa->scroll > sa->line_count - 1) sa->scroll = sa->line_count - 1;
 }
 
+static void shell_click(VWindow* win, int client_x, int client_y) {
+    ShellApp* sa = (ShellApp*)win->user_data;
+    int cw = client_width(win);
+    int ch = win->height - TITLEBAR_HEIGHT - BORDER_SIZE * 2;
+    int char_h = 16;
+    int rows = (ch - SHELL_PAD_Y * 2) / char_h;
+    int draw_lines = rows - 1;
+    int sb_x = cw - SHELL_PAD_X - SHELL_SCROLLBAR_W;
+    int sb_y = SHELL_PAD_Y;
+    int sb_h = draw_lines * char_h;
+    int max_scroll;
+
+    if (!sa || draw_lines <= 0 || sb_h <= 0) return;
+    if (client_x < sb_x || client_x >= sb_x + SHELL_SCROLLBAR_W) return;
+    if (client_y < sb_y || client_y >= sb_y + sb_h) return;
+
+    max_scroll = shell_max_int(0, sa->line_count - draw_lines);
+    if (max_scroll <= 0) {
+        sa->scroll = 0;
+        return;
+    }
+    sa->scroll = ((client_y - sb_y) * max_scroll) / shell_max_int(1, sb_h - 1);
+    sa->scroll = shell_clamp_int(sa->scroll, 0, max_scroll);
+}
+
 static ShellApp* create_shell_app(void) {
     ShellApp* sa = (ShellApp*)kmalloc(sizeof(ShellApp));
     if (!sa) return NULL;
     memset(sa, 0, sizeof(ShellApp));
-    shell_write_line(sa, "GooberOS VESA Shell");
+    sa->history_nav_offset = -1;
+    shell_write_line_kind(sa, "GooberOS VESA Shell", SHELL_LINE_MUTED);
+    shell_write_line_kind(sa, "F1 shell | F2 files | F3 edit | F4 tasks | F9 appearance", SHELL_LINE_MUTED);
     shell_write_line(sa, "Type 'help' for commands.");
     return sa;
 }
@@ -296,7 +496,7 @@ static void sysinfo_render(VWindow* win, int cx, int cy, int cw, int ch) {
     else
         vdesk_draw_text(cx + 84, row, "PS/2", theme->accent, theme->client_bg);
     row += 16;
-    vdesk_draw_text(cx + 4, row, "Theme:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 4, row, "Look:  ", theme->text, theme->client_bg);
     vdesk_draw_text(cx + 68, row, vdesk_get_theme_name(), theme->accent, theme->client_bg);
     row += 16;
     {
@@ -464,6 +664,8 @@ static void taskmgr_click(VWindow* win, int lx, int ly) {
 #define SETTINGS_BTN_X 4
 #define SETTINGS_BTN_W 150
 #define SETTINGS_BTN_H 22
+#define SETTINGS_OUTPUT_BTN_Y 190
+#define SETTINGS_INPUT_BTN_Y 216
 
 static void display_settings_render(VWindow* win, int cx, int cy, int cw, int ch) {
     (void)win;
@@ -471,7 +673,7 @@ static void display_settings_render(VWindow* win, int cx, int cy, int cw, int ch
     const VDeskMetrics* metrics = vdesk_get_metrics();
     vdesk_draw_rect(cx, cy, cw, ch, theme->client_bg);
     vdesk_draw_text(cx + 4, cy + 4, "Display Settings", theme->text, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 24, "Theme:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 4, cy + 24, "Appearance:", theme->text, theme->client_bg);
     vdesk_draw_text(cx + 76, cy + 24, vdesk_get_theme_name(), theme->accent, theme->client_bg);
     {
         char buf[32];
@@ -489,22 +691,40 @@ static void display_settings_render(VWindow* win, int cx, int cy, int cw, int ch
         vdesk_draw_text(cx + 76, cy + 96, buf, theme->accent, theme->client_bg);
     }
     draw_button(cx + SETTINGS_BTN_X, cy + 118, SETTINGS_BTN_W, SETTINGS_BTN_H,
-                "Toggle Theme", 0);
-    vdesk_draw_text(cx + 4, cy + 150, "Click button or press F2 to toggle.",
+                "Cycle Look", 0);
+    vdesk_draw_text(cx + 4, cy + 150, "Click button, F2, or F9 cycles appearance.",
                     theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 166, "Use VGA Safe Mode if VESA freezes.",
+    vdesk_draw_text(cx + 4, cy + 166, "F1 snaps focus back to GooberShell.",
+                    theme->text_muted, theme->client_bg);
+    vdesk_draw_text(cx + 4, cy + 182, "Original keeps blue input + green output.",
+                    theme->text_muted, theme->client_bg);
+    vdesk_draw_text(cx + 4, cy + 206, "Shell output:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 112, cy + 206, "sample", vdesk_shell_output_color(), theme->client_bg);
+    draw_button(cx + 200, cy + SETTINGS_OUTPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H,
+                "Output Color", 0);
+    vdesk_draw_text(cx + 4, cy + 232, "Shell cursor/input:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 144, cy + 232, "> sample_", vdesk_shell_input_color(), theme->client_bg);
+    draw_button(cx + 200, cy + SETTINGS_INPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H,
+                "Input Color", 0);
+    vdesk_draw_text(cx + 4, cy + 258, "F6 output color | F7 input/cursor color",
                     theme->text_muted, theme->client_bg);
 }
 
 static void display_settings_key(VWindow* win, char key) {
     (void)win;
     if ((unsigned char)key == KEY_F2) vdesk_toggle_theme();
+    else if ((unsigned char)key == KEY_F6) vdesk_cycle_shell_output_color();
+    else if ((unsigned char)key == KEY_F7) vdesk_cycle_shell_input_color();
 }
 
 static void display_settings_click(VWindow* win, int lx, int ly) {
     (void)win;
     if (IN_RECT(lx, ly, SETTINGS_BTN_X, 118, SETTINGS_BTN_W, SETTINGS_BTN_H))
         vdesk_toggle_theme();
+    else if (IN_RECT(lx, ly, 200, SETTINGS_OUTPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H))
+        vdesk_cycle_shell_output_color();
+    else if (IN_RECT(lx, ly, 200, SETTINGS_INPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H))
+        vdesk_cycle_shell_input_color();
 }
 
 static void system_settings_render(VWindow* win, int cx, int cy, int cw, int ch) {
@@ -518,21 +738,23 @@ static void system_settings_render(VWindow* win, int cx, int cy, int cw, int ch)
                     theme->accent, theme->client_bg);
     vdesk_draw_text(cx + 4, cy + 44, "Controller:", theme->text, theme->client_bg);
     vdesk_draw_text(cx + 92, cy + 44, usb_host_controller_name(), theme->accent, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 68, "Theme:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 4, cy + 68, "Appearance:", theme->text, theme->client_bg);
     vdesk_draw_text(cx + 92, cy + 68, vdesk_get_theme_name(), theme->accent, theme->client_bg);
     draw_button(cx + SETTINGS_BTN_X, cy + 92, SETTINGS_BTN_W, SETTINGS_BTN_H,
-                "Toggle Theme", 0);
-    vdesk_draw_text(cx + 4, cy + 124, "Click button or press F2 to toggle.",
+                "Cycle Look", 0);
+    vdesk_draw_text(cx + 4, cy + 124, "Click button, F2, or F9 cycles appearance.",
                     theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 140, "Apps are lazy-launched; they must not",
+    vdesk_draw_text(cx + 4, cy + 140, "F1 focuses GooberShell. Esc falls back",
                     theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 156, "take over the graphics main loop.",
+    vdesk_draw_text(cx + 4, cy + 156, "to shell when app focus is gone.",
                     theme->text_muted, theme->client_bg);
 }
 
 static void system_settings_key(VWindow* win, char key) {
     (void)win;
     if ((unsigned char)key == KEY_F2) vdesk_toggle_theme();
+    else if ((unsigned char)key == KEY_F6) vdesk_cycle_shell_output_color();
+    else if ((unsigned char)key == KEY_F7) vdesk_cycle_shell_input_color();
 }
 
 static void system_settings_click(VWindow* win, int lx, int ly) {
@@ -782,8 +1004,34 @@ static void paint_key(VWindow* win, char key) {
     }
 }
 
-static void open_shell_window(void) {
-    VWindow* win = vdesk_create_window("Shell", 60, 40, 500, 320);
+static void open_shell_window(int primary) {
+    int top = vdesk_workspace_top();
+    int bottom = vdesk_workspace_bottom();
+    int w;
+    int h;
+    int x;
+    int y;
+    if (primary) {
+        w = (int)vesa_get_width();
+        h = bottom - top;
+        x = 0;
+        y = top;
+    } else if (vdesk_desktop_experience_visible()) {
+        w = 560;
+        h = 340;
+        x = 72;
+        y = top + 36;
+        if (w > (int)vesa_get_width() - 24) w = (int)vesa_get_width() - 24;
+        if (h > bottom - top - 20) h = bottom - top - 20;
+    } else {
+        w = (int)vesa_get_width() - 24;
+        h = bottom - top - 20;
+        x = 12;
+        y = top + 8;
+    }
+    if (w < 320) w = 320;
+    if (h < 220) h = 220;
+    VWindow* win = vdesk_create_window("GooberShell", x, y, w, h);
     if (win) {
         create_process("vesa-shell", 4);
         ShellApp* sa = create_shell_app();
@@ -791,6 +1039,10 @@ static void open_shell_window(void) {
         win->render = shell_render;
         win->key_handler = shell_key;
         win->scroll_handler = shell_scroll;
+        win->click_handler = shell_click;
+        if (primary) {
+            vdesk_set_primary_shell(win);
+        }
     }
 }
 
@@ -892,7 +1144,7 @@ static void open_taskmgr_window(void) {
 }
 
 static void open_display_settings_window(void) {
-    VWindow* win = vdesk_create_window("Display Settings", 300, 180, 380, 230);
+    VWindow* win = vdesk_create_window("Display Settings", 300, 180, 430, 330);
     if (win) {
         create_process("vesa-setup", 1);
         win->render = display_settings_render;
@@ -989,7 +1241,7 @@ static void vesa_open_desktop_file(const char* name, int kind) {
 static void vesa_launch_app(VDeskAppId app_id) {
     switch (app_id) {
         case VDESK_APP_SHELL:
-            open_shell_window();
+            open_shell_window(0);
             break;
         case VDESK_APP_EXPLORER:
             open_explorer_window();
@@ -1165,6 +1417,21 @@ static void desktop_vga13_render(void) {
 
 void vesa_desktop_init(void) {
     /*
+     * x64 VGA-Compatibility path: the display stage committed to the
+     * 80x25 text console (textcon) and never brought up a VESA LFB.
+     * There is no framebuffer to back a window manager, so the desktop
+     * stage is a no-op -- the kernel main loop will dispatch the full
+     * interactive text shell after the boot-stage results summary
+     * prints. Logging here keeps the per-stage results table honest
+     * (the stage reports OK, just with zero work).
+     */
+    if (kernel_display_is_text_console()) {
+        print("[desktop] text-console mode active -- "
+              "skipping VESA desktop init.\n");
+        return;
+    }
+
+    /*
      * Phase 4 (item 3): when the framework committed to the VGA-13h rung
      * we do NOT have a VESA LFB to back the full window manager. Render
      * the minimal fallback surface and skip the rest of init -- the
@@ -1201,22 +1468,23 @@ void vesa_desktop_init(void) {
     vdesk_init(w, h);
     vdesk_set_app_launcher(vesa_launch_app);
     vdesk_set_file_opener(vesa_open_desktop_file);
-    vdesk_add_icon("Shell", VDESK_APP_SHELL, 24, 24);
-    vdesk_add_icon("Files", VDESK_APP_EXPLORER, 24, 96);
-    vdesk_add_icon("Editor", VDESK_APP_EDITOR, 24, 168);
-    vdesk_add_icon("Tasks", VDESK_APP_TASK_MANAGER, 24, 240);
-    vdesk_add_icon("Paint", VDESK_APP_PAINT, 24, 312);
+    int icon_y = vdesk_workspace_top() + 24;
+    vdesk_add_icon("Shell", VDESK_APP_SHELL, 24, icon_y);
+    vdesk_add_icon("Files", VDESK_APP_EXPLORER, 24, icon_y + 72);
+    vdesk_add_icon("Editor", VDESK_APP_EDITOR, 24, icon_y + 144);
+    vdesk_add_icon("Tasks", VDESK_APP_TASK_MANAGER, 24, icon_y + 216);
+    vdesk_add_icon("Paint", VDESK_APP_PAINT, 24, icon_y + 288);
     /* Phase 4 (item 5): launcher for the VGA-passthrough window class.
      * Editor / games launched standalone (via shell) into the shim end up
      * painted here through the 8x16 font path. */
-    vdesk_add_icon("VGA App", VDESK_APP_VGA_CONSOLE, 24, 384);
+    vdesk_add_icon("VGA App", VDESK_APP_VGA_CONSOLE, 24, icon_y + 360);
 
     /* Ensure the dedicated Desktop folder exists (created once if missing) so
      * the desktop always reflects a fixed directory rather than the cwd. */
     fs_get_desktop_dir();
     vdesk_refresh_desktop_items(1);
 
-    open_shell_window();
+    open_shell_window(1);
 
     print("[desktop] init complete; entering event loop next.\n");
 }

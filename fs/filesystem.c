@@ -325,6 +325,52 @@ int fs_create_dir(const char* dirname) {
     return fs_dir_create_dir(current_dir, dirname);
 }
 
+int fs_dir_rename(Directory* dir, const char* old_name, const char* new_name) {
+    if (!dir || !old_name || !new_name || old_name[0] == '\0' || new_name[0] == '\0')
+        return -1;
+    if (strlen(new_name) >= MAX_NAME_LEN)
+        return -1;
+    if (dir_name_equal(old_name, new_name))
+        return 0;
+
+    for (size_t i = 0; i < dir->file_count; i++) {
+        if (dir_name_equal(new_name, dir->files[i].name)) {
+            print("fs_rename: target file already exists\n");
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < dir->child_count; i++) {
+        if (dir_name_equal(new_name, dir->children[i].name)) {
+            print("fs_rename: target directory already exists\n");
+            return -1;
+        }
+    }
+
+    for (size_t i = 0; i < dir->file_count; i++) {
+        if (dir_name_equal(old_name, dir->files[i].name)) {
+            for (size_t j = 0; j < MAX_NAME_LEN; j++) dir->files[i].name[j] = 0;
+            strncpy(dir->files[i].name, new_name, MAX_NAME_LEN - 1);
+            dir->files[i].name[MAX_NAME_LEN - 1] = '\0';
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < dir->child_count; i++) {
+        if (dir_name_equal(old_name, dir->children[i].name)) {
+            for (size_t j = 0; j < MAX_NAME_LEN; j++) dir->children[i].name[j] = 0;
+            strncpy(dir->children[i].name, new_name, MAX_NAME_LEN - 1);
+            dir->children[i].name[MAX_NAME_LEN - 1] = '\0';
+            return 0;
+        }
+    }
+
+    print("fs_rename: source not found\n");
+    return -1;
+}
+
+int fs_rename(const char* old_name, const char* new_name) {
+    return fs_dir_rename(current_dir, old_name, new_name);
+}
+
 int fs_delete_dir(const char* dirname) {
     if (!dirname || dirname[0] == '\0') return -1;
     for (size_t i = 0; i < current_dir->child_count; i++) {

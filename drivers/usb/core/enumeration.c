@@ -54,17 +54,20 @@ static void enum_print_retry(int port, int attempt, int total,
  *   - per-scan:        hard wall-time cap for one usb_enumerate_devices() call
  * Plus a Linux-style stable-connect debounce and per-port reset retries.
  */
-#define ENUM_PORT_BUDGET_MS      1500U   /* ~150 ticks per reset+enumerate */
-#define ENUM_CTRL_BUDGET_MS      3000U   /* ~300 ticks controller bring-up  */
-#define ENUM_SCAN_BUDGET_MS      5000U   /* ~500 ticks hard per-scan cap     */
-#define ENUM_PORT_RETRIES        3       /* reset/enumerate attempts/port    */
-#define ENUM_DEBOUNCE_POLL_MS    25U     /* connect poll interval            */
-#define ENUM_DEBOUNCE_STABLE_MS  100U    /* connection must persist this long */
-#define ENUM_DEBOUNCE_CAP_MS     2000U   /* total debounce window cap        */
+#define ENUM_PORT_BUDGET_MS       700U   /* reset+enumerate cap per port      */
+#define ENUM_CTRL_BUDGET_MS      1500U   /* controller bring-up cap           */
+#define ENUM_SCAN_BUDGET_MS      2500U   /* hard cap for one scan             */
+#define ENUM_PORT_RETRIES        2       /* reset/enumerate attempts/port     */
+#define ENUM_DEBOUNCE_POLL_MS    20U     /* connect poll interval             */
+#define ENUM_DEBOUNCE_STABLE_MS  60U     /* connection must persist this long */
+#define ENUM_DEBOUNCE_CAP_MS     600U    /* total debounce window cap         */
 
 static usb_device_t devices[MAX_DEVICES];
 static int device_count = 0;
 static int current_address = 1;
+static uint32_t hid_control_next_poll = 0;
+static int hid_control_logged = 0;
+static int hid_interrupt_logged = 0;
 
 static uint8_t buf_scratch[256];
 
@@ -202,6 +205,12 @@ static int hid_set_idle(uint8_t addr, uint8_t interface, uint8_t duration) {
  */
 static int port_budget_blown(uint64_t port_deadline) {
     return host_controller_faulted() || timer_deadline_expired(port_deadline);
+}
+
+static int vid_is_touchpad(uint16_t vendor_id) {
+    /* ELAN, Synaptics, ALPS, and Cypress commonly ship laptop touchpads. */
+    return vendor_id == 0x04F3 || vendor_id == 0x06CB ||
+           vendor_id == 0x044E || vendor_id == 0x04B4;
 }
 
 /* ---- Enumerate a single device on a given port ---- */
@@ -355,6 +364,7 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
     dev->class_code = USB_CLASS_HID;
     dev->subclass = USB_HID_SUBCLASS_BOOT;
     dev->protocol = (uint8_t)chosen_protocol;
+    dev->interface_number = (uint8_t)interface_number;
     dev->max_packet_size = max_pkt;
     dev->ep_in = ep_in->bEndpointAddress;
     dev->ep_out = 0;
@@ -372,12 +382,19 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
     }
 
     if (chosen_protocol == USB_HID_PROTOCOL_MOUSE) {
-        usb_hid_register_boot_pointer(1, 0);
+        uint8_t is_touchpad = vid_is_touchpad(dd.idVendor) ? 1 : 0;
+        usb_hid_register_boot_pointer_detail(1, is_touchpad, (uint8_t)port, addr,
+                                             ep_in->bEndpointAddress,
+                                             ep_in->wMaxPacketSize,
+                                             ep_in->bInterval);
         enum_print("USB HID boot mouse enumerated.\n");
         return USB_HID_PROTOCOL_MOUSE;
     }
 
-    usb_hid_register_boot_keyboard(1);
+    usb_hid_register_boot_keyboard_detail(1, (uint8_t)port, addr,
+                                          ep_in->bEndpointAddress,
+                                          ep_in->wMaxPacketSize,
+                                          ep_in->bInterval);
     enum_print("USB HID boot keyboard enumerated.\n");
     return USB_HID_PROTOCOL_KEYBOARD;
 }
@@ -388,6 +405,9 @@ void usb_enumerate_devices(void) {
 
     device_count = 0;
     current_address = 1;
+    hid_control_next_poll = 0;
+    hid_control_logged = 0;
+    hid_interrupt_logged = 0;
 
     if (!host_controller_healthy()) {
         enum_print("USB enum: controller not healthy.\n");
@@ -465,7 +485,7 @@ void usb_enumerate_devices(void) {
     uint64_t scan_deadline = timer_deadline_ms(ENUM_SCAN_BUDGET_MS);
     uint64_t ctrl_deadline = timer_deadline_ms(ENUM_CTRL_BUDGET_MS);
 
-    for (int port = 0; port < ports && !found_pointer && !found_keyboard; port++) {
+    for (int port = 0; port < ports && !found_pointer; port++) {
         if (host_controller_faulted()) {
             enum_print("USB enum: controller faulted, abandoning scan.\n");
             break;
@@ -541,14 +561,13 @@ void usb_enumerate_devices(void) {
         } else if (enum_result == USB_HID_PROTOCOL_KEYBOARD) {
             found_keyboard = 1;
             /*
-             * Current host drivers track one active interrupt endpoint and
-             * one active device slot. Stop here so a later failed probe does
-             * not reset/overwrite the working USB keyboard state. Full
-             * simultaneous keyboard+mouse support needs a multi-endpoint host
-             * scheduler, which is the next layer after this compatibility
-             * pass.
+             * Keep scanning for a boot mouse. On laptops it is common for a
+             * keyboard-like HID interface/controller path to enumerate before
+             * the external mouse, and stopping here leaves the GUI pointer
+             * stuck even though a mouse is present. If no mouse is found by the
+             * end of the scan, this keyboard remains the fallback HID device.
              */
-            enum_print("USB enum: boot keyboard found, stopping scan.\n");
+            enum_print("USB enum: boot keyboard found, continuing scan for mouse.\n");
         } else {
             /* Port exhausted its retries: mark dead and move on. */
             enum_print("USB enum: port gave up, marking dead and continuing.\n");
@@ -556,7 +575,8 @@ void usb_enumerate_devices(void) {
     }
 
     if (found_pointer) {
-        usb_hid_register_boot_pointer(1, 0);
+        /* enumerate_device() already registered the pointer with endpoint
+         * details and touchpad classification. Do not clobber that state here. */
         enum_print("USB enum: pointer device ready.\n");
     } else if (found_keyboard) {
         usb_hid_register_boot_pointer(0, 0);
@@ -660,6 +680,9 @@ void usb_enumeration_release_active(void) {
     host_remove_interrupt();
     device_count = 0;
     current_address = 1;
+    hid_control_next_poll = 0;
+    hid_control_logged = 0;
+    hid_interrupt_logged = 0;
 }
 
 int usb_get_device_count(void) {
@@ -675,6 +698,10 @@ void usb_process_hid_reports(void) {
     int ready;
     uint8_t* report = host_get_report(&ready);
     if (ready > 0) {
+        if (!hid_interrupt_logged) {
+            enum_print("USB HID: interrupt report path is live.\n");
+            hid_interrupt_logged = 1;
+        }
         /*
          * The host drivers expose data-ready as a flag, not a byte count, so
          * pass the boot-protocol report length for the active device class:
@@ -689,5 +716,54 @@ void usb_process_hid_reports(void) {
     } else if (ready < 0) {
         /* Re-arm on stall/error */
         host_ack_report();
+    }
+
+    /*
+     * Real-hardware fallback: some controller paths enumerate a boot mouse but
+     * never deliver periodic interrupt completions. Poll HID GET_REPORT over
+     * endpoint 0 at a low rate. This is slower than interrupts, but endpoint 0
+     * is the path that already worked for descriptors/configuration, so it is a
+     * good rescue path for cheap mice and a useful diagnostic on bare metal.
+     */
+    if (!hid_interrupt_logged && usb_hid_has_pointer_device() && device_count > 0) {
+        usb_device_t* dev = NULL;
+        for (int i = 0; i < device_count; i++) {
+            if (devices[i].protocol == USB_HID_PROTOCOL_MOUSE) {
+                dev = &devices[i];
+                break;
+            }
+        }
+        if (dev) {
+            uint32_t now = timer_ticks();
+            if ((int32_t)(now - hid_control_next_poll) >= 0) {
+                uint8_t ctrl_report[8];
+                uint8_t len = dev->ep_in_max_pkt;
+                if (len < 3) len = 3;
+                if (len > sizeof(ctrl_report)) len = sizeof(ctrl_report);
+                for (uint8_t i = 0; i < sizeof(ctrl_report); i++) ctrl_report[i] = 0;
+                int ret = do_ctrl(dev->address,
+                                  USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                                  USB_HID_REQ_GET_REPORT,
+                                  0x0100,
+                                  dev->interface_number,
+                                  len,
+                                  ctrl_report,
+                                  1);
+                if (ret == 0) {
+                    if (!hid_control_logged) {
+                        enum_print("USB HID: control GET_REPORT fallback is live.\n");
+                        hid_control_logged = 1;
+                    }
+                    usb_hid_handle_boot_report(ctrl_report, len);
+                    hid_control_next_poll = now + 2; /* ~50 Hz on 100 Hz PIT */
+                } else {
+                    if (!hid_control_logged) {
+                        enum_print("USB HID: control GET_REPORT fallback failed once.\n");
+                        hid_control_logged = 1;
+                    }
+                    hid_control_next_poll = now + 25;
+                }
+            }
+        }
     }
 }
