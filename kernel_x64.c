@@ -10,10 +10,8 @@
  *   - x64_arch_idt_install()                  -- 64-bit IDT (256 gates,
  *                                                exception_stubs + IRQ0/1/12)
  *   - x64_arch_pic_remap()                    -- legacy 8259 remap
- *   - x64_arch_walk_and_draw_framebuffer(info) -- Phase 3a/3a.1 preserved
- *                                                  output: mb2 framebuffer
- *                                                  tag walk + RGB bands +
- *                                                  3-line 8x16 proof-of-life
+ *   - x64_arch_walk_and_draw_framebuffer(info) -- mb2 framebuffer tag walk
+ *                                                  and serial diagnostics
  *   - x64_arch_legacy_vga_text_line(s)        -- one line of 0xB8000 text
  *                                                (visible on legacy BIOS;
  *                                                 silently dropped on UEFI)
@@ -154,11 +152,9 @@ void x64_arch_dump_multiboot(uint32_t magic, uintptr_t info) {
 }
 
 /* ========================================================================
- * Phase 3a / 3a.1: Multiboot2 framebuffer tag walk + RGB test pattern +
- * 8x16 on-panel proof-of-life. PRESERVED from the 3b.0 milestone, lifted
- * into x64_arch_walk_and_draw_framebuffer() so the unified kernel.c
- * orchestrator drives the same draw sequence in the same place in the
- * boot log.
+ * Multiboot2 framebuffer tag walk + serial diagnostics.
+ * The old RGB proof-of-life pattern is intentionally no longer drawn on the
+ * default boot path; kernel.c/vesa.c owns the dark logo + progress splash.
  * ======================================================================== */
 
 struct goober_fb {
@@ -483,8 +479,7 @@ void x64_arch_walk_and_draw_framebuffer(uintptr_t info) {
      * framebuffer tag, so this is safe). */
     mb2_walk_framebuffer(info, &g_fb);
     print_framebuffer_tag(&g_fb);
-    draw_fb_test_pattern(&g_fb);
-    fb_render_proof_of_life(&g_fb);
+    x64_out("[fb] early RGB proof-of-life skipped; using boot logo splash.\n");
 }
 
 /* ---- Legacy 0xB8000 line (legacy-BIOS only; harmless on UEFI) ----------- */

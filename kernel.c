@@ -8,6 +8,7 @@
 #include "drivers/video/display.h"
 #include "drivers/video/native_fb.h"
 #include "drivers/video/intel_gfx.h"
+#include "drivers/video/textcon.h"
 #include "drivers/video/font.h"
 #include "drivers/pci/pci.h"
 #include "lib/string.h"
@@ -42,6 +43,8 @@
 #include "drivers/mouse/mouse.h"
 #include "drivers/input/input.h"
 #include "drivers/usb/usb.h"
+#include "drivers/acpi/acpi.h"
+#include "drivers/input/touchpad.h"
 #ifdef __i386__
 #include "drivers/storage/storage.h"
 #include "taskmgr/process.h"
@@ -56,7 +59,7 @@
 #define IRQ1 33
 
 #define KERNEL_HEAP_SIZE (64 * 1024)  // 64KB heap, adjust as needed
-#define VESA_STATIC_BACKBUFFER_BYTES (4 * 1024 * 1024)
+#define VESA_STATIC_BACKBUFFER_BYTES (8 * 1024 * 1024)
 
 #ifdef __i386__
 volatile int keyboard_interrupt_flag = 0;
@@ -101,6 +104,8 @@ static boot_config_t g_boot_config = {
     .boot    = "default",
     .display = "auto",
     .usb     = "",
+    .i2c     = "",
+    .touchpad = "",
     .theme   = "",
     .native  = "",
     .safe    = 0,
@@ -125,6 +130,20 @@ int kernel_display_target_fps(void) {
  */
 static int boot_mode_vga_graphics = 0;
 int kernel_display_is_vga_graphics(void) { return boot_mode_vga_graphics; }
+
+/*
+ * Text-console boot flag (x64 VGA compatibility). Set inside
+ * framebuffer_bringup() when the display stage commits to the 80x25 text
+ * console rather than any graphical surface -- either explicitly
+ * (gooberos.boot=vga / gooberos.display=vga-text) or as the last-resort
+ * fallback when every other rung was rejected. When set, the x64 main
+ * loop runs the full interactive text shell instead of the VESA desktop;
+ * the x86 path is unaffected (it always has a working VGA text mode under
+ * BIOS so the flag is set but the shell/desktop dispatch in kernel_main
+ * stays the same).
+ */
+static int boot_mode_text_console = 0;
+int kernel_display_is_text_console(void) { return boot_mode_text_console; }
 
 int is_vesa_mode(void) {
     return boot_mode_vesa;
@@ -233,6 +252,8 @@ static void boot_config_parse(const char* cmdline) {
     kstr_copy(g_boot_config.boot, "default", sizeof(g_boot_config.boot));
     kstr_copy(g_boot_config.display, "auto", sizeof(g_boot_config.display));
     g_boot_config.usb[0] = '\0';
+    g_boot_config.i2c[0] = '\0';
+    g_boot_config.touchpad[0] = '\0';
     g_boot_config.theme[0] = '\0';
     g_boot_config.native[0] = '\0';
     g_boot_config.safe = 0;
@@ -296,6 +317,10 @@ static void boot_config_parse(const char* cmdline) {
                                             ? 0 : 1;
         } else if (kstr_starts(p, "gooberos.usb=")) {
             kcopy_token_value(p + 13, g_boot_config.usb, sizeof(g_boot_config.usb));
+        } else if (kstr_starts(p, "gooberos.i2c=")) {
+            kcopy_token_value(p + 13, g_boot_config.i2c, sizeof(g_boot_config.i2c));
+        } else if (kstr_starts(p, "gooberos.touchpad=")) {
+            kcopy_token_value(p + 18, g_boot_config.touchpad, sizeof(g_boot_config.touchpad));
         } else if (kstr_starts(p, "gooberos.theme=")) {
             kcopy_token_value(p + 15, g_boot_config.theme, sizeof(g_boot_config.theme));
         } else if (kstr_starts(p, "gooberos.native=")) {
@@ -582,18 +607,16 @@ static int display_confirm_visible(const display_driver_ops_t* drv,
 }
 
 /*
- * On-panel confirm-or-revert gate. After we have committed to a graphical mode,
- * draw the high-contrast splash with a prompt and wait a bounded time for the
- * user to confirm they can actually see it. If no key arrives, hard-revert to
- * the VGA text floor (which restores the firmware text state that lights the
- * panel) so the user is NEVER stranded on a black screen.
+ * Optional on-panel confirm-or-revert gate. The default boot skips this now
+ * that the framebuffer path is validated; safe/diagnostic boots can still force
+ * it with gooberos.display.confirm=force.
  *
  * The PS/2 keyboard and the 100Hz PIT are already live here (the staged boot
  * enabled interrupts after the kernel-heap floor stage, before this display
  * stage), so the wait is interrupt-driven and bounded by the tick counter with
  * a hard spin cap as a backstop. Returns 1 if confirmed, 0 if it reverted.
  */
-#define DISPLAY_CONFIRM_TIMEOUT_MS 8000u
+#define DISPLAY_CONFIRM_TIMEOUT_MS 3000u
 
 /* Interactive on-panel confirmation. Requires the PS/2 keyboard driver to be
  * online; the boot orchestrator runs the input stage (input_init +
@@ -602,8 +625,8 @@ static int display_confirm_visible(const display_driver_ops_t* drv,
  * is now compiled for both arches. */
 static int display_on_panel_confirm(void) {
     vesa_boot_splash("Press ENTER if you can see this. "
-                     "Reverting to VGA text in 8s...");
-    serial_out("[display] on-panel confirm: waiting up to 8s for a keypress...\n");
+                     "Reverting to VGA text in 3s...");
+    serial_out("[display] on-panel confirm: waiting up to 3s for a keypress...\n");
 
     /* Drain stale keystrokes so a pre-buffered key cannot auto-confirm. */
     while (keyboard_has_char()) (void)keyboard_read_char();
@@ -649,21 +672,67 @@ static int display_on_panel_confirm(void) {
 static int g_display_native_w = 0, g_display_native_h = 0;
 
 /*
- * Commit to the VGA text floor. If GRUB left the hardware in a graphics linear-
- * framebuffer mode (gfxpayload=keep, inherited type 1), the text console at
- * 0xB8000 would be invisible, so hard-reprogram the VGA controller back to text
- * (restoring the firmware text state that lights the panel). When GRUB was
- * already in text mode (no graphics FB inherited) this is skipped. Always
- * clears boot_mode_vesa so the rest of boot stays on the text console.
+ * Commit to the 80x25 text console. Two paths:
+ *
+ *   1. GRUB handed us an inherited graphics LFB (type 1) -- e.g. UEFI x64
+ *      VGA-compat boot, where the firmware never gives back the legacy text
+ *      plane after a graphics handoff. In that case the textcon framebuffer
+ *      backend renders the cell grid via the 8x16 font directly into the
+ *      top-left 640x400 region of the GOP framebuffer. This is the only
+ *      visible text path under UEFI.
+ *
+ *   2. GRUB left us in legacy VGA text mode (no graphics FB inherited).
+ *      That is the classic x86 BIOS path: textcon binds the 0xB8000 plane
+ *      and mirrors cell writes verbatim. On the rare UEFI legacy-BIOS
+ *      reverting case (graphics LFB inherited but no longer wanted),
+ *      display_restore_vga_text() reprograms the VGA controller back to
+ *      text first.
+ *
+ * Always sets boot_mode_text_console (so the x64 main loop runs the full
+ * shell instead of the VESA desktop) and clears boot_mode_vesa.
  */
 static void revert_to_text_floor(void) {
-    if (saved_have_loader_fb && saved_fb_type == 1) {
-        display_restore_vga_text();
-        clear_screen();
-        vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-        serial_out("[display] restored VGA text mode (GRUB had set a graphics LFB).\n");
-    }
     boot_mode_vesa = 0;
+    boot_mode_text_console = 1;
+
+    /* Path 1: inherited LFB -- render the text console into the
+     * firmware framebuffer. This is the visible path on UEFI x64. */
+    if (saved_have_loader_fb && saved_fb_type == 1) {
+        uintptr_t fb_addr;
+        if (sizeof(uintptr_t) < sizeof(uint64_t) && ((saved_fb_addr >> 32) != 0)) {
+            fb_addr = 0;
+        } else {
+            fb_addr = (uintptr_t)saved_fb_addr;
+        }
+        if (fb_addr && con_init_fb(fb_addr, saved_fb_w, saved_fb_h,
+                                   saved_fb_pitch, saved_fb_bpp)) {
+            /* Reflect the FB as the visible console in diagnostics. */
+            last_fb_type   = saved_fb_type;
+            last_fb_bpp    = saved_fb_bpp;
+            last_fb_pitch  = saved_fb_pitch;
+            last_fb_width  = saved_fb_w;
+            last_fb_height = saved_fb_h;
+            last_fb_addr   = fb_addr;
+            serial_out("[display] bound text console to inherited "
+                       "framebuffer (textcon FB backend).\n");
+            return;
+        }
+        /* FB bind failed (too small, weird bpp): try to hard-revert the
+         * VGA controller back to text and use 0xB8000 instead. On UEFI
+         * this almost certainly won't light the panel either, but on a
+         * legacy-BIOS boot it will. */
+        display_restore_vga_text();
+        vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        serial_out("[display] textcon FB bind declined; falling back "
+                   "to 0xB8000 (legacy BIOS only).\n");
+    }
+
+    /* Path 2: legacy VGA text plane. clear_screen() writes 0xB8000 and
+     * con_init_vga then snapshots that into the cell grid. */
+    clear_screen();
+    con_init_vga();
+    serial_out("[display] bound text console to 0xB8000 "
+               "(textcon VGA backend).\n");
 }
 
 static void framebuffer_bringup(void) {
@@ -678,6 +747,15 @@ static void framebuffer_bringup(void) {
         revert_to_text_floor();
         return;
     }
+    /* gooberos.display=vga-text: explicit 80x25 text floor, even when
+     * GRUB inherited a graphics LFB. Goes through the same textcon path
+     * as the VGA-Compatibility GRUB entry. */
+    if (kstr_eq(g_boot_config.display, "vga-text")) {
+        vesa_reject_reason = "VESA disabled: text-only floor requested "
+                             "by gooberos.display=vga-text.\n";
+        revert_to_text_floor();
+        return;
+    }
 
     /* gooberos.display=safe: firmware FB only + probe + forced auto-revert. */
     int safe_display = kstr_eq(g_boot_config.display, "safe");
@@ -686,15 +764,29 @@ static void framebuffer_bringup(void) {
         serial_out("[display] gooberos.display=safe: adopting firmware FB only, "
                    "probe + on-panel auto-revert armed.\n");
 
-    /* gooberos.native=WxH: a hint we prefer for the generic driver and flag in
-     * diagnostics if the committed mode differs. */
+    /* Pick the recommended geometry that programmable drivers should try first.
+     * Inherited framebuffers ignore this and keep the loader's exact mode. */
     uint32_t nat_w = 0, nat_h = 0;
+    uint32_t req_w = 0, req_h = 0;
     if (parse_wxh(g_boot_config.native, &nat_w, &nat_h)) {
         g_display_native_w = (int)nat_w;
         g_display_native_h = (int)nat_h;
+        req_w = nat_w;
+        req_h = nat_h;
         serial_out("[display] native panel hint: ");
         { char b[16]; itoa((int)nat_w, b, 10); serial_out(b); serial_out("x");
           itoa((int)nat_h, b, 10); serial_out(b); serial_out("\n"); }
+    } else if (saved_have_loader_fb && saved_fb_type == 1 &&
+               saved_fb_w >= 320 && saved_fb_h >= 200 &&
+               saved_fb_w <= 1920 && saved_fb_h <= 1200) {
+        req_w = saved_fb_w;
+        req_h = saved_fb_h;
+        serial_out("[display] recommended mode from loader framebuffer: ");
+        { char b[16]; itoa((int)req_w, b, 10); serial_out(b); serial_out("x");
+          itoa((int)req_h, b, 10); serial_out(b); serial_out("\n"); }
+    } else {
+        serial_out("[display] recommended mode: driver default "
+                   "(no safe native/loader geometry).\n");
     }
 
     /*
@@ -728,7 +820,7 @@ static void framebuffer_bringup(void) {
      * (the inherited "vesa" driver ignores hints and uses GRUB's geometry). */
     display_framebuffer_t fb;
     const display_driver_ops_t* drv =
-        display_probe_drivers(force_name, nat_w, nat_h, 0, &fb,
+        display_probe_drivers(force_name, req_w, req_h, 0, &fb,
                               display_confirm_visible, NULL);
 
     if (!drv) {
@@ -779,27 +871,15 @@ static void framebuffer_bringup(void) {
     last_fb_addr = fb.framebuffer_addr;
 
     /*
-     * On-panel confirm-or-revert. Run it on the at-risk hardware (any Intel GPU
-     * present, the "valid FB scans out dark" case), whenever safe mode was
-     * requested, OR unconditionally on x64. The x64 path runs through this
-     * gate every boot because under UEFI the firmware never gives back the
-     * legacy text plane after a graphics LFB; arming the auto-revert is the
-     * cheapest insurance against handing the user a dark panel after a bad
-     * mode commit. (Phase 3c flipped this on once the keyboard driver was
-     * linked into the x64 build.) Pure x86 VMs without an Intel GPU keep
-     * their existing always-visible behavior.
+     * The normal path now trusts the validated framebuffer and goes directly
+     * to the desktop. Safe mode and gooberos.display.confirm=force keep the
+     * bounded fallback prompt available for diagnostics.
      */
     int intel_present = intel_gfx_detect(NULL);
-#ifdef __x86_64__
-    int run_confirm = 1;        /* always-on under UEFI by default */
-#else
-    int run_confirm = (safe_display || intel_present);
-#endif
+    int run_confirm = safe_display;
     /*
-     * Phase 3f: gooberos.display.confirm=skip|force|default lets the
-     * cmdline override the arch default. `skip` is what unattended QEMU
-     * CI sets so the boot doesn't time out and revert to VGA text. The
-     * arch defaults are unchanged when the switch is absent.
+     * gooberos.display.confirm=skip|force|default lets the cmdline override
+     * the default. Normal boot passes skip; the safe GRUB entry passes force.
      */
     switch (g_boot_config.display_confirm) {
         case BOOT_DISPLAY_CONFIRM_SKIP:
@@ -829,7 +909,7 @@ static void framebuffer_bringup(void) {
             revert_to_text_floor();
             vesa_reject_reason =
                 "VESA reverted: no on-panel confirmation; restored VGA text floor.\n";
-            print("Display: no confirmation within 8s; reverted to VGA text.\n");
+            print("Display: no confirmation within 3s; reverted to VGA text.\n");
             serial_out("[display] reverting to VGA text floor after on-panel timeout.\n");
             /* Reflect the revert through the diagnostic accessors. */
             last_fb_type = 0xFF;
@@ -1286,10 +1366,17 @@ void print(const char* str) {
 
 #ifdef __i386__
 extern void fs_init();
-extern void shell_init();
-extern void shell_run();
 extern void vesa_desktop_run();
 #endif
+
+/* shell.c is linked on both arches (Phase 3e), so the shell entry points
+ * are available regardless of __i386__ / __x86_64__. The x64 main loop
+ * dispatches the full shell when the VGA-Compatibility boot path commits
+ * the 80x25 text console; the x86 path uses the same shell_init/shell_run
+ * pair after vesa_desktop_run returns or is skipped. usb_poll() is already
+ * declared via drivers/usb/usb.h included above. */
+extern void shell_init(void);
+extern void shell_run(void);
 
 #ifdef __i386__
 static void update_kernel_process_memory() {
@@ -1368,7 +1455,8 @@ typedef struct {
 #define WD_HWSUMMARY  300u   /* 3 s  */
 #define WD_PCI        400u   /* 4 s  */
 #define WD_STORAGE    500u   /* 5 s  */
-#define WD_USB       1200u   /* 12 s -- the known real-hardware offender */
+#define WD_USB        500u   /* 5 s -- bounded so bad USB does not dominate boot */
+#define WD_TOUCHPAD   250u   /* 2.5 s -- ACPI/I2C touchpad probe ceiling */
 /*
  * Phase 3f doubles the desktop init budget to 60 s. Storage-driven icon
  * enumeration (Recent Files, mounted volumes, /Desktop on a slow USB
@@ -1443,6 +1531,15 @@ static void stage_pci(void)      { pci_init(); }
 static void stage_storage(void)  { storage_init(); }
 static void stage_usb(void)      { usb_init(); }
 static void stage_fs(void)       { fs_init(); }
+static void stage_acpi(void)     { acpi_init(); }
+static void stage_touchpad(void) {
+    if (kstr_eq(g_boot_config.i2c, "off") ||
+        kstr_eq(g_boot_config.touchpad, "off")) {
+        print("[touchpad] disabled by cmdline.\n");
+        return;
+    }
+    touchpad_init();
+}
 
 static const boot_stage_def_t k_boot_stages[] = {
     /* --- Minimal floor: always runs, even in safe mode --- */
@@ -1451,17 +1548,20 @@ static const boot_stage_def_t k_boot_stages[] = {
     { "Kernel heap",                 stage_heap,      0, 1, NULL, 0, 0 },
     /* --- Risky stages: guarded, skipped in safe mode --- */
     { "Hardware summary (PCI scan)", stage_hwsummary, 1, 0, NULL, 0, WD_HWSUMMARY },
+    { "ACPI tables",                 stage_acpi,      1, 0, NULL, 0, WD_HWSUMMARY },
     { "Display / framebuffer",       stage_display,   1, 0,
       "Framebuffer OK. Initializing hardware...", 1, 0 },
     { "PCI init",                    stage_pci,       1, 0,
       "PCI initialized. Scanning storage...", 0, WD_PCI },
+    { "I2C HID touchpad",            stage_touchpad,  1, 0,
+      "Touchpad probe complete. Scanning storage...", 0, WD_TOUCHPAD },
     { "Storage controllers",         stage_storage,   1, 0,
       "Storage initialized. Initializing USB...", 0, WD_STORAGE },
     { "USB host stack",              stage_usb,       1, 0,
       "USB initialized. Loading filesystem...", 0, WD_USB },
     /* --- Back to the floor: filesystem powers the text shell --- */
     { "Filesystem",                  stage_fs,        0, 0,
-      "Filesystem ready. Starting desktop in 3 seconds...", 0, 0 },
+      "Filesystem ready. Starting desktop...", 0, 0 },
 };
 
 static void boot_run_stages(void) {
@@ -1544,14 +1644,6 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
     boot_print_results_summary();
 
     if (boot_mode_vesa) {
-        /*
-         * Hold the splash long enough for a user with a marginal LCD to read
-         * the resolution/pitch/FB-addr info. Without this they only see a
-         * brief flash before the desktop clears the screen, which makes
-         * "is the panel even syncing?" impossible to answer.
-         */
-        timer_sleep(3000);
-
         uint32_t fb_size = vesa_get_pitch() * vesa_get_height();
         if (fb_size <= VESA_STATIC_BACKBUFFER_BYTES) {
             vesa_set_backbuffer_bytes((uint32_t*)vesa_static_backbuffer, fb_size);
@@ -1573,6 +1665,7 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
 
     while (1) {
         usb_poll();
+        touchpad_poll();
         shell_run();
         __asm__("hlt");
     }
@@ -1688,6 +1781,70 @@ static void x64_fb_clear_below_pol(void) {
     x64_fb_glyph_col = 0;
 }
 
+/*
+ * Textcon mirror for the x64 print sink. Active when the display stage
+ * bound the 80x25 text console (the VGA-compat boot path -- either x64
+ * UEFI rendering into the GOP framebuffer, or x64 legacy BIOS writing
+ * to 0xB8000). Maintains its own row/col cursor so the boot log scrolls
+ * cleanly; on `\n` we move to the next row and scroll when we run off
+ * the bottom. Handles `\r`, `\t` -> space, and `\b`/DEL.
+ *
+ * After the boot log finishes printing, x64_con_sync_shell_cursor()
+ * copies the row/col into the shell's `cursor_row`/`cursor_col` so
+ * shell_init() starts its prompt immediately below the last log line.
+ */
+static int x64_con_row = 0;
+static int x64_con_col = 0;
+#define X64_CON_ATTR 0x07u   /* light grey on black: a calm boot-log tone */
+
+static void x64_con_putc(char c) {
+    if (!con_ready()) return;
+    if (c == '\n') {
+        x64_con_col = 0;
+        if (x64_con_row + 1 < CON_ROWS) {
+            x64_con_row++;
+        } else {
+            con_scroll_up(1, X64_CON_ATTR);
+            /* stay on last row */
+        }
+        return;
+    }
+    if (c == '\r') { x64_con_col = 0; return; }
+    if (c == '\t') c = ' ';
+    if (c == '\b' || c == 0x7F) {
+        if (x64_con_col > 0) {
+            x64_con_col--;
+            con_put_cell(x64_con_row, x64_con_col, ' ', X64_CON_ATTR);
+        }
+        return;
+    }
+    if (x64_con_col >= CON_COLS) {
+        x64_con_col = 0;
+        if (x64_con_row + 1 < CON_ROWS) {
+            x64_con_row++;
+        } else {
+            con_scroll_up(1, X64_CON_ATTR);
+        }
+    }
+    con_put_cell(x64_con_row, x64_con_col, c, X64_CON_ATTR);
+    x64_con_col++;
+}
+
+/* Hand off the boot-log cursor to the shell. Called from the x64 main
+ * loop just before shell_init() so the prompt starts on a fresh line
+ * immediately below the boot-stage results summary, not at row 0
+ * overwriting it. */
+static void x64_con_sync_shell_cursor(void) {
+    if (!con_ready()) return;
+    /* If the boot log ended mid-line, drop down to the next row so the
+     * prompt does not concatenate onto the partial line. */
+    int row = x64_con_row;
+    if (x64_con_col != 0 && row + 1 < CON_ROWS) row++;
+    if (row >= CON_ROWS) row = CON_ROWS - 1;
+    cursor_row = (uint8_t)row;
+    cursor_col = 0;
+}
+
 static void x64_print_sink(const char* str, void* ctx) {
     (void)ctx;
     while (*str) {
@@ -1696,8 +1853,15 @@ static void x64_print_sink(const char* str, void* ctx) {
         outb(0xE9, (uint8_t)c);
         while ((inb(0x3F8 + 5) & 0x20) == 0) {}
         outb(0x3F8, (uint8_t)c);
-        /* Framebuffer console mirror; no-op until vesa is initialized. */
-        x64_fb_putc(c);
+        /* On-panel mirror. The graphical (VESA desktop) path is the
+         * common one; the textcon path lights up when the user picked
+         * the VGA-Compatibility GRUB entry. They are mutually exclusive
+         * because the display stage commits to exactly one. */
+        if (vesa_is_initialized()) {
+            x64_fb_putc(c);
+        } else {
+            x64_con_putc(c);
+        }
     }
 }
 
@@ -1740,6 +1904,15 @@ static void stage_x64_usb(void)        { usb_init(); }
  */
 extern void storage_init(void);
 static void stage_x64_storage(void)    { storage_init(); }
+static void stage_x64_acpi(void)       { acpi_init(); }
+static void stage_x64_touchpad(void) {
+    if (kstr_eq(g_boot_config.i2c, "off") ||
+        kstr_eq(g_boot_config.touchpad, "off")) {
+        print("[touchpad] disabled by cmdline.\n");
+        return;
+    }
+    touchpad_init();
+}
 
 /*
  * Phase 3e: in-memory filesystem and VESA desktop bring-up.
@@ -1908,6 +2081,7 @@ static const boot_stage_def_t k_boot_stages_x64[] = {
     { "PS/2 input + keyboard/mouse", stage_x64_input,     0, 1, NULL, 0, 0 },
     /* --- Risky stages: guarded, skipped in safe mode --- */
     { "Hardware summary (PCI scan)", stage_x64_hwsummary, 1, 0, NULL, 0, WD_HWSUMMARY },
+    { "ACPI tables",                 stage_x64_acpi,      1, 0, NULL, 0, WD_HWSUMMARY },
     /*
      * Phase 3d: USB host stack between the PCI scan and the display stage,
      * matching the x86 ordering in k_boot_stages above. The 12-second
@@ -1936,6 +2110,7 @@ static const boot_stage_def_t k_boot_stages_x64[] = {
      * stage table by kernel_main below.
      */
     { "Kernel heap",                 stage_x64_heap,      0, 0, NULL, 0, 0 },
+    { "I2C HID touchpad",            stage_x64_touchpad,  1, 0, NULL, 0, WD_TOUCHPAD },
     { "Filesystem",                  stage_x64_fs,        1, 0, NULL, 0, 200 },
     /*
      * Phase 3f: Storage stage runs after Filesystem + before the desktop
@@ -2001,10 +2176,8 @@ void kernel_main(uint32_t magic, uintptr_t info) {
     }
 
     /*
-     * Step 4. Preserved Phase 3a/3a.1 on-panel proof-of-life. Renders the
-     *         RGB sync bands + 3 lines of 8x16 text from
-     *         fb_render_proof_of_life. The x64 framebuffer text console
-     *         below starts at row 4 so it doesn't clobber these.
+     * Step 4. Capture framebuffer diagnostics early. The visible boot surface
+     *         is now the dark logo/progress splash in vesa_boot_splash().
      */
     x64_arch_walk_and_draw_framebuffer(info);
 
@@ -2089,6 +2262,31 @@ void kernel_main(uint32_t magic, uintptr_t info) {
      * below. This is the "smallest diff" version of the
      * desktop_started_ok hand-off discussed in the Phase 3e brief.
      */
+    /*
+     * VGA-Compatibility path takes precedence: when the display stage
+     * committed to the 80x25 text console (gooberos.boot=vga,
+     * gooberos.display=vga-text, or the all-rungs-rejected fallback in
+     * revert_to_text_floor), run the full interactive text shell instead
+     * of the VESA desktop. The shell renders through textcon, which
+     * mirrors cell writes to either the inherited GOP framebuffer (UEFI)
+     * or 0xB8000 (legacy BIOS).
+     */
+    if (kernel_display_is_text_console()) {
+        print("\nGooberOSx86 x64 VGA-Compatibility text shell\n");
+        print("Type `help` for the command list.\n\n");
+        /* Sync the shell's cell-grid cursor to where the boot log left
+         * off so the prompt does not overwrite the results summary. */
+        x64_con_sync_shell_cursor();
+        shell_init();
+        while (1) {
+            usb_poll();
+            touchpad_poll();
+            shell_run();
+            __asm__ volatile ("hlt");
+        }
+        /* unreachable */
+    }
+
     if (g_desktop_init_ok) {
         print("Phase 3e online: VESA desktop event pump engaged.\n");
         vesa_desktop_main_loop();
@@ -2169,6 +2367,7 @@ static void x64_repl_pump_mouse(void) {
      * call is structurally safe even when usb_init() failed because
      * usb_poll() short-circuits on usb_initialized=0 / unhealthy host. */
     usb_poll();
+    touchpad_poll();
 
     input_event_t ev;
     while (input_poll_event(&ev)) {

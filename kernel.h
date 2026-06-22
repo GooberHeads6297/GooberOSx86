@@ -68,6 +68,8 @@ typedef struct {
     char display[24];   /* gooberos.display= (default "auto"; "safe" = adopt
                          * firmware FB only, arm probe + on-panel auto-revert) */
     char usb[16];       /* gooberos.usb=     ("" if unset) */
+    char i2c[16];       /* gooberos.i2c=     (""/"full", "off", "safe") */
+    char touchpad[16];  /* gooberos.touchpad=(""/"poll", "off", "irq") */
     char theme[16];     /* gooberos.theme=   ("" if unset) */
     char native[16];    /* gooberos.native=WxH (preferred native panel mode;
                          * "" if unset). Diagnostics warn when committed != native */
@@ -112,6 +114,15 @@ int kernel_display_target_fps(void);
  * SOMETHING on the panel, even when the VESA framebuffer is unusable.
  */
 int kernel_display_is_vga_graphics(void);
+
+/*
+ * x64 VGA compatibility: returns 1 when the display stage committed to
+ * the 80x25 text console (either explicitly via gooberos.boot=vga /
+ * gooberos.display=vga-text, or as the last-resort fallback when every
+ * graphical rung was rejected). The x64 kernel_main runs the full
+ * interactive text shell in that case instead of the VESA desktop.
+ */
+int kernel_display_is_text_console(void);
 
 const boot_config_t* boot_get_config(void);
 int boot_safe_mode(void);
