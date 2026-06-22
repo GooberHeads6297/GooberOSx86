@@ -8,11 +8,8 @@ Simple OS with a Kernel and a Shell (W.I.P)
 ________________________________
 
 ### Built-in Task Manager 
-(At the moment not neccesary becasue the only thing running is the Kernel itself.)
 
-
-<img width="957" height="489" alt="image" src="https://github.com/user-attachments/assets/03ff41db-e101-4bfc-a215-05318dfee3bf" />
-
+<img width="715" height="474" alt="image" src="https://github.com/user-attachments/assets/8917a1fe-123a-429d-b3de-ad280b7e5266" />
 
 ________________________________
 
@@ -41,8 +38,7 @@ ________________________________
 
 ### Vesa Driver Support With Text Editor
 
-<img width="937" height="564" alt="image" src="https://github.com/user-attachments/assets/19c269da-e20e-4d07-8493-f31ae9650b83" />
-
+<img width="676" height="411" alt="image" src="https://github.com/user-attachments/assets/d7aeb5e4-41ed-4210-9a49-d9f37341e183" />
 
 ________________________________
 
@@ -52,22 +48,29 @@ ________________________________
 
 ________________________________
 
-### Device and simple Storage ennumeration for hybrid ISO installation (Currently Works on x86 release)
+### Device and simple Storage ennumeration for hybrid ISO installation (Works on Both x86 and x64)
 
 <img width="1380" height="676" alt="image" src="https://github.com/user-attachments/assets/3205fecb-9024-42ab-9579-6459fcf1756f" />
 
+## UEFI supported (x64)
+
+<img width="1492" height="445" alt="image" src="https://github.com/user-attachments/assets/c8e9f50b-5aa7-42d4-a086-a5858521dbeb" />
+
 _________________________________
 
-### Light and Dark Mode for VESA supported Display Manager (Both x86 and x64)
+### Light and Dark Mode for VESA supported Display Manager (Both x86 MBR and x64 EFI)
 
 ## Light Mode
 
-<img width="1315" height="988" alt="image" src="https://github.com/user-attachments/assets/4ea13897-5f76-41c9-ac27-835f03d99591" />
+<img width="1519" height="1140" alt="image" src="https://github.com/user-attachments/assets/4ca8c8b5-b087-4f2b-a8e0-f0360f0438ff" />
 
 ## Dark Mode
 
-<img width="1315" height="988" alt="image" src="https://github.com/user-attachments/assets/711bc0a6-9a9b-44c6-8af6-5196121cc237" />
+<img width="1519" height="1140" alt="image" src="https://github.com/user-attachments/assets/717ff848-d25b-4cf9-81df-8d27b0ce17b7" />
 
+## Original Mode
+
+<img width="1519" height="1140" alt="image" src="https://github.com/user-attachments/assets/a4346273-481f-4b3d-9410-b6f40f0d453e" />
 
 _________________________________
 
@@ -75,27 +78,24 @@ _________________________________
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
 Release x86: 0.11.7 (sha256 only shows the one for the latest release)
-7f5abfdb83297968f2d71c587d15ceed8cf40d02218ff8c40f638e1a792d180a
+sha256:2310513132d9e153ef87760cf2c4fab4c9a33f37f74f8c09dae0930584daffd4
 
 Release x86_x64: 0.11.7 (sha256 only shows the one for the latest release)
-7f5abfdb83297968f2d71c587d15ceed8cf40d02218ff8c40f638e1a792d180a
+sha256:179402601724598310ee12bf65efa831cf24b83ace3a8f264d796ce3797d016d
+
+__________________________________
  
 
-  Install with GRUB on a storage device:
+###  How to install:
 
-  1. Build the project: `./build.sh`
-  2. Inspect host devices: `./build.sh list-devices`
-  3. Mount the target partition or filesystem.
-  4. Install kernel + GRUB:
-     `./build.sh install --device /dev/sdX --mount /mnt/goober`
-  5. Boot the selected disk in BIOS/Legacy mode.
+## x86 (MBR/CSM Legacy)
+1. Flash with Rufus or Balena Etcher using MBR
+2. Ensure Secure Boot is disabled
+3. Boot off of flashed storage device
 
-  In-kernel storage visibility:
-
-  1. Run `devices` to list detected storage hardware.
-  2. Run `install list` to show storage targets the kernel can identify.
-  3. Run `install info <id>` for details about one target.
-  4. Run `install write <id> YES` to raw-write the hybrid boot image to an ATA HDD/SSD target.
+## x64 (EFI)
+1. Flash using EFI
+2. Ensure boot config in BIOS is set to UEFI or "EFI" boot
 
   Current direct-install scope:
 
