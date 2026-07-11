@@ -1,6 +1,7 @@
 #ifndef KERNEL_H
 #define KERNEL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "include/multiboot.h"
@@ -96,7 +97,39 @@ typedef struct {
      * before hotplug bookkeeping is initialized.
      */
     int  usb_hotplug;
+    char root[24];      /* gooberos.root= ("auto", "live", or "dev:part") */
+    /*
+     * gooberos.storage= ("ata"|"sdhci"|"all"|"off"; default "")
+     *
+     * Controls which storage backends run MMIO/bring-up probes:
+     *   ata   -> ATA PIO only; PCI controllers are inventoried, not probed
+     *   sdhci -> ATA + SDHCI/eMMC probe
+     *   all   -> ATA + SDHCI + USB-MSC scaffold probes
+     *   off   -> ATA only, skip PCI storage inventory
+     *   ""    -> live root: ata; persistent root (auto/dev:part): sdhci
+     */
+    char storage[16];
+    /*
+     * gooberos.vbe= ("bios"|"loader"|"off"; default depends on display=)
+     *   bios   -> INT 10h VBE modeset via real-mode trampoline before adopting LFB
+     *   loader -> use GRUB/multiboot framebuffer only (retry BIOS on confirm fail)
+     *   off    -> never call the BIOS VBE trampoline
+     */
+    char vbe[16];
 } boot_config_t;
+
+/*
+ * Smart boot profile: filled when gooberos.boot=smart resolves hardware
+ * signals (loader FB, Bay Trail, Bochs, SDHCI) into concrete display/storage
+ * settings before framebuffer_bringup(). Explicit cmdline fields win.
+ */
+typedef struct {
+    int  active;            /* 1 if this boot used Smart resolution */
+    char display[24];       /* resolved gooberos.display= value */
+    char storage[16];       /* resolved gooberos.storage= value */
+    char reason[96];        /* human-readable decision for diagnostics */
+    boot_display_confirm_t confirm;
+} boot_smart_profile_t;
 
 /*
  * Phase 4: the user enhancement-2 display-polish layer adds a real back-
@@ -126,5 +159,13 @@ int kernel_display_is_text_console(void);
 
 const boot_config_t* boot_get_config(void);
 int boot_safe_mode(void);
+const boot_smart_profile_t* boot_smart_profile(void);
+
+/*
+ * FAT partition template loaded by GRUB as a multiboot2 module
+ * (module2 /boot/install/FAT_PART.IMG). Used by install fat32 on USB live
+ * boots where no ATAPI optical drive is present. Returns NULL if absent.
+ */
+const uint8_t* boot_fat_template_module(size_t* size_out);
 
 #endif

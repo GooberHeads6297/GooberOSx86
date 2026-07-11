@@ -238,4 +238,17 @@ void boot_print_hardware_summary(void) {
         bs_print_ids(usbc[i].vendor_id, usbc[i].device_id);
         bs_out("\n");
     }
+
+    sdhci_pci_controller_t sdhc[8];
+    int ns = pci_find_sdhci_controllers(sdhc, 8);
+    bs_out("SDHCI/eMMC controllers: ");
+    bs_out_dec(ns);
+    bs_out("\n");
+    for (int i = 0; i < ns && i < 8; i++) {
+        bs_out("  ");
+        bs_print_bdf(sdhc[i].bus, sdhc[i].slot, sdhc[i].func);
+        bs_out(" sdhci ");
+        bs_print_ids(sdhc[i].vendor_id, sdhc[i].device_id);
+        bs_out("\n");
+    }
 }

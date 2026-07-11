@@ -153,8 +153,11 @@ void x64_arch_dump_multiboot(uint32_t magic, uintptr_t info) {
 
 /* ========================================================================
  * Multiboot2 framebuffer tag walk + serial diagnostics.
- * The old RGB proof-of-life pattern is intentionally no longer drawn on the
- * default boot path; kernel.c/vesa.c owns the dark logo + progress splash.
+ *
+ * Draw a tiny proof-of-life immediately after the trampoline hands control to
+ * the kernel. On some laptops the firmware logo remains on screen until the
+ * first GOP/LFB write; waiting for later driver stages makes a slow or wedged
+ * hardware probe look like a display failure.
  * ======================================================================== */
 
 struct goober_fb {
@@ -450,6 +453,7 @@ static void fb_render_proof_of_life(const struct goober_fb* fb) {
     const uint32_t WHITE = 0x00FFFFFFu;
     const uint32_t BLACK = 0x00000000u;
 
+    fb_draw_band(fb, 0, 0, fb->width, 64, BLACK);
     fb_print_at(0, 0, "GooberOSx86 x64  Phase 3a.1", WHITE, BLACK);
 
     char line1[96];
@@ -479,7 +483,7 @@ void x64_arch_walk_and_draw_framebuffer(uintptr_t info) {
      * framebuffer tag, so this is safe). */
     mb2_walk_framebuffer(info, &g_fb);
     print_framebuffer_tag(&g_fb);
-    x64_out("[fb] early RGB proof-of-life skipped; using boot logo splash.\n");
+    fb_render_proof_of_life(&g_fb);
 }
 
 /* ---- Legacy 0xB8000 line (legacy-BIOS only; harmless on UEFI) ----------- */

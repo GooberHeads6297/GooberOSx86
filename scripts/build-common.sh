@@ -128,6 +128,9 @@ create_iso_hybrid() {
   mkdir -p "${ISO_DIR}/boot/grub"
   cp "${BUILD_DIR}/kernel.bin" "${ISO_DIR}/boot/"
   cp grub/grub.cfg "${ISO_DIR}/boot/grub/"
+  if [ "${ISO_DIR}" = "iso64" ]; then
+    patch_grub_x64_normal_boot "${ISO_DIR}/boot/grub/grub.cfg"
+  fi
   prepare_install_root
 
   grub-mkrescue \
@@ -136,6 +139,173 @@ create_iso_hybrid() {
     --modules="part_msdos iso9660 multiboot multiboot2 all_video gfxterm font"
 
   echo "[+] Hybrid BIOS+UEFI ISO created: ${ISO_OUTPUT}"
+}
+
+# BIOS-safe grub.cfg for FAT32-installed media (minimal core.img, no ISO fonts).
+write_installed_grub_cfg() {
+  local dest="$1"
+  cp grub/grub.installed.cfg "${dest}"
+  echo "[+] Wrote installed grub.cfg -> ${dest}"
+}
+
+# x64: normalize any leftover storage=sdhci cmdline to storage=ata.
+patch_grub_x64_normal_boot() {
+  local cfg="$1"
+  if [ ! -f "${cfg}" ]; then
+    echo "[!] grub.cfg not found at ${cfg}"
+    return 1
+  fi
+  sed -i 's/gooberos\.storage=sdhci/gooberos.storage=ata/g' "${cfg}"
+  echo "[+] x64 storage=ata normalize (${cfg})"
+}
+
+# Stage install payload files on the ISO (FAT template read at install time).
+stage_iso_install_files() {
+  local payload_dir="${BUILD_DIR}/install"
+  mkdir -p "${ISO_DIR}/boot/install"
+  rm -f "${ISO_DIR}/boot/install/"*
+  if [ -f "${payload_dir}/fat-partition.img" ]; then
+    cp "${payload_dir}/fat-partition.img" "${ISO_DIR}/boot/install/FAT_PART.IMG"
+    echo "[+] Staged FAT template on ISO -> ${ISO_DIR}/boot/install/FAT_PART.IMG"
+  fi
+}
+
+# Stage files embedded into the kernel for in-OS `install fat32` deployment.
+# Builds BIOS (boot.img + core.img) and UEFI (BOOTX64.EFI) GRUB blobs.
+# BOOTX64.EFI is copied into the FAT template at EFI/BOOT/ for eMMC/UEFI.
+prepare_install_payload() {
+  local payload_dir="${BUILD_DIR}/install"
+  local memdisk_dir="${payload_dir}/memdisk"
+  mkdir -p "${payload_dir}"
+  cp "${BUILD_DIR}/kernel.bin" "${payload_dir}/kernel_payload.bin"
+  write_installed_grub_cfg "${payload_dir}/grub.cfg"
+
+  mkdir -p "${memdisk_dir}/boot/grub"
+  cp grub/grub.installed.cfg "${memdisk_dir}/boot/grub/grub.cfg"
+  tar -C "${memdisk_dir}" -cf "${payload_dir}/memdisk.tar" boot
+
+  if [ -r /usr/lib/grub/i386-pc/boot.img ] && command -v grub-mkimage >/dev/null 2>&1; then
+    cp /usr/lib/grub/i386-pc/boot.img "${payload_dir}/boot.img"
+    grub-mkimage -O i386-pc -o "${payload_dir}/core.img" \
+      -m "${payload_dir}/memdisk.tar" -p '(memdisk)/boot/grub' \
+      -c grub/grub.early.cfg \
+      biosdisk part_msdos part_gpt fat search search_label configfile normal \
+      multiboot multiboot2 tar memdisk minicmd cat echo linux halt reboot
+    echo "[+] Prepared GRUB BIOS payload (boot.img + core.img + memdisk)"
+  else
+    echo "[!] grub-mkimage or i386-pc boot.img not found; install fat32 may not be BIOS-bootable"
+    : > "${payload_dir}/boot.img"
+    : > "${payload_dir}/core.img"
+  fi
+
+  # UEFI removable-media paths on the ESP (x64 and IA32 for Bay Trail).
+  local efi_files=()
+  if [ -d /usr/lib/grub/x86_64-efi ] && command -v grub-mkimage >/dev/null 2>&1; then
+    grub-mkimage -O x86_64-efi -o "${payload_dir}/BOOTX64.EFI" \
+      -p /boot/grub \
+      -c grub/grub.efi.early.cfg \
+      part_msdos part_gpt fat search search_label configfile normal \
+      multiboot multiboot2 echo linux halt reboot all_video gfxterm
+    efi_files+=("${payload_dir}/BOOTX64.EFI")
+    echo "[+] Prepared GRUB UEFI payload (BOOTX64.EFI)"
+  else
+    echo "[!] x86_64-efi GRUB modules missing; eMMC install will not be UEFI-bootable"
+    echo "    (install grub-efi-amd64-bin / run ./InstallDep.sh x64)"
+    rm -f "${payload_dir}/BOOTX64.EFI"
+  fi
+  if [ -d /usr/lib/grub/i386-efi ] && command -v grub-mkimage >/dev/null 2>&1; then
+    grub-mkimage -O i386-efi -o "${payload_dir}/BOOTIA32.EFI" \
+      -p /boot/grub \
+      -c grub/grub.efi.early.cfg \
+      part_msdos part_gpt fat search search_label configfile normal \
+      multiboot multiboot2 echo linux halt reboot all_video gfxterm
+    efi_files+=("${payload_dir}/BOOTIA32.EFI")
+    echo "[+] Prepared GRUB IA32 UEFI payload (BOOTIA32.EFI) for Bay Trail firmware"
+  else
+    echo "[!] i386-efi GRUB modules missing; 32-bit UEFI eMMC boot may fail"
+    echo "    (install grub-efi-ia32-bin if Lenovo Setup is 32-bit UEFI)"
+    rm -f "${payload_dir}/BOOTIA32.EFI"
+  fi
+
+  bash "${REPO_ROOT}/scripts/prepare-fat-template.sh" \
+    "${payload_dir}" "${BUILD_DIR}/kernel.bin" "${payload_dir}/grub.cfg" \
+    "${efi_files[@]+"${efi_files[@]}"}"
+
+  echo "[+] Install payload staged at ${payload_dir}"
+}
+
+# Link GRUB install blobs. The FAT template stays on the live ISO
+# (boot/install/FAT_PART.IMG) — embedding it made kernel.bin ~37 MiB and
+# GRUB on slow eMMC appeared to hang on a bare cursor after menu select.
+link_install_payload_objects() {
+  local payload_dir="${BUILD_DIR}/install"
+  ${LD} -m elf_i386 -r -b binary "${payload_dir}/kernel_payload.bin" \
+    -o "${BUILD_DIR}/install_kernel_payload.o"
+  ${LD} -m elf_i386 -r -b binary "${payload_dir}/grub.cfg" \
+    -o "${BUILD_DIR}/install_grub_cfg.o"
+  ${LD} -m elf_i386 -r -b binary "${payload_dir}/boot.img" \
+    -o "${BUILD_DIR}/install_boot_img.o"
+  ${LD} -m elf_i386 -r -b binary "${payload_dir}/core.img" \
+    -o "${BUILD_DIR}/install_core_img.o"
+  echo "[+] Linked install payload objects (i386; FAT template is ISO-only)"
+}
+
+link_install_payload_objects_x64() {
+  local payload_dir="${BUILD_DIR}/install"
+  ${LD} -m elf_x86_64 -r -b binary "${payload_dir}/kernel_payload.bin" \
+    -o "${BUILD_DIR}/install_kernel_payload.o"
+  ${LD} -m elf_x86_64 -r -b binary "${payload_dir}/grub.cfg" \
+    -o "${BUILD_DIR}/install_grub_cfg.o"
+  ${LD} -m elf_x86_64 -r -b binary "${payload_dir}/boot.img" \
+    -o "${BUILD_DIR}/install_boot_img.o"
+  ${LD} -m elf_x86_64 -r -b binary "${payload_dir}/core.img" \
+    -o "${BUILD_DIR}/install_core_img.o"
+  echo "[+] Linked install payload objects (x86_64; FAT template is ISO-only)"
+}
+
+# Rebuild the ESP FAT image with the *final* kernel.bin (after payload link).
+refresh_fat_template_with_final_kernel() {
+  local payload_dir="${BUILD_DIR}/install"
+  local efi_files=()
+  if [ -s "${payload_dir}/BOOTX64.EFI" ]; then
+    efi_files+=("${payload_dir}/BOOTX64.EFI")
+  fi
+  if [ -s "${payload_dir}/BOOTIA32.EFI" ]; then
+    efi_files+=("${payload_dir}/BOOTIA32.EFI")
+  fi
+  write_installed_grub_cfg "${payload_dir}/grub.cfg"
+  bash "${REPO_ROOT}/scripts/prepare-fat-template.sh" \
+    "${payload_dir}" "${BUILD_DIR}/kernel.bin" "${payload_dir}/grub.cfg" \
+    "${efi_files[@]+"${efi_files[@]}"}"
+  echo "[+] Refreshed FAT template with final kernel.bin"
+}
+
+# Patch multiboot lines in an installed grub.cfg to include gooberos.root=auto.
+patch_installed_grub_cfg() {
+  local cfg="$1"
+  local tmp="${cfg}.tmp"
+  if [ ! -f "${cfg}" ]; then
+    echo "[!] grub.cfg not found at ${cfg}"
+    return 1
+  fi
+  awk '
+    /multiboot2 / {
+      if ($0 !~ /gooberos\.root=/) {
+        sub(/[ \t]*$/, "", $0)
+        print $0 " gooberos.root=auto"
+        next
+      }
+    }
+    /multiboot / && $0 !~ /multiboot2/ {
+      if ($0 !~ /gooberos\.root=/) {
+        sub(/[ \t]*$/, "", $0)
+        print $0 " gooberos.root=auto"
+        next
+      }
+    }
+    { print }
+  ' "${cfg}" > "${tmp}" && mv "${tmp}" "${cfg}"
+  echo "[+] Patched ${cfg} with gooberos.root=auto"
 }
 
 # Install the freshly built kernel + grub config onto a mounted target device.
@@ -178,18 +348,39 @@ install_to_device_with_target() {
     return 1
   fi
 
+  if command -v findmnt >/dev/null 2>&1; then
+    local fstype
+    fstype="$(findmnt -n -o FSTYPE --target "${mountpoint}" 2>/dev/null || true)"
+    if [ -n "${fstype}" ] && [ "${fstype}" != "vfat" ] && [ "${fstype}" != "fat" ] && [ "${fstype}" != "msdos" ]; then
+      echo "[!] Warning: mount ${mountpoint} fstype=${fstype} (expected FAT32/vfat)"
+    fi
+  fi
+
   if ! command -v grub-install >/dev/null 2>&1; then
     echo "grub-install is not available on this host."
-    echo "Use the in-kernel 'install write <target-id> YES' flow for VirtualBox HDD tests."
+    echo "Use ./scripts/make-installed-disk.sh or in-OS 'install fat32 <id> YES'."
     return 1
   fi
 
   mkdir -p "${mountpoint}/boot/grub"
+  mkdir -p "${mountpoint}/Desktop" "${mountpoint}/home" "${mountpoint}/usr/bin" "${mountpoint}/tmp"
+
   cp "${BUILD_DIR}/kernel.bin" "${mountpoint}/boot/kernel.bin"
-  cp grub/grub.cfg "${mountpoint}/boot/grub/grub.cfg"
+  write_installed_grub_cfg "${mountpoint}/boot/grub/grub.cfg"
+
+  if command -v fatlabel >/dev/null 2>&1; then
+    fatlabel "${mountpoint}" GOOBEROS 2>/dev/null || \
+      echo "[!] fatlabel failed (non-fatal; set label manually if needed)"
+  elif command -v mlabel >/dev/null 2>&1; then
+    mlabel -i "${device}" ::GOOBEROS 2>/dev/null || \
+      echo "[!] mlabel failed (non-fatal)"
+  else
+    echo "[!] fatlabel/mlabel not found; volume label GOOBEROS not set"
+  fi
 
   grub-install --target="${grub_target}" --boot-directory="${mountpoint}/boot" "${device}"
 
   echo "[+] Installed GooberOS boot files to ${mountpoint}/boot"
+  echo "[+] Created /Desktop /home /usr/bin /tmp on FAT32 root"
   echo "[+] GRUB (${grub_target}) installed to ${device}"
 }

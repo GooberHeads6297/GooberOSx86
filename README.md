@@ -1,15 +1,16 @@
-# GooberOSx86 | GooberOSx64
+# GooberOSx86
 Simple OS with a Kernel and a Shell (W.I.P)
 
-<img width="181" height="37" alt="image" src="https://github.com/user-attachments/assets/bb6f39ea-2ec5-4dac-89eb-c1a8875393e1" />
-
+<img width="397" height="138" alt="imageStart" src="https://github.com/user-attachments/assets/7598db4d-5243-41c1-84ba-0f8388f031cc" />
 
 
 ________________________________
 
 ### Built-in Task Manager 
+(At the moment not neccesary becasue the only thing runnnig is the Kernel itself.)
 
-<img width="715" height="474" alt="image" src="https://github.com/user-attachments/assets/8917a1fe-123a-429d-b3de-ad280b7e5266" />
+
+<img width="3840" height="2160" alt="TaskManagerUpdate" src="https://github.com/user-attachments/assets/7856bcc9-8228-492b-a3ce-ba765fc7cafb" />
 
 ________________________________
 
@@ -18,27 +19,11 @@ ________________________________
 
 <img width="693" height="270" alt="ImageMemfilesystem" src="https://github.com/user-attachments/assets/4e2f3cc1-fcf3-4ec6-a14c-ce4ea1cce921" />
 
-### VGA GUI Filesystem Support 
-
-<img width="670" height="609" alt="image" src="https://github.com/user-attachments/assets/e21c76f2-51bb-4e28-b8e0-826d1e304bb7" />
-
-
-### Vesa Driver Support with File Explorer
-
-<img width="718" height="532" alt="image" src="https://github.com/user-attachments/assets/8a1e0d9c-0e7a-417a-a9b8-19e3e2b26072" />
-
-
 ________________________________
 
-### Integrated Text Editor (Interactive with Memory-Based Filesystem)
+### Integrated Text Editor (Currenntly In Development)
 
 <img width="835" height="354" alt="ImageEditor" src="https://github.com/user-attachments/assets/e8d2dc58-3b94-4217-b09f-59b8ca868698" />
-
-### VGA GUI Support For Text Editor
-
-### Vesa Driver Support With Text Editor
-
-<img width="676" height="411" alt="image" src="https://github.com/user-attachments/assets/d7aeb5e4-41ed-4210-9a49-d9f37341e183" />
 
 ________________________________
 
@@ -48,60 +33,52 @@ ________________________________
 
 ________________________________
 
-### Device and simple Storage ennumeration for hybrid ISO installation (Works on Both x86 and x64)
+### Text Editor Integration with GUI
 
-<img width="1380" height="676" alt="image" src="https://github.com/user-attachments/assets/3205fecb-9024-42ab-9579-6459fcf1756f" />
+<img width="3840" height="2160" alt="TextEdit" src="https://github.com/user-attachments/assets/67997362-36f6-4fe4-ab9e-f5244c3c8498" />
 
-## UEFI supported (x64)
-
-<img width="1492" height="445" alt="image" src="https://github.com/user-attachments/assets/c8e9f50b-5aa7-42d4-a086-a5858521dbeb" />
-
-_________________________________
-
-### Light and Dark Mode for VESA supported Display Manager (Both x86 MBR and x64 EFI)
-
-## Light Mode
-
-<img width="1519" height="1140" alt="image" src="https://github.com/user-attachments/assets/4ca8c8b5-b087-4f2b-a8e0-f0360f0438ff" />
-
-## Dark Mode
-
-<img width="1519" height="1140" alt="image" src="https://github.com/user-attachments/assets/717ff848-d25b-4cf9-81df-8d27b0ce17b7" />
-
-## Original Mode
-
-<img width="1519" height="1140" alt="image" src="https://github.com/user-attachments/assets/a4346273-481f-4b3d-9410-b6f40f0d453e" />
-
-_________________________________
+________________________________
 
 
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
-Release x86: 0.11.7 (sha256 only shows the one for the latest release)
-sha256:2310513132d9e153ef87760cf2c4fab4c9a33f37f74f8c09dae0930584daffd4
+Release: 0.11.5 (sha256 only shows the one for the latest release)
+802df6ae35109f057163d37c072072695bbc9177e7f033b48b491a6bce6e5180
 
-Release x86_x64: 0.11.7 (sha256 only shows the one for the latest release)
-sha256:179402601724598310ee12bf65efa831cf24b83ace3a8f264d796ce3797d016d
+  Install with GRUB on a storage device:
 
-__________________________________
- 
+  Portable install from live ISO (recommended — like a Linux live USB):
 
-###  How to install:
+  1. Build: `./build.sh x86` or `./build.sh x64`
+  2. Boot the ISO from USB or attach as IDE optical drive.
+  3. Attach an empty virtual/real HDD.
+  4. In the shell:
+       `install list`
+       `install fat32 <target-id> YES MBR`   (BIOS/legacy)
+       `install fat32 <target-id> YES GPT`   (UEFI)
+  5. Reboot from the HDD (remove ISO/USB or change boot order).
 
-## x86 (MBR/CSM Legacy)
-1. Flash with Rufus or Balena Etcher using MBR
-2. Ensure Secure Boot is disabled
-3. Boot off of flashed storage device
+  No host partitioning tools are required — `install fat32` creates the
+  partition table, boot track, and filesystem on the target disk.
 
-## x64 (EFI)
-1. Flash using EFI
-2. Ensure boot config in BIOS is set to UEFI or "EFI" boot
+  Developer / host install (optional):
+  1. `./build.sh x86`
+  2. `./scripts/make-installed-disk.sh build/GooberOS-installed.img`
+  3. Attach as IDE HDD and boot (skips the live ISO installer).
+
+  Or install to a mounted FAT32 partition on the build host:
+
+  1. `./build.sh list-devices`
+  2. Mount the target partition (FAT32).
+  3. `./build.sh install --device /dev/sdX --mount /mnt/goober`
+
+  Other commands:
+
+  1. Run `devices` to list detected storage hardware.
+  2. Run `install info <id>` for details about one target.
 
   Current direct-install scope:
 
-  1. Intended first target: BIOS/legacy VirtualBox HDD installs.
-  2. The direct in-kernel write path currently targets ATA disks.
-  3. NVMe/AHCI installation work still needs dedicated write support. (eMMC support now works 🥳)
+  1. ATA, AHCI/SATA, and eMMC (SDHCI) installs.
+  2. NVMe / USB MSC install paths still need dedicated write support.
 
-
-      

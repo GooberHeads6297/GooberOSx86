@@ -8,6 +8,10 @@
 #include "drivers/video/display.h"
 #include "drivers/video/native_fb.h"
 #include "drivers/video/intel_gfx.h"
+#include "drivers/video/edid.h"
+#include "drivers/video/connector.h"
+#include "drivers/video/fb_cache.h"
+#include "drivers/diagnostics/driver_log.h"
 #include "drivers/video/textcon.h"
 #include "drivers/video/font.h"
 #include "drivers/pci/pci.h"
@@ -45,8 +49,10 @@
 #include "drivers/usb/usb.h"
 #include "drivers/acpi/acpi.h"
 #include "drivers/input/touchpad.h"
+#include "drivers/video/basic_display.h"
 #ifdef __i386__
 #include "drivers/storage/storage.h"
+#include "drivers/video/bios_vbe.h"
 #include "taskmgr/process.h"
 #endif
 /* Phase 3e brings the heap online on x64 too -- the new Filesystem and
@@ -58,7 +64,7 @@
 #define IRQ0 32
 #define IRQ1 33
 
-#define KERNEL_HEAP_SIZE (64 * 1024)  // 64KB heap, adjust as needed
+#define KERNEL_HEAP_SIZE (512 * 1024)  // 512KB heap for FAT32 + desktop
 #define VESA_STATIC_BACKBUFFER_BYTES (8 * 1024 * 1024)
 
 #ifdef __i386__
@@ -97,7 +103,7 @@ static uintptr_t last_fb_addr = 0;
  * re-walking the cmdline. gooberos.display= values: "auto" (try every driver
  * in priority order), "vesa" (inherited GRUB LFB only), "bochs" (Bochs/QEMU
  * dispi only), or "off" (force VGA text). gooberos.boot= values: "vesa-auto",
- * "vga", or "default".
+ * "vga", "smart" (hardware-aware profile), or "default".
  */
 static boot_config_t g_boot_config = {
     .cmdline = "",
@@ -112,10 +118,21 @@ static boot_config_t g_boot_config = {
     .display_confirm = BOOT_DISPLAY_CONFIRM_DEFAULT,
     .display_fps = 0,
     .usb_hotplug = 1,  /* default: hot-plug enabled when USB stack is up */
+    .root = "live",
+    .storage = "",
 };
+
+/* Explicit cmdline presence — Smart must not override user overrides. */
+static int g_cmdline_has_display;
+static int g_cmdline_has_storage;
+static int g_cmdline_has_confirm;
+static int g_cmdline_has_vbe;
+
+static boot_smart_profile_t g_smart_profile;
 
 const boot_config_t* boot_get_config(void) { return &g_boot_config; }
 int boot_safe_mode(void) { return g_boot_config.safe; }
+const boot_smart_profile_t* boot_smart_profile(void) { return &g_smart_profile; }
 
 int kernel_display_target_fps(void) {
     int fps = g_boot_config.display_fps;
@@ -261,6 +278,18 @@ static void boot_config_parse(const char* cmdline) {
     g_boot_config.display_fps = 0;
     g_boot_config.usb_hotplug = 1;  /* default: hot-plug enabled */
     g_boot_config.cmdline[0] = '\0';
+    kstr_copy(g_boot_config.root, "live", sizeof(g_boot_config.root));
+    g_boot_config.storage[0] = '\0';
+    g_boot_config.vbe[0] = '\0';
+    g_cmdline_has_display = 0;
+    g_cmdline_has_storage = 0;
+    g_cmdline_has_confirm = 0;
+    g_cmdline_has_vbe = 0;
+    g_smart_profile.active = 0;
+    g_smart_profile.display[0] = '\0';
+    g_smart_profile.storage[0] = '\0';
+    g_smart_profile.reason[0] = '\0';
+    g_smart_profile.confirm = BOOT_DISPLAY_CONFIRM_DEFAULT;
 
     if (!cmdline) return;
     kstr_copy(g_boot_config.cmdline, cmdline, sizeof(g_boot_config.cmdline));
@@ -279,6 +308,7 @@ static void boot_config_parse(const char* cmdline) {
              */
             char v[16];
             kcopy_token_value(p + 25, v, sizeof(v));
+            g_cmdline_has_confirm = 1;
             if (kstr_eq(v, "skip"))
                 g_boot_config.display_confirm = BOOT_DISPLAY_CONFIRM_SKIP;
             else if (kstr_eq(v, "force"))
@@ -302,6 +332,7 @@ static void boot_config_parse(const char* cmdline) {
             g_boot_config.display_fps = fps;
         } else if (kstr_starts(p, "gooberos.display=")) {
             kcopy_token_value(p + 17, g_boot_config.display, sizeof(g_boot_config.display));
+            g_cmdline_has_display = 1;
         } else if (kstr_starts(p, "gooberos.usb.hotplug=")) {
             /*
              * USB-mouse + keyboard hot-plug toggle. Default = on; set to
@@ -330,8 +361,23 @@ static void boot_config_parse(const char* cmdline) {
             kcopy_token_value(p + 14, v, sizeof(v));
             g_boot_config.safe = (kstr_eq(v, "1") || kstr_eq(v, "on") ||
                                   kstr_eq(v, "true") || kstr_eq(v, "yes")) ? 1 : 0;
+        } else if (kstr_starts(p, "gooberos.root=")) {
+            kcopy_token_value(p + 14, g_boot_config.root, sizeof(g_boot_config.root));
+        } else if (kstr_starts(p, "gooberos.storage=")) {
+            kcopy_token_value(p + 17, g_boot_config.storage, sizeof(g_boot_config.storage));
+            g_cmdline_has_storage = 1;
+        } else if (kstr_starts(p, "gooberos.vbe=")) {
+            kcopy_token_value(p + 13, g_boot_config.vbe, sizeof(g_boot_config.vbe));
+            g_cmdline_has_vbe = 1;
         }
         while (*p && *p != ' ' && *p != '\t') p++;
+    }
+
+    if (!g_boot_config.vbe[0]) {
+        if (kstr_eq(g_boot_config.display, "basic"))
+            kstr_copy(g_boot_config.vbe, "off", sizeof(g_boot_config.vbe));
+        else
+            kstr_copy(g_boot_config.vbe, "loader", sizeof(g_boot_config.vbe));
     }
 }
 
@@ -346,15 +392,485 @@ static uint32_t saved_fb_w = 0, saved_fb_h = 0, saved_fb_pitch = 0;
 static uint8_t  saved_fb_bpp = 0, saved_fb_type = 0xFF;
 static int      saved_have_loader_fb = 0;
 
+static void record_loader_framebuffer(uint64_t addr, uint32_t width, uint32_t height,
+                                      uint32_t pitch, uint8_t bpp, uint8_t type);
+
+static int loader_fb_bpp_bytes(uint8_t bpp, uint32_t* bpx_out) {
+    if (bpp == 32) { if (bpx_out) *bpx_out = 4; return 1; }
+    if (bpp == 24) { if (bpx_out) *bpx_out = 3; return 1; }
+    if (bpp == 16 || bpp == 15) { if (bpx_out) *bpx_out = 2; return 1; }
+    return 0;
+}
+
+void kernel_loader_fb_get(kernel_loader_fb_t* out) {
+    if (!out) return;
+    out->have = saved_have_loader_fb;
+    out->addr = saved_fb_addr;
+    out->w = saved_fb_w;
+    out->h = saved_fb_h;
+    out->pitch = saved_fb_pitch;
+    out->bpp = saved_fb_bpp;
+    out->type = saved_fb_type;
+}
+
+void kernel_loader_fb_set(const kernel_loader_fb_t* fb) {
+    if (!fb) return;
+    saved_have_loader_fb = fb->have;
+    saved_fb_addr = fb->addr;
+    saved_fb_w = fb->w;
+    saved_fb_h = fb->h;
+    saved_fb_pitch = fb->pitch;
+    saved_fb_bpp = fb->bpp;
+    saved_fb_type = fb->type;
+    if (fb->have)
+        record_loader_framebuffer(fb->addr, fb->w, fb->h, fb->pitch, fb->bpp, fb->type);
+}
+
+int kernel_loader_fb_usable(void) {
+    kernel_loader_fb_t fb;
+    uint32_t bpx;
+    kernel_loader_fb_get(&fb);
+    if (!fb.have || fb.type != 1 || fb.addr == 0) return 0;
+    if (sizeof(uintptr_t) < sizeof(uint64_t) && ((fb.addr >> 32) != 0)) return 0;
+    if (!loader_fb_bpp_bytes(fb.bpp, &bpx)) return 0;
+    if (fb.w < 320 || fb.h < 200) return 0;
+    if (fb.pitch < fb.w * bpx) return 0;
+    return 1;
+}
+
+static void serial_out(const char* s);
+static void serial_out_hex(uint32_t v);
+static void serial_out_hex64(uint64_t v);
+
+/* Passive PCI probes for Smart boot (config space only; no BAR sizing). */
+static int boot_pci_has_bochs(void) {
+    pci_display_device_t devs[8];
+    int n = pci_find_display_controllers(devs, 8);
+    int i;
+    for (i = 0; i < n && i < 8; i++) {
+        /* QEMU stdvga / Bochs VBE: vendor 0x1234 */
+        if (devs[i].vendor_id == 0x1234) return 1;
+    }
+    return 0;
+}
+
+static int boot_pci_has_sdhci(void) {
+    uint16_t bus;
+    uint8_t slot, func;
+    for (bus = 0; bus < 256; bus++) {
+        for (slot = 0; slot < 32; slot++) {
+            for (func = 0; func < 8; func++) {
+                uint32_t vendor = pci_read_config_dword((uint8_t)bus, slot, func, 0) & 0xFFFF;
+                uint32_t class_code;
+                uint8_t base_class, sub_class;
+                if (vendor == 0xFFFF) continue;
+                class_code = pci_read_config_dword((uint8_t)bus, slot, func, 0x08);
+                base_class = (uint8_t)((class_code >> 24) & 0xFF);
+                sub_class = (uint8_t)((class_code >> 16) & 0xFF);
+                /* SD Host Controller class 0x08 / subclass 0x05 */
+                if (base_class == 0x08 && sub_class == 0x05) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/*
+ * Smart boot: pick display/storage from early hardware signals. Only runs when
+ * gooberos.boot=smart. Explicit gooberos.display=/storage=/confirm=/vbe= win.
+ */
+static void boot_smart_resolve(boot_config_t* cfg) {
+    int lfb;
+    int bay;
+    int bochs;
+    int sdhci;
+    const char* want_display = "auto";
+    const char* want_storage = "ata";
+    boot_display_confirm_t want_confirm = BOOT_DISPLAY_CONFIRM_DEFAULT;
+    const char* want_vbe = NULL;
+
+    if (!cfg || !kstr_eq(cfg->boot, "smart")) return;
+
+    lfb = kernel_loader_fb_usable();
+    bay = intel_gfx_is_bay_trail_class();
+    bochs = boot_pci_has_bochs();
+    sdhci = boot_pci_has_sdhci();
+
+    if (bay && lfb) {
+        /* Visibility-first on Bay Trail: inherit firmware FB, skip forced confirm
+         * (confirm splash often paints a non-scanout buffer -> black panel). */
+        want_display = "basic";
+        want_confirm = BOOT_DISPLAY_CONFIRM_DEFAULT;
+        want_vbe = "off";
+        want_storage = sdhci ? "sdhci" : "ata";
+        kstr_copy(g_smart_profile.reason,
+                  "Bay Trail + firmware LFB -> basic inherit (no confirm force)",
+                  sizeof(g_smart_profile.reason));
+    } else if (bay && !lfb) {
+        want_display = "vga-text";
+        want_storage = "ata";
+        kstr_copy(g_smart_profile.reason,
+                  "Bay Trail without LFB -> VGA text floor, storage=ata",
+                  sizeof(g_smart_profile.reason));
+    } else if (bochs) {
+        want_display = "bochs";
+        want_confirm = BOOT_DISPLAY_CONFIRM_SKIP;
+        want_storage = "ata";
+        kstr_copy(g_smart_profile.reason,
+                  "Bochs/QEMU VGA -> display=bochs, confirm=skip",
+                  sizeof(g_smart_profile.reason));
+    } else if (lfb) {
+        want_display = "auto";
+        want_confirm = BOOT_DISPLAY_CONFIRM_DEFAULT;
+        want_vbe = "off";
+        want_storage = sdhci ? "sdhci" : "ata";
+        kstr_copy(g_smart_profile.reason,
+                  "Trusted firmware LFB -> display auto inherit",
+                  sizeof(g_smart_profile.reason));
+    } else {
+        want_display = "vga-text";
+        want_storage = "ata";
+        kstr_copy(g_smart_profile.reason,
+                  "No usable loader FB -> VGA text floor",
+                  sizeof(g_smart_profile.reason));
+    }
+
+    if (!g_cmdline_has_display) {
+        kstr_copy(cfg->display, want_display, sizeof(cfg->display));
+    }
+    if (!g_cmdline_has_confirm) {
+        cfg->display_confirm = want_confirm;
+    }
+    if (!g_cmdline_has_storage) {
+        kstr_copy(cfg->storage, want_storage, sizeof(cfg->storage));
+    }
+    if (want_vbe && !g_cmdline_has_vbe) {
+        kstr_copy(cfg->vbe, want_vbe, sizeof(cfg->vbe));
+    }
+
+    kstr_copy(g_smart_profile.display, cfg->display, sizeof(g_smart_profile.display));
+    kstr_copy(g_smart_profile.storage, cfg->storage, sizeof(g_smart_profile.storage));
+    g_smart_profile.confirm = cfg->display_confirm;
+    g_smart_profile.active = 1;
+
+    serial_out("[boot] smart: ");
+    serial_out(g_smart_profile.reason);
+    serial_out("\n");
+    serial_out("[boot] smart: display=");
+    serial_out(cfg->display);
+    serial_out(" storage=");
+    serial_out(cfg->storage[0] ? cfg->storage : "(default)");
+    serial_out("\n");
+    driver_log("[boot] smart: ");
+    driver_log_line(g_smart_profile.reason);
+}
+
+static int fb_readback_ok(uintptr_t addr, uint32_t w, uint32_t h,
+                          uint32_t pitch, uint8_t bpp);
+/* serial_out / serial_out_hex already forward-declared above for Smart boot. */
+
+#ifdef __i386__
+static int              g_bios_vbe_attempted = 0;
+static int              g_bios_vbe_active = 0;
+static bios_vbe_result_t g_last_bios_vbe;
+
+typedef struct {
+    uint64_t addr;
+    uint32_t w, h, pitch;
+    uint8_t  bpp, type;
+    int      have;
+} loader_fb_backup_t;
+
+static loader_fb_backup_t g_loader_fb_backup;
+
+static void loader_fb_backup_save(void) {
+    g_loader_fb_backup.have = saved_have_loader_fb;
+    g_loader_fb_backup.addr = saved_fb_addr;
+    g_loader_fb_backup.w = saved_fb_w;
+    g_loader_fb_backup.h = saved_fb_h;
+    g_loader_fb_backup.pitch = saved_fb_pitch;
+    g_loader_fb_backup.bpp = saved_fb_bpp;
+    g_loader_fb_backup.type = saved_fb_type;
+}
+
+static void loader_fb_backup_restore(void) {
+    if (!g_loader_fb_backup.have) {
+        saved_have_loader_fb = 0;
+        saved_fb_addr = 0;
+        saved_fb_w = saved_fb_h = saved_fb_pitch = 0;
+        saved_fb_bpp = 0;
+        saved_fb_type = 0xFF;
+        return;
+    }
+    saved_have_loader_fb = 1;
+    saved_fb_addr = g_loader_fb_backup.addr;
+    saved_fb_w = g_loader_fb_backup.w;
+    saved_fb_h = g_loader_fb_backup.h;
+    saved_fb_pitch = g_loader_fb_backup.pitch;
+    saved_fb_bpp = g_loader_fb_backup.bpp;
+    saved_fb_type = g_loader_fb_backup.type;
+    record_loader_framebuffer(saved_fb_addr, saved_fb_w, saved_fb_h,
+                              saved_fb_pitch, saved_fb_bpp, saved_fb_type);
+}
+
+static int boot_vbe_use_query(void) {
+    if (kstr_eq(g_boot_config.vbe, "off")) return 0;
+    if (kstr_eq(g_boot_config.vbe, "bios")) return 0;
+    if (kstr_eq(g_boot_config.vbe, "query")) return 1;
+    if (kstr_eq(g_boot_config.display, "basic")) return 1;
+    return 0;
+}
+
+static int boot_vbe_use_modeset(void) {
+    if (kstr_eq(g_boot_config.vbe, "off")) return 0;
+    if (kstr_eq(g_boot_config.vbe, "bios")) return 1;
+    return 0;
+}
+
+static int boot_vbe_allow_retry(void) {
+    if (kstr_eq(g_boot_config.vbe, "off")) return 0;
+    if (kstr_eq(g_boot_config.vbe, "loader")) return 1;
+    if (kstr_eq(g_boot_config.vbe, "bios")) return 0;
+    if (kstr_eq(g_boot_config.vbe, "query")) return 0;
+    return 1;
+}
+
+static void bios_vbe_apply_result(const bios_vbe_result_t* vbe, int clear_fb) {
+    if (!vbe || !vbe->ok) return;
+
+    saved_fb_addr = vbe->lfb_phys;
+    saved_fb_w = vbe->width;
+    saved_fb_h = vbe->height;
+    saved_fb_pitch = vbe->pitch;
+    saved_fb_bpp = vbe->bpp;
+    saved_fb_type = 1;
+    saved_have_loader_fb = 1;
+    record_loader_framebuffer(saved_fb_addr, saved_fb_w, saved_fb_h,
+                              saved_fb_pitch, saved_fb_bpp, saved_fb_type);
+    if (clear_fb)
+        bios_vbe_clear_framebuffer(vbe);
+}
+
+/*
+ * Microsoft Basic Display pattern: GRUB/firmware already picked the scanout
+ * buffer. INT 10h 4F01 tells us the true bytes_per_scanline -- keep the
+ * loader LFB base and only adopt BIOS width/height/pitch when they validate
+ * on that address.
+ */
+static int vbe_query_merge_loader_fb(const bios_vbe_result_t* vbe) {
+    uintptr_t loader_addr;
+
+    if (!vbe || !vbe->ok) return 0;
+    if (!g_loader_fb_backup.have || g_loader_fb_backup.addr == 0) return 0;
+    if (g_loader_fb_backup.type != 1) return 0;
+
+    loader_addr = (uintptr_t)g_loader_fb_backup.addr;
+    if (sizeof(uintptr_t) < sizeof(uint64_t) && ((g_loader_fb_backup.addr >> 32) != 0))
+        return 0;
+
+    if (!bios_vbe_pitch_stride_ok(loader_addr, vbe->width, vbe->height,
+                                  vbe->pitch, vbe->bpp))
+        return 0;
+    if (!fb_readback_ok(loader_addr, vbe->width, vbe->height, vbe->pitch, vbe->bpp))
+        return 0;
+
+    saved_have_loader_fb = 1;
+    saved_fb_addr = g_loader_fb_backup.addr;
+    saved_fb_w = vbe->width;
+    saved_fb_h = vbe->height;
+    saved_fb_pitch = vbe->pitch;
+    saved_fb_bpp = vbe->bpp;
+    saved_fb_type = 1;
+    record_loader_framebuffer(saved_fb_addr, saved_fb_w, saved_fb_h,
+                              saved_fb_pitch, saved_fb_bpp, saved_fb_type);
+    serial_out("[vbe] merged loader LFB base with BIOS pitch (no LFB relocation).\n");
+    return 1;
+}
+
+/*
+ * Bay Trail / Braswell (Lenovo 80M4): GRUB's multiboot FB tag is often not the
+ * scanned surface. Trust BIOS VBE 4F01 for pitch and, when it differs, the LFB
+ * physical base. No pixel probes — writing the wrong buffer hangs the panel.
+ */
+static int vbe_query_merge_loader_fb_bay_trail(const bios_vbe_result_t* vbe) {
+    uint64_t loader_addr;
+
+    if (!vbe || !vbe->ok) return 0;
+    if (!g_loader_fb_backup.have || g_loader_fb_backup.type != 1) return 0;
+    if (!bios_vbe_pitch_geometry_ok(vbe->width, vbe->height, vbe->pitch, vbe->bpp))
+        return 0;
+
+    loader_addr = g_loader_fb_backup.addr;
+    if (sizeof(uintptr_t) < sizeof(uint64_t) && (loader_addr >> 32) != 0)
+        return 0;
+
+    saved_have_loader_fb = 1;
+    saved_fb_type = 1;
+    saved_fb_w = vbe->width;
+    saved_fb_h = vbe->height;
+    saved_fb_pitch = vbe->pitch;
+    saved_fb_bpp = vbe->bpp;
+
+    if (vbe->lfb_phys != 0 && (uint64_t)vbe->lfb_phys != loader_addr) {
+        serial_out("[vbe] Bay Trail: BIOS LFB base differs from multiboot tag; "
+                   "adopting BIOS scanout address.\n");
+        serial_out("[vbe]   loader tag LFB=0x");
+        serial_out_hex((uint32_t)loader_addr);
+        serial_out(" BIOS LFB=0x");
+        serial_out_hex(vbe->lfb_phys);
+        serial_out("\n");
+        saved_fb_addr = vbe->lfb_phys;
+    } else {
+        saved_fb_addr = loader_addr;
+        serial_out("[vbe] Bay Trail: merged BIOS pitch on loader LFB base.\n");
+    }
+
+    record_loader_framebuffer(saved_fb_addr, saved_fb_w, saved_fb_h,
+                              saved_fb_pitch, saved_fb_bpp, saved_fb_type);
+    return 1;
+}
+
+static int try_bios_vbe_query_current(void) {
+    uintptr_t fb_addr;
+    int had_loader_fb;
+    int bay_trail = intel_gfx_is_bay_trail_class();
+
+    if (g_bios_vbe_attempted) return 0;
+    g_bios_vbe_attempted = 1;
+    g_bios_vbe_active = 0;
+    g_last_bios_vbe.ok = 0;
+
+    loader_fb_backup_save();
+    had_loader_fb = saved_have_loader_fb;
+
+    serial_out("[vbe] querying BIOS current VBE mode (no modeset)...\n");
+
+    if (bay_trail) {
+        if (!bios_vbe_query_current_mode_ex(&g_last_bios_vbe, 0) ||
+            !g_last_bios_vbe.ok) {
+            serial_out("[vbe] Bay Trail query declined; using loader/handoff FB if any.\n");
+            loader_fb_backup_restore();
+            g_bios_vbe_attempted = 0;
+            if (had_loader_fb)
+                basic_display_try_all_pitches();
+            return 0;
+        }
+    } else if (!bios_vbe_query_current_mode(&g_last_bios_vbe) || !g_last_bios_vbe.ok) {
+        serial_out("[vbe] query declined; using loader/handoff FB if any.\n");
+        loader_fb_backup_restore();
+        g_bios_vbe_attempted = 0;
+        if (had_loader_fb)
+            basic_display_try_all_pitches();
+        return 0;
+    }
+
+    if (had_loader_fb) {
+        if (bay_trail) {
+            if (vbe_query_merge_loader_fb_bay_trail(&g_last_bios_vbe)) {
+                g_bios_vbe_active = 1;
+                serial_out("[vbe] Bay Trail: current-mode query adopted.\n");
+                return 1;
+            }
+        } else if (vbe_query_merge_loader_fb(&g_last_bios_vbe)) {
+            g_bios_vbe_active = 1;
+            serial_out("[vbe] current-mode query adopted (loader LFB + BIOS pitch).\n");
+            return 1;
+        }
+        serial_out("[vbe] query could not validate BIOS pitch on loader LFB; "
+                   "keeping loader tag unchanged.\n");
+        loader_fb_backup_restore();
+        g_bios_vbe_attempted = 0;
+        basic_display_try_all_pitches();
+        return 0;
+    }
+
+    fb_addr = (uintptr_t)g_last_bios_vbe.lfb_phys;
+    if (fb_addr == 0) {
+        loader_fb_backup_restore();
+        g_bios_vbe_attempted = 0;
+        return 0;
+    }
+
+    if (!fb_readback_ok(fb_addr, g_last_bios_vbe.width, g_last_bios_vbe.height,
+                        g_last_bios_vbe.pitch, g_last_bios_vbe.bpp)) {
+        serial_out("[vbe] queried LFB failed read-back; keeping loader framebuffer.\n");
+        driver_log_line("[vbe] queried LFB failed read-back; keeping loader/handoff FB.");
+        loader_fb_backup_restore();
+        g_bios_vbe_attempted = 0;
+        return 0;
+    }
+
+    if (had_loader_fb && g_loader_fb_backup.addr != 0 &&
+        (uintptr_t)g_loader_fb_backup.addr != fb_addr) {
+        serial_out("[vbe] queried LFB differs from loader tag; adopting BIOS truth.\n");
+    }
+
+    bios_vbe_apply_result(&g_last_bios_vbe, 0);
+    g_bios_vbe_active = 1;
+    serial_out("[vbe] current-mode query adopted (pitch/LFB reconciled).\n");
+    return 1;
+}
+
+static int try_bios_vbe_modeset(uint32_t pref_w, uint32_t pref_h) {
+    uintptr_t fb_addr;
+
+    if (g_bios_vbe_attempted) return 0;
+    g_bios_vbe_attempted = 1;
+    g_bios_vbe_active = 0;
+    g_last_bios_vbe.ok = 0;
+
+    loader_fb_backup_save();
+
+    serial_out("[vbe] attempting BIOS INT 10h modeset...\n");
+
+    if (!bios_vbe_set_best_mode(pref_w, pref_h, &g_last_bios_vbe) || !g_last_bios_vbe.ok) {
+        serial_out("[vbe] modeset declined; using loader/handoff FB if any.\n");
+        loader_fb_backup_restore();
+        return 0;
+    }
+
+    fb_addr = (uintptr_t)g_last_bios_vbe.lfb_phys;
+    if (fb_addr == 0) {
+        loader_fb_backup_restore();
+        return 0;
+    }
+
+    if (!fb_readback_ok(fb_addr, g_last_bios_vbe.width, g_last_bios_vbe.height,
+                        g_last_bios_vbe.pitch, g_last_bios_vbe.bpp)) {
+        serial_out("[vbe] BIOS LFB failed read-back; restoring loader framebuffer.\n");
+        driver_log_line("[vbe] BIOS LFB failed read-back; keeping loader/handoff FB.");
+        loader_fb_backup_restore();
+        return 0;
+    }
+
+    bios_vbe_apply_result(&g_last_bios_vbe, 0);
+    g_bios_vbe_active = 1;
+    serial_out("[vbe] BIOS modeset adopted after read-back OK.\n");
+    return 1;
+}
+#endif
+
 /*
  * Bootstrap step (NOT guarded): walk multiboot1/2 info, extract the cmdline +
  * any inherited framebuffer, and parse the unified boot config. This is pure
  * memory walking over the loader-provided info block and must complete before
  * the staged orchestrator runs so boot_safe_mode() is known.
  */
+/* GRUB module2 FAT install template (USB live path). */
+static const uint8_t* g_fat_tpl_mod;
+static size_t g_fat_tpl_mod_size;
+
+const uint8_t* boot_fat_template_module(size_t* size_out) {
+    if (size_out) *size_out = g_fat_tpl_mod_size;
+    return (g_fat_tpl_mod && g_fat_tpl_mod_size >= 512U) ? g_fat_tpl_mod : NULL;
+}
+
 static void boot_config_parse_multiboot(uint32_t magic, multiboot_info_t* mb_info) {
     multiboot2_tag_framebuffer_t* mb2_fb = NULL;
     const char* mb_cmdline = NULL;
+
+    g_fat_tpl_mod = NULL;
+    g_fat_tpl_mod_size = 0;
 
     if (magic == MULTIBOOT2_MAGIC && mb_info) {
         /* Phase 3b widening: walk the multiboot2 tag chain using `uintptr_t`
@@ -375,12 +891,36 @@ static void boot_config_parse_multiboot(uint32_t magic, multiboot_info_t* mb_inf
                 mb_cmdline = c->string;
             } else if (tag->type == MULTIBOOT2_TAG_FRAMEBUFFER) {
                 mb2_fb = (multiboot2_tag_framebuffer_t*)tag;
+            } else if (tag->type == MULTIBOOT2_TAG_MODULE &&
+                       tag->size >= 16 && !g_fat_tpl_mod) {
+                multiboot2_tag_module_t* mod = (multiboot2_tag_module_t*)tag;
+                uint32_t mod_start = mod->mod_start;
+                uint32_t mod_end = mod->mod_end;
+                if (mod_end > mod_start && (mod_end - mod_start) >= 512U) {
+                    g_fat_tpl_mod = (const uint8_t*)(uintptr_t)mod_start;
+                    g_fat_tpl_mod_size = (size_t)(mod_end - mod_start);
+                }
             }
             addr += (tag->size + 7) & ~7u;
         }
     } else if (magic == MULTIBOOT_MAGIC && mb_info) {
         if (mb_info->flags & MULTIBOOT_INFO_CMDLINE) {
             mb_cmdline = (const char*)(uintptr_t)mb_info->cmdline;
+        }
+        if ((mb_info->flags & MULTIBOOT_INFO_MODS) && mb_info->mods_count > 0 &&
+            mb_info->mods_addr != 0 && !g_fat_tpl_mod) {
+            uint32_t i;
+            multiboot_module_t* mods =
+                (multiboot_module_t*)(uintptr_t)mb_info->mods_addr;
+            for (i = 0; i < mb_info->mods_count; i++) {
+                uint32_t mod_start = mods[i].mod_start;
+                uint32_t mod_end = mods[i].mod_end;
+                if (mod_end > mod_start && (mod_end - mod_start) >= 512U) {
+                    g_fat_tpl_mod = (const uint8_t*)(uintptr_t)mod_start;
+                    g_fat_tpl_mod_size = (size_t)(mod_end - mod_start);
+                    break;
+                }
+            }
         }
     }
 
@@ -420,6 +960,9 @@ static void boot_config_parse_multiboot(uint32_t magic, multiboot_info_t* mb_inf
         record_loader_framebuffer(saved_fb_addr, saved_fb_w, saved_fb_h,
                                   saved_fb_pitch, saved_fb_bpp, saved_fb_type);
     }
+
+    /* Hardware-aware profile after FB tags are known (config-space probes only). */
+    boot_smart_resolve(&g_boot_config);
 }
 
 /* Forward declarations for the serial boot log (defined later in this file). */
@@ -536,6 +1079,15 @@ static int display_confirm_visible(const display_driver_ops_t* drv,
     itoa((int)fb->height, b, 10); serial_out(b); serial_out("x");
     itoa((int)fb->bpp, b, 10);    serial_out(b); serial_out("\n");
 
+    /*
+     * Bay Trail: skip pixel write/read-back. The multiboot tag may point at
+     * writable but non-scanout memory; probing it leaves GRUB gfxterm frozen.
+     */
+    if (intel_gfx_is_bay_trail_class()) {
+        serial_out("[display] confirm OK: Bay Trail inherit (geometry only, no probe).\n");
+        return 1;
+    }
+
     /* (a) real-framebuffer pixel round-trip. */
     if (!fb_readback_ok(fb->framebuffer_addr, fb->width, fb->height,
                         fb->pitch, fb->bpp)) {
@@ -543,6 +1095,16 @@ static int display_confirm_visible(const display_driver_ops_t* drv,
                    "(physical FB address wrong/unmapped).\n");
         display_set_error("VESA disabled: framebuffer failed pixel read-back probe.\n");
         return 0;
+    }
+
+    /*
+     * Basic Display Adapter: pixel read-back is enough. Skip Ivy-oriented
+     * Intel pipe/panel heuristics that can reject a working firmware FB on
+     * Bay Trail / Braswell-class laptops (Lenovo 80M4).
+     */
+    if (drv && drv->id == DISPLAY_DRIVER_BASIC_LFB) {
+        serial_out("[display] confirm OK: basic firmware FB (pixel read-back only).\n");
+        return 1;
     }
 
     /* (b)+(c) Intel scanout health + panel power (read-only). */
@@ -598,8 +1160,19 @@ static int display_confirm_visible(const display_driver_ops_t* drv,
                        "committing but arming the on-panel confirm-or-revert gate.\n");
         }
     } else {
-        serial_out("[display] confirm: no Intel GPU present; skipping pipe/panel "
-                   "heuristics (pixel read-back passed).\n");
+        intel_gfx_info_t gpu;
+        if (intel_gfx_detect(&gpu) && gpu.present) {
+            serial_out("[display] confirm: Intel ");
+            serial_out(intel_gfx_generation_name(gpu.device_id));
+            serial_out(" detected; skipping Ivy-only pipe/panel heuristics "
+                       "(pixel read-back passed).\n");
+            driver_log("[display] Intel ");
+            driver_log(intel_gfx_generation_name(gpu.device_id));
+            driver_log_line(" detected; firmware framebuffer accepted without Ivy scanout gate.");
+        } else {
+            serial_out("[display] confirm: no Intel GPU present; skipping pipe/panel "
+                       "heuristics (pixel read-back passed).\n");
+        }
     }
 
     serial_out("[display] confirm OK: framebuffer accepted as a visible candidate.\n");
@@ -616,24 +1189,33 @@ static int display_confirm_visible(const display_driver_ops_t* drv,
  * stage), so the wait is interrupt-driven and bounded by the tick counter with
  * a hard spin cap as a backstop. Returns 1 if confirmed, 0 if it reverted.
  */
-#define DISPLAY_CONFIRM_TIMEOUT_MS 3000u
-
 /* Interactive on-panel confirmation. Requires the PS/2 keyboard driver to be
  * online; the boot orchestrator runs the input stage (input_init +
  * keyboard_init + mouse_init) BEFORE the display stage on both x86 and x64
  * (Phase 3c lifted the x64 keyboard driver into the link), so this function
  * is now compiled for both arches. */
-static int display_on_panel_confirm(void) {
-    vesa_boot_splash("Press ENTER if you can see this. "
-                     "Reverting to VGA text in 3s...");
-    serial_out("[display] on-panel confirm: waiting up to 3s for a keypress...\n");
+static int display_on_panel_confirm(const char* message, uint32_t timeout_ms,
+                                    int paint_splash) {
+    char tbuf[8];
+    if (!message) message = "Press ANY KEY if you can see this.";
+    if (timeout_ms < 1000U) timeout_ms = 1000U;
+    if (timeout_ms > 15000U) timeout_ms = 15000U;
+
+    /* Optional: dark splash card during on-panel confirm. */
+    if (paint_splash)
+        vesa_boot_splash(message);
+    (void)message;
+    serial_out("[display] on-panel confirm: waiting up to ");
+    itoa((int)(timeout_ms / 1000U), tbuf, 10);
+    serial_out(tbuf);
+    serial_out("s for a keypress...\n");
 
     /* Drain stale keystrokes so a pre-buffered key cannot auto-confirm. */
     while (keyboard_has_char()) (void)keyboard_read_char();
 
     uint32_t start = timer_ticks();
     /* stage_timer programs the PIT at 100Hz, so 1 tick == 10ms. */
-    uint32_t deadline = (DISPLAY_CONFIRM_TIMEOUT_MS * 100u) / 1000u;
+    uint32_t deadline = (timeout_ms * 100u) / 1000u;
     uint32_t spin_cap = 0;
 
     while ((timer_ticks() - start) < deadline) {
@@ -691,12 +1273,68 @@ static int g_display_native_w = 0, g_display_native_h = 0;
  * Always sets boot_mode_text_console (so the x64 main loop runs the full
  * shell instead of the VESA desktop) and clears boot_mode_vesa.
  */
+/*
+ * Clear the inherited loader framebuffer to a near-black colour so GRUB
+ * gfxterm residue does not look like a hung boot.
+ */
+static void early_paint_loader_framebuffer(void) {
+    uintptr_t fb_addr;
+    uint32_t w, h, pitch, bpp, bpx;
+    uint32_t x, y;
+    volatile uint8_t* fb;
+
+    if (!saved_have_loader_fb || saved_fb_type != 1) return;
+    if (sizeof(uintptr_t) < sizeof(uint64_t) && ((saved_fb_addr >> 32) != 0))
+        return;
+    fb_addr = (uintptr_t)saved_fb_addr;
+    if (!fb_addr || saved_fb_w < 320 || saved_fb_h < 200) return;
+
+    w = saved_fb_w;
+    h = saved_fb_h;
+    pitch = saved_fb_pitch;
+    bpp = saved_fb_bpp;
+    if (!loader_fb_bpp_bytes((uint8_t)bpp, &bpx)) return;
+    if (pitch < w * bpx) return;
+    fb = (volatile uint8_t*)fb_addr;
+
+    for (y = 0; y < h; y++) {
+        volatile uint8_t* row = fb + (uint32_t)y * pitch;
+        for (x = 0; x < w; x++) {
+            uint32_t color = 0x050608U;
+            if (bpp == 32) {
+                ((volatile uint32_t*)row)[x] = color;
+            } else if (bpp == 24) {
+                volatile uint8_t* p = row + x * 3U;
+                p[0] = (uint8_t)(color & 0xFF);
+                p[1] = (uint8_t)((color >> 8) & 0xFF);
+                p[2] = (uint8_t)((color >> 16) & 0xFF);
+            } else if (bpp == 16 || bpp == 15) {
+                uint16_t r = (uint16_t)((color >> 19) & 0x1F);
+                uint16_t g = (uint16_t)((color >> 10) & 0x3F);
+                uint16_t b = (uint16_t)((color >> 3) & 0x1F);
+                ((volatile uint16_t*)row)[x] = (uint16_t)((r << 11) | (g << 5) | b);
+            }
+        }
+    }
+    serial_out("[display] cleared loader framebuffer.\n");
+}
+
+static void early_clear_loader_framebuffer(const char* banner) {
+    (void)banner;
+    early_paint_loader_framebuffer();
+}
+
 static void revert_to_text_floor(void) {
     boot_mode_vesa = 0;
     boot_mode_text_console = 1;
 
-    /* Path 1: inherited LFB -- render the text console into the
-     * firmware framebuffer. This is the visible path on UEFI x64. */
+    /*
+     * Prefer drawing the text console into the inherited LFB whenever GRUB
+     * left us a graphics framebuffer. Falling through to 0xB8000 while the
+     * panel still scans that LFB leaves a permanent "blue screen" (GRUB
+     * gfxterm) with a live but invisible kernel -- the Lenovo 80M4 failure
+     * mode when confirm times out or graphics is abandoned.
+     */
     if (saved_have_loader_fb && saved_fb_type == 1) {
         uintptr_t fb_addr;
         if (sizeof(uintptr_t) < sizeof(uint64_t) && ((saved_fb_addr >> 32) != 0)) {
@@ -704,9 +1342,9 @@ static void revert_to_text_floor(void) {
         } else {
             fb_addr = (uintptr_t)saved_fb_addr;
         }
+        early_clear_loader_framebuffer("GooberOS text console");
         if (fb_addr && con_init_fb(fb_addr, saved_fb_w, saved_fb_h,
                                    saved_fb_pitch, saved_fb_bpp)) {
-            /* Reflect the FB as the visible console in diagnostics. */
             last_fb_type   = saved_fb_type;
             last_fb_bpp    = saved_fb_bpp;
             last_fb_pitch  = saved_fb_pitch;
@@ -715,20 +1353,17 @@ static void revert_to_text_floor(void) {
             last_fb_addr   = fb_addr;
             serial_out("[display] bound text console to inherited "
                        "framebuffer (textcon FB backend).\n");
+            print("Display: text console on firmware framebuffer.\n");
             return;
         }
-        /* FB bind failed (too small, weird bpp): try to hard-revert the
-         * VGA controller back to text and use 0xB8000 instead. On UEFI
-         * this almost certainly won't light the panel either, but on a
-         * legacy-BIOS boot it will. */
+        /* Last resort on legacy BIOS: reprogram VGA text registers. */
         display_restore_vga_text();
         vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
         serial_out("[display] textcon FB bind declined; falling back "
                    "to 0xB8000 (legacy BIOS only).\n");
     }
 
-    /* Path 2: legacy VGA text plane. clear_screen() writes 0xB8000 and
-     * con_init_vga then snapshots that into the cell grid. */
+    /* Path 2: legacy VGA text plane (only visible if the panel scans it). */
     clear_screen();
     con_init_vga();
     serial_out("[display] bound text console to 0xB8000 "
@@ -736,6 +1371,95 @@ static void revert_to_text_floor(void) {
 }
 
 static void framebuffer_bringup(void) {
+    int basic_display = kstr_eq(g_boot_config.display, "basic");
+    int safe_display = kstr_eq(g_boot_config.display, "safe");
+    uint32_t pref_w = 0, pref_h = 0;
+    int loader_fb_live = kernel_loader_fb_usable();
+    int bay_trail = intel_gfx_is_bay_trail_class();
+
+    parse_wxh(g_boot_config.native, &pref_w, &pref_h);
+
+    /*
+     * Inherit-first: prepare pitch before GMBUS/DDC or modeset.
+     * Bay Trail: skip Intel display MMIO (plane/HPD/GMBUS) — it can hang —
+     * but do NOT force VGA text; user can pick GRUB VGA entry if needed.
+     */
+    if (loader_fb_live &&
+        (basic_display || safe_display || kstr_eq(g_boot_config.display, "auto") ||
+         g_boot_config.display[0] == '\0')) {
+        serial_out("[display] inherit-first: prepare loader FB (no GMBUS, no VBE modeset).\n");
+        if (bay_trail)
+            serial_out("[display] Bay Trail: Intel display MMIO skipped.\n");
+#ifdef __i386__
+        /*
+         * Bay Trail: multiboot FB tag != scanout buffer on many BIOS builds.
+         * INT 10h 4F01 is safe (no Intel MMIO) and yields true pitch/LFB base.
+         */
+        if (bay_trail) {
+            serial_out("[display] Bay Trail: BIOS VBE query before inherit prepare.\n");
+            try_bios_vbe_query_current();
+        } else if (kstr_eq(g_boot_config.vbe, "query") || kstr_eq(g_boot_config.vbe, "bios")) {
+            serial_out("[display] inherit-first: ignoring gooberos.vbe= while loader FB live.\n");
+        }
+#endif
+        basic_display_prepare_loader_fb();
+        /*
+         * Full-screen paint probe writes the entire LFB — on 80M4 the multiboot
+         * tag is often not the scanned surface; painting the wrong buffer leaves
+         * GRUB's blue gfxterm frozen. Skip on Bay Trail; Basic display opts in.
+         */
+        if (!bay_trail &&
+            (basic_display || safe_display ||
+             kstr_eq(g_boot_config.display, "auto") ||
+             g_boot_config.display[0] == '\0' ||
+             g_smart_profile.active))
+            basic_display_paint_probe();
+#ifdef __i386__
+    } else if (boot_vbe_use_query()) {
+        try_bios_vbe_query_current();
+    } else if (boot_vbe_use_modeset()) {
+        try_bios_vbe_modeset(pref_w, pref_h);
+#endif
+    }
+    if (!loader_fb_live || (!basic_display && !safe_display &&
+                            !kstr_eq(g_boot_config.display, "auto") &&
+                            g_boot_config.display[0] != '\0')) {
+#ifdef __i386__
+        if (!g_bios_vbe_active && !basic_display_scanout_preserved() && !bay_trail)
+            early_paint_loader_framebuffer();
+#else
+        if (!basic_display_scanout_preserved() && !bay_trail)
+            early_paint_loader_framebuffer();
+#endif
+    }
+
+    /*
+     * Connector inventory: never touch Intel display MMIO on Bay Trail while
+     * the firmware LFB is live (Phase-1 HPD scan caused 80M4 blue-panel hang).
+     */
+    if (!boot_safe_mode() && !kstr_eq(g_boot_config.display, "off")) {
+        if (bay_trail && loader_fb_live) {
+            kernel_loader_fb_t lfb;
+            kernel_loader_fb_get(&lfb);
+            display_connectors_stub_firmware_panel(lfb.w, lfb.h);
+            serial_out("[display] Bay Trail: firmware connector stubs "
+                       "(no Intel MMIO).\n");
+        } else if (display_connectors_count() == 0) {
+            if (kernel_loader_fb_usable() || safe_display) {
+                int nconn = display_connectors_scan_ex(0);
+                if (nconn <= 0) {
+                    display_connectors_reset();
+                    kernel_loader_fb_t lfb;
+                    kernel_loader_fb_get(&lfb);
+                    display_connector_add_simplefb(lfb.w, lfb.h, "Firmware-LFB");
+                }
+                serial_out("[display] connector scan: HPD-only (GMBUS deferred).\n");
+            } else {
+                display_connectors_scan_ex(1);
+            }
+        }
+    }
+
     /* Respect an explicit VGA / off request; never override the user's choice. */
     if (kstr_eq(g_boot_config.boot, "vga")) {
         vesa_reject_reason = "VESA disabled: VGA Compatibility Mode requested by GRUB.\n";
@@ -751,23 +1475,67 @@ static void framebuffer_bringup(void) {
      * GRUB inherited a graphics LFB. Goes through the same textcon path
      * as the VGA-Compatibility GRUB entry. */
     if (kstr_eq(g_boot_config.display, "vga-text")) {
+        if (kernel_loader_fb_usable())
+            basic_display_prepare_loader_fb();
         vesa_reject_reason = "VESA disabled: text-only floor requested "
                              "by gooberos.display=vga-text.\n";
         revert_to_text_floor();
         return;
     }
 
-    /* gooberos.display=safe: firmware FB only + probe + forced auto-revert. */
-    int safe_display = kstr_eq(g_boot_config.display, "safe");
-    const char* force_name = safe_display ? "vesa" : g_boot_config.display;
-    if (safe_display)
+    /* gooberos.display=safe|basic: firmware FB only (no modeset). */
+    const char* force_name = g_boot_config.display;
+    if (safe_display) {
+        force_name = "vesa";
         serial_out("[display] gooberos.display=safe: adopting firmware FB only, "
                    "probe + on-panel auto-revert armed.\n");
+    } else if (basic_display) {
+        force_name = "basic";
+        serial_out("[display] gooberos.display=basic: Microsoft Basic Display Adapter "
+                   "(firmware handoff + pitch catalog + driver ladder).\n");
+    }
 
     /* Pick the recommended geometry that programmable drivers should try first.
      * Inherited framebuffers ignore this and keep the loader's exact mode. */
     uint32_t nat_w = 0, nat_h = 0;
     uint32_t req_w = 0, req_h = 0;
+    edid_info_t edid_info;
+    int have_edid_hint = 0;
+    intel_gfx_info_t boot_intel;
+    int have_boot_intel = 0;
+    int defer_braswell_edid = 0;
+    for (uint32_t i = 0; i < sizeof(edid_info); i++) ((uint8_t*)&edid_info)[i] = 0;
+    for (uint32_t i = 0; i < sizeof(boot_intel); i++) ((uint8_t*)&boot_intel)[i] = 0;
+    have_boot_intel = intel_gfx_detect(&boot_intel) && boot_intel.present;
+    /*
+     * When GRUB already handed us a usable LFB, never touch GMBUS/DDC.
+     * EDID probes have hung real Intel panels (Bay Trail / Braswell class)
+     * and leave the user staring at GRUB's blue gfxterm forever.
+     */
+    defer_braswell_edid = saved_have_loader_fb && saved_fb_type == 1;
+    if (!boot_safe_mode()) {
+        if (defer_braswell_edid) {
+            if (have_boot_intel) {
+                driver_log("[display] EDID/DDC deferred for Intel ");
+                driver_log(intel_gfx_generation_name(boot_intel.device_id));
+                driver_log_line(" because firmware framebuffer is already present.");
+            } else {
+                driver_log_line("[display] EDID/DDC deferred: firmware framebuffer present.");
+            }
+        } else {
+            have_edid_hint = intel_gfx_read_edid(&edid_info) &&
+                             edid_info.valid &&
+                             edid_info.preferred_width >= 320 &&
+                             edid_info.preferred_height >= 200 &&
+                             edid_info.preferred_width <= 1920 &&
+                             edid_info.preferred_height <= 1200;
+            if (!have_edid_hint && edid_info.valid) {
+                driver_log_line("[display] EDID preferred mode outside safe bounds; ignoring as mode hint.");
+            }
+        }
+    } else {
+        driver_log_line("[display] EDID/DDC skipped in gooberos.safe compatibility mode.");
+    }
     if (parse_wxh(g_boot_config.native, &nat_w, &nat_h)) {
         g_display_native_w = (int)nat_w;
         g_display_native_h = (int)nat_h;
@@ -776,6 +1544,18 @@ static void framebuffer_bringup(void) {
         serial_out("[display] native panel hint: ");
         { char b[16]; itoa((int)nat_w, b, 10); serial_out(b); serial_out("x");
           itoa((int)nat_h, b, 10); serial_out(b); serial_out("\n"); }
+        driver_log("[display] native panel hint: ");
+        driver_log_u32(nat_w); driver_log("x"); driver_log_u32(nat_h); driver_log("\n");
+    } else if (have_edid_hint) {
+        req_w = edid_info.preferred_width;
+        req_h = edid_info.preferred_height;
+        g_display_native_w = (int)req_w;
+        g_display_native_h = (int)req_h;
+        serial_out("[display] EDID preferred mode hint: ");
+        { char b[16]; itoa((int)req_w, b, 10); serial_out(b); serial_out("x");
+          itoa((int)req_h, b, 10); serial_out(b); serial_out("\n"); }
+        driver_log("[display] EDID preferred mode hint: ");
+        driver_log_u32(req_w); driver_log("x"); driver_log_u32(req_h); driver_log("\n");
     } else if (saved_have_loader_fb && saved_fb_type == 1 &&
                saved_fb_w >= 320 && saved_fb_h >= 200 &&
                saved_fb_w <= 1920 && saved_fb_h <= 1200) {
@@ -784,11 +1564,28 @@ static void framebuffer_bringup(void) {
         serial_out("[display] recommended mode from loader framebuffer: ");
         { char b[16]; itoa((int)req_w, b, 10); serial_out(b); serial_out("x");
           itoa((int)req_h, b, 10); serial_out(b); serial_out("\n"); }
+        driver_log("[display] recommended mode from loader framebuffer: ");
+        driver_log_u32(req_w); driver_log("x"); driver_log_u32(req_h); driver_log("\n");
     } else {
         serial_out("[display] recommended mode: driver default "
                    "(no safe native/loader geometry).\n");
+        driver_log_line("[display] recommended mode: driver default (no safe native/loader geometry).");
+    }
+    if (!have_edid_hint) edid_log_info(NULL);
+    if (have_edid_hint && saved_have_loader_fb && saved_fb_type == 1 &&
+        (saved_fb_w != req_w || saved_fb_h != req_h)) {
+        driver_log("[display] auto-panel: firmware framebuffer ");
+        driver_log_u32(saved_fb_w);
+        driver_log("x");
+        driver_log_u32(saved_fb_h);
+        driver_log(" differs from EDID preferred ");
+        driver_log_u32(req_w);
+        driver_log("x");
+        driver_log_u32(req_h);
+        driver_log_line("; keeping firmware mode until native modeset is available.");
     }
 
+display_reprobe:
     /*
      * Feed the inherited framebuffer to the simple-framebuffer driver. On
      * x86_64 the kernel identity-maps the low 4 GiB and `uintptr_t` is 64
@@ -813,15 +1610,43 @@ static void framebuffer_bringup(void) {
      * better than a bare 80x25 text floor for the "visibility" goal. */
     display_reset_drivers();
     native_fb_register_drivers();    /* "vesa" then "bochs"       */
-    intel_gfx_register_driver();     /* "intel" (plane-repoint)   */
+    if (!(bay_trail && loader_fb_live))
+        intel_gfx_register_driver(); /* plane-repoint — unsafe on Bay Trail LFB */
     vga_graphics_register_driver();  /* "vga-graphics" (mode-13h) */
 
     /* Run the visibility-gated ladder. The generic driver gets the native hint
      * (the inherited "vesa" driver ignores hints and uses GRUB's geometry). */
     display_framebuffer_t fb;
-    const display_driver_ops_t* drv =
-        display_probe_drivers(force_name, req_w, req_h, 0, &fb,
-                              display_confirm_visible, NULL);
+    const display_driver_ops_t* drv = NULL;
+    int intel_first = 0;
+
+    if (basic_display && have_boot_intel &&
+        intel_gfx_supports_plane_repoint(boot_intel.device_id) &&
+        !bay_trail)
+        intel_first = 1;
+
+    if (basic_display) {
+        serial_out("[display] basic: MS driver ladder (intel->basic->vesa->bochs).\n");
+        drv = basic_display_probe_ladder(req_w, req_h, &fb,
+                                         display_confirm_visible,
+                                         NULL, intel_first);
+    }
+
+    /* Normal boot on Bay Trail: inherit-only ladder (no Intel plane MMIO). */
+    if (!drv && bay_trail && loader_fb_live && !basic_display && !safe_display &&
+        (kstr_eq(g_boot_config.display, "auto") ||
+         g_boot_config.display[0] == '\0')) {
+        serial_out("[display] Bay Trail Normal boot: inherit ladder "
+                   "(basic/vesa, no Intel MMIO).\n");
+        drv = basic_display_probe_ladder(req_w, req_h, &fb,
+                                         display_confirm_visible,
+                                         NULL, 0);
+    }
+
+    if (!drv) {
+        drv = display_probe_drivers(force_name, req_w, req_h, 0, &fb,
+                                    display_confirm_visible, NULL);
+    }
 
     if (!drv) {
         const char* err = display_last_error();
@@ -854,6 +1679,7 @@ static void framebuffer_bringup(void) {
         last_fb_height = fb.height;
         last_fb_addr = fb.framebuffer_addr;
         serial_out("[display] committed to VGA mode-13h (320x200x8).\n");
+        driver_log_line("[display] committed to VGA mode-13h (320x200x8).");
         return;
     }
 
@@ -862,6 +1688,7 @@ static void framebuffer_bringup(void) {
     display_register_framebuffer(drv->id, fb.format,
                                  fb.framebuffer_addr, fb.width, fb.height,
                                  fb.pitch, fb.bpp);
+    fb_cache_enable_write_combining(fb.framebuffer_addr, fb.pitch * fb.height);
     boot_mode_vesa = 1;
     last_fb_type = 1;
     last_fb_bpp = fb.bpp;
@@ -869,25 +1696,64 @@ static void framebuffer_bringup(void) {
     last_fb_width = fb.width;
     last_fb_height = fb.height;
     last_fb_addr = fb.framebuffer_addr;
+    driver_log("[display] committed framebuffer via ");
+    driver_log(drv->name ? drv->name : "?");
+    driver_log(" ");
+    driver_log_u32(fb.width); driver_log("x"); driver_log_u32(fb.height);
+    driver_log("x"); driver_log_u32(fb.bpp); driver_log("\n");
 
     /*
      * The normal path now trusts the validated framebuffer and goes directly
      * to the desktop. Safe mode and gooberos.display.confirm=force keep the
      * bounded fallback prompt available for diagnostics.
      */
-    int intel_present = intel_gfx_detect(NULL);
-    int run_confirm = safe_display;
+    intel_gfx_info_t active_intel;
+    int intel_present = intel_gfx_detect(&active_intel) && active_intel.present;
+    int untrusted_intel_scanout = intel_present &&
+        !intel_gfx_uses_ivb_display_regs(active_intel.device_id);
+    /*
+     * Basic Display MUST use the on-panel confirm gate. Pixel read-back only
+     * proves CPU-accessible memory; on Lenovo-class Intel panels the LFB can
+     * be writable but not scanned out (solid black). Microsoft Basic Display
+     * similarly relies on firmware modeset + user-visible output; if the
+     * panel stays dark we hard-revert to VGA text (CRTC reprogram), not
+     * textcon-on-dead-LFB.
+     */
+    int used_basic = basic_display ||
+        (drv && drv->id == DISPLAY_DRIVER_BASIC_LFB);
+    int run_confirm = safe_display || used_basic || untrusted_intel_scanout;
+    if (used_basic) {
+        serial_out("[display] basic: on-panel confirm armed.\n");
+        run_confirm = 1;
+#ifdef __i386__
+        if (basic_display_scanout_preserved() && !have_boot_intel) {
+            serial_out("[display] basic: GRUB scanout preserved; skipping on-panel confirm.\n");
+            run_confirm = 0;
+        } else if (basic_display_scanout_preserved() && have_boot_intel) {
+            serial_out("[display] basic: Intel GPU present; keeping on-panel confirm.\n");
+        }
+#endif
+    } else if (untrusted_intel_scanout) {
+        driver_log("[display] auto-panel: Intel ");
+        driver_log(intel_gfx_generation_name(active_intel.device_id));
+        driver_log_line(" uses firmware FB plus on-panel recovery gate.");
+        serial_out("[display] auto-panel: untrusted Intel scanout generation; "
+                   "arming on-panel recovery gate.\n");
+    }
     /*
      * gooberos.display.confirm=skip|force|default lets the cmdline override
-     * the default. Normal boot passes skip; the safe GRUB entry passes force.
+     * the default. Basic Display ignores skip (black-panel trap).
      */
     switch (g_boot_config.display_confirm) {
         case BOOT_DISPLAY_CONFIRM_SKIP:
-            if (run_confirm) {
+            if (used_basic) {
+                serial_out("[display] gooberos.display.confirm=skip ignored for "
+                           "basic display (need visible-panel proof).\n");
+            } else {
                 serial_out("[display] gooberos.display.confirm=skip: "
                            "skipping on-panel confirm gate.\n");
+                run_confirm = 0;
             }
-            run_confirm = 0;
             break;
         case BOOT_DISPLAY_CONFIRM_FORCE:
             if (!run_confirm) {
@@ -901,18 +1767,74 @@ static void framebuffer_bringup(void) {
         default:
             break;
     }
+    /*
+     * Smart boot on Bay Trail: skip on-panel confirm. The splash writes through
+     * a multiboot tag that may not be the scanned surface; users only see black
+     * for 5s then a broken fallback (Lenovo 80M4 class).
+     */
+    if (g_smart_profile.active && bay_trail && kernel_loader_fb_usable()) {
+        serial_out("[display] smart+bay trail: skipping on-panel confirm "
+                   "(visibility-first).\n");
+        driver_log_line("[display] smart+bay trail: skipping on-panel confirm.");
+        run_confirm = 0;
+    }
     (void)intel_present;
     if (run_confirm) {
-        if (!display_on_panel_confirm()) {
-            /* Reverting: restore the VGA text floor so we are never stranded on
-             * a black panel, and drop back to text-mode boot. */
-            revert_to_text_floor();
+        if (!display_on_panel_confirm(
+                "Press ANY KEY if you can see this. "
+                "Reverting to VGA text in 5s...",
+                used_basic ? 5000U : 3000U,
+                1)) {
+#ifdef __i386__
+            if (boot_vbe_allow_retry() && try_bios_vbe_modeset(req_w, req_h)) {
+                serial_out("[display] BIOS VBE modeset retry after confirm timeout; "
+                           "re-probing drivers.\n");
+                goto display_reprobe;
+            }
+#endif
+            if (used_basic && saved_have_loader_fb && saved_fb_type == 1 &&
+                basic_display_try_all_pitches()) {
+                basic_display_paint_probe();
+                serial_out("[display] basic: retrying with heuristic padded pitch.\n");
+                goto display_reprobe;
+            }
+            if (used_basic && saved_have_loader_fb && saved_fb_type == 1) {
+                uintptr_t fb_addr = (uintptr_t)saved_fb_addr;
+                boot_mode_vesa = 0;
+                boot_mode_text_console = 1;
+                basic_display_paint_probe();
+                if (fb_addr && con_init_fb(fb_addr, saved_fb_w, saved_fb_h,
+                                           saved_fb_pitch, saved_fb_bpp)) {
+                    last_fb_type = saved_fb_type;
+                    last_fb_bpp = saved_fb_bpp;
+                    last_fb_pitch = saved_fb_pitch;
+                    last_fb_width = saved_fb_w;
+                    last_fb_height = saved_fb_h;
+                    last_fb_addr = fb_addr;
+                    vesa_reject_reason =
+                        "VESA reverted: basic display fell back to text on firmware FB.\n";
+                    print("Display: basic text console on firmware framebuffer.\n");
+                    serial_out("[display] basic: on-panel timeout; textcon on inherited LFB.\n");
+                    return;
+                }
+            }
+            /*
+             * No inherited LFB to draw into: reprogram legacy VGA text.
+             */
+            boot_mode_vesa = 0;
+            boot_mode_text_console = 1;
+            display_restore_vga_text();
+            vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+            clear_screen();
+            con_init_vga();
             vesa_reject_reason =
                 "VESA reverted: no on-panel confirmation; restored VGA text floor.\n";
-            print("Display: no confirmation within 3s; reverted to VGA text.\n");
-            serial_out("[display] reverting to VGA text floor after on-panel timeout.\n");
-            /* Reflect the revert through the diagnostic accessors. */
+            print("Display: panel not confirmed; reverted to VGA text.\n");
+            print("Hint: if this text is visible, graphics LFB was not scanning out.\n");
+            serial_out("[display] reverting to VGA text (hard CRTC restore) "
+                       "after on-panel timeout.\n");
             last_fb_type = 0xFF;
+            last_fb_addr = 0;
         } else {
             serial_out("[display] on-panel confirmation OK; keeping graphical mode.\n");
         }
@@ -933,6 +1855,20 @@ static void report_display_diagnostics(void) {
     char buf[16];
     const display_mode_info_t* mode = display_get_mode();
 
+    if (g_smart_profile.active) {
+        print("Smart boot: ");
+        print(g_smart_profile.reason);
+        print("\n");
+        print("  display=");
+        print(g_smart_profile.display);
+        print(" storage=");
+        print(g_smart_profile.storage[0] ? g_smart_profile.storage : "(default)");
+        print("\n");
+        serial_out("Smart boot: ");
+        serial_out(g_smart_profile.reason);
+        serial_out("\n");
+    }
+
     print("Display driver: ");
     print(display_driver_name(mode->driver));
     print("\n");
@@ -941,6 +1877,7 @@ static void report_display_diagnostics(void) {
     serial_out("\n");
 
     if (mode->driver == DISPLAY_DRIVER_VESA_LFB ||
+        mode->driver == DISPLAY_DRIVER_BASIC_LFB ||
         mode->driver == DISPLAY_DRIVER_NATIVE_GENERIC ||
         mode->driver == DISPLAY_DRIVER_NATIVE_INTEL) {
         print("Display mode: ");
@@ -967,6 +1904,68 @@ static void report_display_diagnostics(void) {
             serial_out("WARNING: committed display mode != gooberos.native (");
             itoa(g_display_native_w, buf, 10); serial_out(buf); serial_out("x");
             itoa(g_display_native_h, buf, 10); serial_out(buf); serial_out(")\n");
+        }
+    }
+
+#ifdef __i386__
+    if (g_last_bios_vbe.ok) {
+        print("VBE: BIOS modeset OK mode=0x");
+        print_hex32((uint32_t)g_last_bios_vbe.mode);
+        print(" ");
+        itoa((int)g_last_bios_vbe.width, buf, 10); print(buf); print("x");
+        itoa((int)g_last_bios_vbe.height, buf, 10); print(buf); print("x");
+        itoa((int)g_last_bios_vbe.bpp, buf, 10); print(buf);
+        print(" LFB="); print_hex32(g_last_bios_vbe.lfb_phys); print("\n");
+        serial_out("VBE: BIOS modeset OK\n");
+    }
+#endif
+
+    /* Ubuntu-style connector inventory (eDP / HDMI / DP / SimpleFB). */
+    if (display_connectors_count() == 0) {
+        if (intel_gfx_is_bay_trail_class() && kernel_loader_fb_usable()) {
+            kernel_loader_fb_t lfb;
+            kernel_loader_fb_get(&lfb);
+            display_connectors_stub_firmware_panel(lfb.w, lfb.h);
+        } else {
+            display_connectors_scan_ex(0);
+            if (kernel_loader_fb_usable()) {
+                kernel_loader_fb_t lfb;
+                kernel_loader_fb_get(&lfb);
+                display_connector_add_simplefb(lfb.w, lfb.h, "Firmware-LFB");
+            }
+        }
+    }
+    {
+        int ci;
+        int nconn = display_connectors_count();
+        print("Connectors: ");
+        itoa(nconn, buf, 10); print(buf); print("\n");
+        serial_out("Connectors: ");
+        itoa(nconn, buf, 10); serial_out(buf); serial_out("\n");
+        for (ci = 0; ci < nconn; ci++) {
+            const display_connector_t* c = display_connector_get(ci);
+            if (!c) continue;
+            print("  ");
+            print(c->name);
+            print(" ");
+            print(display_connector_status_name(c->status));
+            if (c->status == DISPLAY_CONN_STATUS_CONNECTED &&
+                c->preferred_width && c->preferred_height) {
+                print(" ");
+                itoa((int)c->preferred_width, buf, 10); print(buf); print("x");
+                itoa((int)c->preferred_height, buf, 10); print(buf);
+            }
+            if (c->monitor_name[0]) {
+                print(" \"");
+                print(c->monitor_name);
+                print("\"");
+            }
+            print("\n");
+            serial_out("  ");
+            serial_out(c->name);
+            serial_out(" ");
+            serial_out(display_connector_status_name(c->status));
+            serial_out("\n");
         }
     }
 
@@ -1454,7 +2453,9 @@ typedef struct {
  */
 #define WD_HWSUMMARY  300u   /* 3 s  */
 #define WD_PCI        400u   /* 4 s  */
-#define WD_STORAGE    500u   /* 5 s  */
+#define WD_DISPLAY    800u   /* 8 s -- FB adopt / confirm must not hang forever */
+#define WD_STORAGE    500u   /* 5 s  (x86) */
+#define WD_STORAGE_X64 2500u  /* 25 s -- Bay Trail eMMC init can be slow */
 #define WD_USB        500u   /* 5 s -- bounded so bad USB does not dominate boot */
 #define WD_TOUCHPAD   250u   /* 2.5 s -- ACPI/I2C touchpad probe ceiling */
 /*
@@ -1550,7 +2551,7 @@ static const boot_stage_def_t k_boot_stages[] = {
     { "Hardware summary (PCI scan)", stage_hwsummary, 1, 0, NULL, 0, WD_HWSUMMARY },
     { "ACPI tables",                 stage_acpi,      1, 0, NULL, 0, WD_HWSUMMARY },
     { "Display / framebuffer",       stage_display,   1, 0,
-      "Framebuffer OK. Initializing hardware...", 1, 0 },
+      "Framebuffer OK. Initializing hardware...", 1, WD_DISPLAY },
     { "PCI init",                    stage_pci,       1, 0,
       "PCI initialized. Scanning storage...", 0, WD_PCI },
     { "I2C HID touchpad",            stage_touchpad,  1, 0,
@@ -1559,9 +2560,10 @@ static const boot_stage_def_t k_boot_stages[] = {
       "Storage initialized. Initializing USB...", 0, WD_STORAGE },
     { "USB host stack",              stage_usb,       1, 0,
       "USB initialized. Loading filesystem...", 0, WD_USB },
-    /* --- Back to the floor: filesystem powers the text shell --- */
+    /* Filesystem is always run (not skipped in safe mode) but is fault-
+     * guarded with a watchdog so a bad auto-mount cannot hang the box. */
     { "Filesystem",                  stage_fs,        0, 0,
-      "Filesystem ready. Starting desktop...", 0, 0 },
+      "Filesystem ready. Starting desktop...", 0, WD_STORAGE },
 };
 
 static void boot_run_stages(void) {
@@ -1652,6 +2654,8 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
             vesa_set_backbuffer_bytes(NULL, 0);
             serial_out("VESA backbuffer too large; using direct framebuffer\n");
         }
+        /* Prove the panel is ours before the desktop event loop. */
+        vesa_boot_splash("Starting desktop...");
     }
 
     kernel_pid = create_process("kernel.bin", 0);
@@ -1982,7 +2986,6 @@ static void stage_x64_heap(void) {
 }
 static void stage_x64_fs(void) {
     fs_init();
-    print("[boot] fs_init complete (in-memory tree ready).\n");
 }
 
 /*
@@ -2083,43 +3086,21 @@ static const boot_stage_def_t k_boot_stages_x64[] = {
     { "Hardware summary (PCI scan)", stage_x64_hwsummary, 1, 0, NULL, 0, WD_HWSUMMARY },
     { "ACPI tables",                 stage_x64_acpi,      1, 0, NULL, 0, WD_HWSUMMARY },
     /*
-     * Phase 3d: USB host stack between the PCI scan and the display stage,
-     * matching the x86 ordering in k_boot_stages above. The 12-second
-     * watchdog (WD_USB = 1200 ticks @ 100 Hz) is what saved the boot on
-     * Bay Trail when xHCI deadlocked -- a wedged controller MUST be
-     * contained so the orchestrator still reaches Display + REPL.
+     * Bay Trail (Lenovo 80M4) ordering constraints:
+     *   - Display before USB: a wedged xHCI probe must not leave a frozen
+     *     GRUB cursor with no panel update.
+     *   - USB before Storage: xHCI/LPSS handoff can gate eMMC visibility;
+     *     probing storage before USB left only the xHCI controller in `devices`.
+     *   - Storage before Filesystem: fat32_try_auto_mount() only mounts READY
+     *     devices. Running FS first fell back to empty-looking live memfs and
+     *     never remounted after eMMC came up (installed `ls` looked empty).
      */
+    { "Display / framebuffer",       stage_x64_display,   1, 0, NULL, 1, WD_DISPLAY },
     { "USB host stack",              stage_x64_usb,       1, 0, NULL, 0, WD_USB },
-    /* No splash on the display stage: vesa_boot_splash() inside
-     * framebuffer_bringup() draws the on-panel confirm prompt itself, so
-     * a stage-level splash here would clobber it. */
-    { "Display / framebuffer",       stage_x64_display,   1, 0, NULL, 1, 0 },
-    /*
-     * Phase 3e: in-memory filesystem + VESA desktop bring-up. Both run
-     * AFTER the framebuffer is up. The desktop's first full-screen paint
-     * (inside vdesk_init -> render_desktop) clears any RGB-test-pattern
-     * residue from the splash hand-off, so by the time vesa_desktop_main_loop
-     * runs the panel shows the actual desktop background, not the splash.
-     *
-     * The Filesystem stage carries a small watchdog budget out of an
-     * abundance of caution -- the only failure mode is kmalloc returning
-     * NULL, but if that ever happens we don't want a hung boot.
-     *
-     * The Shell / desktop stage runs vesa_desktop_init() under a 30-s
-     * ceiling. The actual desktop event pump is dispatched outside the
-     * stage table by kernel_main below.
-     */
     { "Kernel heap",                 stage_x64_heap,      0, 0, NULL, 0, 0 },
     { "I2C HID touchpad",            stage_x64_touchpad,  1, 0, NULL, 0, WD_TOUCHPAD },
-    { "Filesystem",                  stage_x64_fs,        1, 0, NULL, 0, 200 },
-    /*
-     * Phase 3f: Storage stage runs after Filesystem + before the desktop
-     * so the install path / `storage` shell command can enumerate
-     * AHCI / NVMe / SDHCI / USB-MSC controllers via the PCI scan that
-     * Hardware summary already kicked off. Bounded by WD_STORAGE so a
-     * stuck AHCI/NVMe initialization is contained.
-     */
-    { "Storage",                     stage_x64_storage,   1, 0, NULL, 0, WD_STORAGE },
+    { "Storage",                     stage_x64_storage,   1, 0, NULL, 0, WD_STORAGE_X64 },
+    { "Filesystem",                  stage_x64_fs,        1, 0, NULL, 0, WD_STORAGE_X64 },
     { "Shell / desktop",             stage_x64_desktop,   1, 0, NULL, 0, WD_DESKTOP },
 };
 
