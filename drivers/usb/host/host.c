@@ -4,6 +4,7 @@
 #include "ehci.h"
 #include "xhci.h"
 #include "../../io/io.h"
+#include "../../diagnostics/driver_log.h"
 
 extern void print(const char* str);
 
@@ -79,6 +80,7 @@ static const usb_host_driver_t host_drivers[] = {
  * diagnostics invisible on `-serial file:` setups (only `-debugcon`
  * captures port 0xE9). */
 static void host_serial(const char* s) {
+    driver_log(s);
     print(s);
     const char* p = s;
     while (*p) { outb(0xE9, *p++); }

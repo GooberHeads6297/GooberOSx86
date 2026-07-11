@@ -1,6 +1,7 @@
 #include "designware.h"
 #include "../pci/pci.h"
 #include "../timer/timer.h"
+#include "../diagnostics/driver_log.h"
 #include "../../lib/string.h"
 
 extern void print(const char* str);
@@ -106,6 +107,7 @@ int i2c_init_controller(int index) {
 
     if (g_ctrl_count <= 0) {
         print("[i2c] no Intel DesignWare/LPSS I2C controller found.\n");
+        driver_log_line("[i2c] no Intel DesignWare/LPSS I2C controller found.");
         return -1;
     }
     if (index < 0 || index >= g_ctrl_count) return -1;
@@ -116,6 +118,7 @@ int i2c_init_controller(int index) {
         uintptr_t mmio = (uintptr_t)(bar & ~0x0FU);
         if (!mmio) {
             print("[i2c] controller has no usable MMIO BAR.\n");
+            driver_log_line("[i2c] controller has no usable MMIO BAR.");
             return -1;
         }
 
@@ -144,6 +147,10 @@ int i2c_init_controller(int index) {
 
         g_bus.ready = 1;
         print("[i2c] Intel DesignWare I2C ready.\n");
+        driver_log("[i2c] Intel DesignWare I2C ready at PCI ");
+        driver_log_u32(g_bus.bus); driver_log(":");
+        driver_log_u32(g_bus.slot); driver_log(":");
+        driver_log_u32(g_bus.func); driver_log("\n");
         return 0;
     }
 }
@@ -154,6 +161,7 @@ int i2c_init(void) {
         if (i2c_init_controller(i) == 0) return 0;
     }
     print("[i2c] controller found but no usable MMIO BAR initialized.\n");
+    driver_log_line("[i2c] controller found but no usable MMIO BAR initialized.");
     return -1;
 }
 

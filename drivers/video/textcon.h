@@ -31,7 +31,9 @@
 typedef enum {
     CON_BACKEND_NONE = 0,
     CON_BACKEND_VGA  = 1,
-    CON_BACKEND_FB   = 2
+    CON_BACKEND_FB   = 2,
+    /* Cell grid only — presented by the VESA VGA-compat console window. */
+    CON_BACKEND_SOFT = 3
 } con_backend_t;
 
 /* Bind the VGA backend (0xB8000). Always succeeds (returns 1); the caller
@@ -46,6 +48,10 @@ int  con_init_vga(void);
  * surfaces are accepted). */
 int  con_init_fb(uintptr_t fb_addr, uint32_t fb_width, uint32_t fb_height,
                  uint32_t fb_pitch, uint8_t fb_bpp);
+
+/* Soft console: keep the 80x25 cell grid without drawing to VGA/FB hardware.
+ * Used when the modern display manager hosts the VGA-compat console window. */
+int  con_init_soft(void);
 
 /* Current backend; CON_BACKEND_NONE before init or if init failed. */
 con_backend_t con_backend(void);

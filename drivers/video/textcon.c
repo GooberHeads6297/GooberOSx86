@@ -133,6 +133,11 @@ static void render_cell(int row, int col) {
         VGA_PLANE[row * CON_COLS + col] = cell;
         return;
     }
+    if (g_backend == CON_BACKEND_SOFT) {
+        /* Presented by the VESA VGA-compat console window. */
+        (void)cell;
+        return;
+    }
     if (g_backend == CON_BACKEND_FB) {
         char    ch   = (char)(cell & 0xFFu);
         uint8_t attr = (uint8_t)(cell >> 8);
@@ -195,6 +200,14 @@ int con_init_fb(uintptr_t fb_addr, uint32_t fb_width, uint32_t fb_height,
         }
     }
     render_all();
+    return 1;
+}
+
+int con_init_soft(void) {
+    uint16_t blank = pack_cell(' ', 0x07u);
+    for (int i = 0; i < CON_ROWS * CON_COLS; i++) g_cells[i] = blank;
+    g_fb_base = NULL;
+    g_backend = CON_BACKEND_SOFT;
     return 1;
 }
 

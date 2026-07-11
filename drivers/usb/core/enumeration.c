@@ -5,6 +5,7 @@
 #include "../usb.h"
 #include "../../timer/timer.h"
 #include "../../io/io.h"
+#include "../../diagnostics/driver_log.h"
 
 extern void print(const char* str);
 
@@ -12,6 +13,7 @@ static void enum_serial(const char* s) {
     while (*s) { outb(0xE9, *s++); }
 }
 static void enum_print(const char* s) {
+    driver_log(s);
     print(s);
     enum_serial(s);
 }

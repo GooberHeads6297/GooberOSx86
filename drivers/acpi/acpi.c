@@ -87,6 +87,58 @@ static int table_contains(const acpi_sdt_header_t* h, const char* needle) {
     return 0;
 }
 
+static void acpi_add_emmc_mmio(uint32_t base, uint32_t length) {
+    int i;
+    if (base < 0x100000U) return; /* reject low / nonsense */
+    if (length < 0x100U || length > 0x10000U) return;
+    if (g_touchpad_info.emmc_mmio_count >= ACPI_EMMC_MAX_MMIO) return;
+    for (i = 0; i < g_touchpad_info.emmc_mmio_count; i++) {
+        if (g_touchpad_info.emmc_mmio[i] == base) return;
+    }
+    g_touchpad_info.emmc_mmio[g_touchpad_info.emmc_mmio_count++] = base;
+}
+
+/*
+ * Crude AML scan: after HID "80860F14", look for Memory32Fixed (0x86) large
+ * resource descriptors and collect plausible SDHCI windows (0x100..0x10000).
+ */
+static void extract_emmc_mmio_near_hid(const acpi_sdt_header_t* h) {
+    const uint8_t* p = (const uint8_t*)h;
+    uint32_t len = h->length;
+    const char* needle = "80860F14";
+    uint32_t nlen = 8;
+    uint32_t i;
+
+    for (i = 0; i + nlen <= len; i++) {
+        uint32_t j = 0;
+        uint32_t end;
+        uint32_t k;
+        while (j < nlen && p[i + j] == (uint8_t)needle[j]) j++;
+        if (j != nlen) continue;
+
+        end = i + 768;
+        if (end > len) end = len;
+        for (k = i; k + 12 <= end; k++) {
+            uint16_t desc_len;
+            uint32_t base;
+            uint32_t res_len;
+            if (p[k] != 0x86U) continue; /* Memory32Fixed large item */
+            desc_len = (uint16_t)(p[k + 1] | ((uint16_t)p[k + 2] << 8));
+            if (desc_len < 9) continue;
+            /* flags at k+3, base at k+4, length at k+8 */
+            base = (uint32_t)p[k + 4] |
+                   ((uint32_t)p[k + 5] << 8) |
+                   ((uint32_t)p[k + 6] << 16) |
+                   ((uint32_t)p[k + 7] << 24);
+            res_len = (uint32_t)p[k + 8] |
+                      ((uint32_t)p[k + 9] << 8) |
+                      ((uint32_t)p[k + 10] << 16) |
+                      ((uint32_t)p[k + 11] << 24);
+            acpi_add_emmc_mmio(base, res_len);
+        }
+    }
+}
+
 static void scan_aml_table(const acpi_sdt_header_t* h) {
     if (!table_valid(h)) return;
     if (table_contains(h, "ELAN0") || table_contains(h, "ELAN1")) {
@@ -97,6 +149,10 @@ static void scan_aml_table(const acpi_sdt_header_t* h) {
         g_touchpad_info.pnp0c50_found = 1;
     }
     if (table_contains(h, "80860F41")) g_touchpad_info.baytrail_i2c_found = 1;
+    if (table_contains(h, "80860F14")) {
+        g_touchpad_info.baytrail_emmc_acpi = 1;
+        extract_emmc_mmio_near_hid(h);
+    }
 }
 
 static void scan_table_pointer(uintptr_t addr);
@@ -139,8 +195,11 @@ void acpi_init(void) {
     g_touchpad_info.elan0601_found = 0;
     g_touchpad_info.pnp0c50_found = 0;
     g_touchpad_info.baytrail_i2c_found = 0;
+    g_touchpad_info.baytrail_emmc_acpi = 0;
     g_touchpad_info.touchpad_i2c_addr = 0;
     g_touchpad_info.hid_desc_reg = 0x0001;
+    g_touchpad_info.emmc_mmio_count = 0;
+    for (int i = 0; i < ACPI_EMMC_MAX_MMIO; i++) g_touchpad_info.emmc_mmio[i] = 0;
 
     acpi_rsdp_t* rsdp = find_rsdp();
     if (!rsdp) {
@@ -170,6 +229,17 @@ void acpi_init(void) {
     print_bool("  ELAN0601: ", g_touchpad_info.elan0601_found);
     print_bool("  PNP0C50: ", g_touchpad_info.pnp0c50_found);
     print_bool("  80860F41 I2C: ", g_touchpad_info.baytrail_i2c_found);
+    print_bool("  80860F14 eMMC: ", g_touchpad_info.baytrail_emmc_acpi);
+    if (g_touchpad_info.emmc_mmio_count > 0) {
+        char buf[16];
+        print("  eMMC MMIO candidates:");
+        for (int i = 0; i < g_touchpad_info.emmc_mmio_count; i++) {
+            print(" ");
+            itoa((int)g_touchpad_info.emmc_mmio[i], buf, 16);
+            print(buf);
+        }
+        print("\n");
+    }
 }
 
 const acpi_touchpad_info_t* acpi_get_touchpad_info(void) {

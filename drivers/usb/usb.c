@@ -5,6 +5,7 @@
 #include "../input/input.h"
 #include "../io/io.h"
 #include "../timer/timer.h"
+#include "../diagnostics/driver_log.h"
 #include "../../kernel.h"
 #include <stddef.h>
 
@@ -74,6 +75,7 @@ static void usb_serial(const char* s) {
 
 /* Replacement for print() that also goes to serial port */
 static void usb_print(const char* s) {
+    driver_log(s);
     print(s);
     usb_serial(s);
 }

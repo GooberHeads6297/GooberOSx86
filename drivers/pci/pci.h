@@ -24,6 +24,18 @@ typedef struct {
     uint32_t bar1;
 } i2c_pci_controller_t;
 
+typedef struct {
+    uint8_t bus;
+    uint8_t slot;
+    uint8_t func;
+    uint8_t class_code;
+    uint8_t sub_class;
+    uint8_t prog_if;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint32_t bar0;
+} sdhci_pci_controller_t;
+
 /*
  * A PCI display controller (base class 0x03). Reports all six raw BARs so a
  * display driver can pick out the linear-framebuffer aperture and the MMIO
@@ -44,6 +56,9 @@ typedef struct {
 void pci_init(void);
 int pci_find_usb_controllers(usb_pci_controller_t* out, int max_out);
 int pci_find_i2c_controllers(i2c_pci_controller_t* out, int max_out);
+int pci_find_sdhci_controllers(sdhci_pci_controller_t* out, int max_out);
+/* Enable PCI memory/IO/bus-master and attempt D0 for a single function. */
+void pci_enable_device(uint8_t bus, uint8_t slot, uint8_t func);
 
 /*
  * Enumerate PCI display controllers (base class 0x03). Returns the number
@@ -56,5 +71,8 @@ uint16_t pci_read_config_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t o
 uint32_t pci_read_config_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
 void pci_write_config_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value);
 void pci_write_config_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value);
+/* Read a PCI memory BAR (handles 32- and 64-bit BARs). Returns 1 on success. */
+int pci_read_mmio_bar(uint8_t bus, uint8_t slot, uint8_t func, uint8_t bar_index,
+                      uint64_t* out_addr);
 
 #endif

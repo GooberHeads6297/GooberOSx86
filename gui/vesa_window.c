@@ -6,7 +6,10 @@
 #include "../drivers/input/touchpad.h"
 #include "../drivers/timer/timer.h"
 #include "../drivers/usb/usb.h"
+#include "../drivers/diagnostics/driver_log.h"
+#include "../drivers/video/display.h"
 #include "../fs/filesystem.h"
+#include "../taskmgr/process.h"
 #include "../lib/string.h"
 #include "../kernel.h"
 
@@ -37,8 +40,32 @@ static int new_bitmap_count = 1;
 static int new_folder_count = 1;
 static int shell_output_color_index = 0;
 static int shell_input_color_index = 0;
+static uint32_t desktop_log_last_version = 0;
+static uint32_t desktop_log_last_sync_tick = 0;
 
 static void clear_icon_selection(void);
+
+static void vdesk_sync_driver_log_file(void) {
+    /*
+     * Automatic Desktop/log.txt rewrites on FAT32/eMMC freeze the UI for
+     * 1–4 seconds (full file rewrite + FAT scan). Keep the in-memory log
+     * for `logs` / `driverlog`; only sync when explicitly requested or on
+     * a cheap live memfs backend.
+     */
+    uint32_t now;
+    uint32_t version;
+    if (fs_is_persistent()) return;
+
+    now = timer_ticks();
+    version = driver_log_version();
+    if (version == desktop_log_last_version) return;
+    /* 60 s at 100 Hz on memfs (cheap); was 10 s and hit FAT too. */
+    if (now - desktop_log_last_sync_tick < 6000U) return;
+    if (driver_log_sync_desktop_file() == 0) {
+        desktop_log_last_version = version;
+        desktop_log_last_sync_tick = now;
+    }
+}
 
 static const VTheme original_theme = {
     0x05090D, 0x061B3A, 0x12325F, 0x071018, 0x7FD88A, 0x254F8E,
@@ -208,6 +235,8 @@ void vdesk_init(int screen_w, int screen_h) {
     desktop.icon_drag_moved = 0;
     desktop.mouse_buttons = 0;
     desktop.running = 1;
+    desktop.status_msg[0] = '\0';
+    desktop.status_until_tick = 0;
     memset(&desktop.metrics, 0, sizeof(desktop.metrics));
     desktop.metrics.theme_mode = desktop.theme_mode;
     desktop.metrics.appearance = desktop.appearance;
@@ -480,6 +509,7 @@ VWindow* vdesk_create_window(const char* title, int x, int y, int w, int h) {
     win->tick_handler = NULL;
     win->click_handler = NULL;
     win->user_data = NULL;
+    win->process_pid = -1;
 
     strncpy(win->title, title, VWINDOW_TITLE_MAX - 1);
     win->title[VWINDOW_TITLE_MAX - 1] = '\0';
@@ -496,6 +526,10 @@ void vdesk_close_window(VWindow* win) {
         vdesk_focus_primary_shell();
         return;
     }
+    if (win->process_pid > 0) {
+        terminate_process(win->process_pid);
+        win->process_pid = -1;
+    }
     win->visible = 0;
     win->minimized = 0;
     mark_window_dirty(win);
@@ -503,6 +537,17 @@ void vdesk_close_window(VWindow* win) {
     desktop.window_count--;
     if (should_auto_focus_primary_shell() && !vdesk_has_active_app_focus())
         vdesk_focus_primary_shell();
+}
+
+void vdesk_close_windows_by_pid(int pid) {
+    int i;
+    if (pid <= 0) return;
+    for (i = 0; i < MAX_VWINDOWS; i++) {
+        VWindow* win = &desktop.windows[i];
+        if (!win->visible) continue;
+        if (win->process_pid == pid)
+            vdesk_close_window(win);
+    }
 }
 
 void vdesk_set_app_launcher(void (*launcher)(VDeskAppId app_id)) {
@@ -573,9 +618,23 @@ static void place_file_icon(VDesktopIcon* icon, int slot) {
  * marked dirty only when the set actually changes (so we never thrash the
  * render loop). Pass force=1 to rebuild unconditionally.
  */
+void vdesk_set_status(const char* msg) {
+    int i;
+    if (!msg) msg = "";
+    for (i = 0; i < (int)sizeof(desktop.status_msg) - 1 && msg[i]; i++)
+        desktop.status_msg[i] = msg[i];
+    desktop.status_msg[i] = '\0';
+    desktop.status_until_tick = timer_ticks() + 300U; /* ~3 s at 100 Hz */
+    vdesk_mark_full_dirty();
+}
+
 void vdesk_refresh_desktop_items(int force) {
-    const Directory* dir = fs_get_desktop_dir();
+    Directory* dir = fs_get_desktop_dir();
     if (!dir) return;
+
+    /* Refresh only the Desktop directory (not the root twice). */
+    if (dir->fat32)
+        fs_dir_refresh(dir);
 
     uint32_t sig = (uint32_t)(dir->child_count * 131 + dir->file_count * 7);
     for (size_t i = 0; i < dir->child_count; i++)
@@ -884,6 +943,14 @@ static void render_taskbar(void) {
         vdesk_draw_text(bx + 6, by + 5, label,
                         active ? VCOLOR_WHITE : t->text, bg);
         slot++;
+    }
+
+    if (desktop.status_msg[0] &&
+        (int32_t)(timer_ticks() - desktop.status_until_tick) < 0) {
+        int sx = desktop.screen_w / 2;
+        vdesk_draw_text(sx, ty + 6, desktop.status_msg, t->accent, t->taskbar_bg);
+    } else if (desktop.status_msg[0]) {
+        desktop.status_msg[0] = '\0';
     }
 }
 
@@ -1288,6 +1355,7 @@ static void context_run_taskbar_item(int item) {
 static void context_run_item(int item) {
     char name[32];
     char num[12];
+    int rc;
 
     if (desktop.context_kind == VCTX_ICON) {
         context_run_icon_item(item);
@@ -1301,12 +1369,21 @@ static void context_run_item(int item) {
     /* New items are placed in the fixed Desktop folder (not whatever directory
      * File Explorer happens to be browsing) so they appear on the desktop. */
     Directory* desk = fs_get_desktop_dir();
+    if (!desk) {
+        vdesk_set_status("Desktop folder unavailable");
+        return;
+    }
 
     if (item == 0) {
         strcpy(name, "NewFolder");
         itoa(new_folder_count++, num, 10);
         strcat(name, num);
-        fs_dir_create_dir(desk, name);
+        rc = fs_dir_create_dir(desk, name);
+        if (rc != 0) {
+            vdesk_set_status("Failed to create folder");
+            return;
+        }
+        vdesk_set_status("Folder created");
         vdesk_refresh_desktop_items(1);
         vdesk_mark_full_dirty();
         return;
@@ -1317,7 +1394,12 @@ static void context_run_item(int item) {
         itoa(new_file_count++, num, 10);
         strcat(name, num);
         strcat(name, ".txt");
-        fs_dir_create(desk, name);
+        rc = fs_dir_create(desk, name);
+        if (rc != 0) {
+            vdesk_set_status("Failed to create text file");
+            return;
+        }
+        vdesk_set_status("Text file created");
         vdesk_refresh_desktop_items(1);
         vdesk_mark_full_dirty();
         return;
@@ -1330,7 +1412,12 @@ static void context_run_item(int item) {
         itoa(new_bitmap_count++, num, 10);
         strcat(name, num);
         strcat(name, ".gbm");
-        fs_dir_write(desk, name, pixels, sizeof(pixels));
+        rc = fs_dir_write(desk, name, pixels, sizeof(pixels));
+        if (rc != 0) {
+            vdesk_set_status("Failed to create bitmap");
+            return;
+        }
+        vdesk_set_status("Bitmap created");
         vdesk_refresh_desktop_items(1);
         vdesk_mark_full_dirty();
         return;
@@ -1664,6 +1751,55 @@ static void handle_events(void) {
 
 /* ---- Main loop ---- */
 
+void vdesk_pump_one_frame(void) {
+    int dirty_x, dirty_y, dirty_w, dirty_h;
+    int dirty_area, screen_area, promote_full, vblank_ok;
+    VWindow* shell;
+
+    if (!desktop.running) return;
+
+    shell = get_window(desktop.primary_shell_id);
+    if (shell)
+        mark_window_dirty(shell);
+    else
+        vdesk_mark_full_dirty();
+
+    if (!desktop.dirty) return;
+
+    dirty_x = desktop.dirty_x1;
+    dirty_y = desktop.dirty_y1;
+    dirty_w = desktop.dirty_x2 - desktop.dirty_x1;
+    dirty_h = desktop.dirty_y2 - desktop.dirty_y1;
+    dirty_area = dirty_w * dirty_h;
+    screen_area = desktop.screen_w * desktop.screen_h;
+    vblank_ok = display_present_vblank_reliable();
+    promote_full = vblank_ok
+                       ? (dirty_area > (screen_area / 2))
+                       : (dirty_area > ((screen_area * 98) / 100));
+    desktop.dirty = 0;
+
+    vesa_set_clip(dirty_x, dirty_y, dirty_w, dirty_h);
+    render_desktop();
+    render_desktop_icons();
+    for (int zi = 0; zi < desktop.z_count; zi++) {
+        VWindow* win = get_window(desktop.z_order[zi]);
+        if (win) render_window(win);
+    }
+    render_taskbar();
+    render_start_menu();
+    render_context_menu();
+    render_rename_modal();
+    render_mouse();
+    vesa_clear_clip();
+
+    if (promote_full) {
+        display_present_note_promotion();
+        display_present_frame();
+    } else {
+        display_present_rect(dirty_x, dirty_y, dirty_w, dirty_h);
+    }
+}
+
 void vdesk_run(void) {
     /*
      * Phase 4 (display polish, item 2): tear-free repaint loop.
@@ -1692,29 +1828,33 @@ void vdesk_run(void) {
 
         usb_poll();
         touchpad_poll();
+        vdesk_sync_driver_log_file();
         update_metrics_pointer();
         handle_keyboard();
         handle_events();
 
         /*
-         * Re-scan the filesystem for desktop items a couple of times per
-         * second so files/folders created via the context menu or by apps
-         * appear without a reboot. The scan only marks the desktop dirty when
-         * the set actually changed, so it does not force redraws.
+         * Re-scan Desktop icons ~1 Hz. Faster polls + FAT refresh on eMMC
+         * caused multi-hundred-ms hitches every few frames after install.
          */
-        if ((uint32_t)(frame_start - desktop.last_scan_tick) >= 25) {
+        if ((uint32_t)(frame_start - desktop.last_scan_tick) >= 100) {
             desktop.last_scan_tick = frame_start;
             vdesk_refresh_desktop_items(0);
         }
 
         /*
-         * Periodically repaint visible windows so live content (clocks, task
-         * manager, FPS counters, blinking cursors) refreshes.
+         * Periodically repaint live windows (taskmgr/metrics). Skip the
+         * fullscreen primary shell — dirtying it promotes a full copy-frame
+         * present (~fullscreen memcpy) and freezes Bay Trail for hundreds ms.
+         * Shell input already marks dirty on keystrokes.
          */
         if ((desktop.metrics.frame_count % 25) == 0) {
             for (int i = 0; i < MAX_VWINDOWS; i++) {
-                if (desktop.windows[i].visible && !desktop.windows[i].minimized)
-                    mark_window_dirty(&desktop.windows[i]);
+                if (!desktop.windows[i].visible || desktop.windows[i].minimized)
+                    continue;
+                if (desktop.windows[i].id == desktop.primary_shell_id)
+                    continue;
+                mark_window_dirty(&desktop.windows[i]);
             }
         }
 
@@ -1730,6 +1870,14 @@ void vdesk_run(void) {
             int dirty_y = desktop.dirty_y1;
             int dirty_w = desktop.dirty_x2 - desktop.dirty_x1;
             int dirty_h = desktop.dirty_y2 - desktop.dirty_y1;
+            int dirty_area = dirty_w * dirty_h;
+            int screen_area = desktop.screen_w * desktop.screen_h;
+            int vblank_ok = display_present_vblank_reliable();
+            int promote_full = vblank_ok
+                             ? (dirty_area > (screen_area / 2))
+                             /* Bay Trail firmware LFB: avoid promoting near-fullscreen
+                              * damage to a full copy-frame memcpy unless truly full. */
+                             : (dirty_area > ((screen_area * 98) / 100));
             desktop.metrics.last_dirty_x = desktop.dirty_x1;
             desktop.metrics.last_dirty_y = desktop.dirty_y1;
             desktop.metrics.last_dirty_w = dirty_w;
@@ -1763,8 +1911,18 @@ void vdesk_run(void) {
             desktop.metrics.render_ticks = timer_ticks() - render_start;
 
             swap_start = timer_ticks();
-            /* Publish only the invalidated rectangle when a back-buffer exists. */
-            vesa_swap_rect(dirty_x, dirty_y, dirty_w, dirty_h);
+            /*
+             * Publish through the display framework so hardware-specific
+             * drivers can wait for vblank or page-flip. Generic VM/firmware
+             * framebuffers favor dirty rects for speed; full-frame publish is
+             * reserved for near-fullscreen damage or reliable vblank paths.
+             */
+            if (promote_full) {
+                display_present_note_promotion();
+                display_present_frame();
+            } else {
+                display_present_rect(dirty_x, dirty_y, dirty_w, dirty_h);
+            }
             desktop.metrics.swap_ticks = timer_ticks() - swap_start;
         } else {
             desktop.metrics.skipped_frames++;
@@ -1793,6 +1951,15 @@ void vdesk_run(void) {
         desktop.metrics.window_count = desktop.window_count;
         desktop.metrics.icon_count = desktop.icon_count;
         desktop.metrics.theme_mode = desktop.theme_mode;
+        {
+            const display_present_stats_t* ps = display_get_present_stats();
+            desktop.metrics.present_count = ps->present_count;
+            desktop.metrics.vblank_waits = ps->vblank_waits;
+            desktop.metrics.vblank_misses = ps->vblank_misses;
+            desktop.metrics.present_area = ps->last_dirty_area;
+            desktop.metrics.present_mode = (int)ps->last_mode;
+            desktop.metrics.promoted_frames = (int)ps->promoted_frames;
+        }
         if (desktop.metrics.frame_ticks > 0) {
             desktop.metrics.fps = 100 / desktop.metrics.frame_ticks;
         }

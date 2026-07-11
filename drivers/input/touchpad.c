@@ -3,6 +3,7 @@
 #include "../acpi/acpi.h"
 #include "../hid/i2c_hid.h"
 #include "../i2c/i2c.h"
+#include "../diagnostics/driver_log.h"
 #include "../../lib/string.h"
 
 extern void print(const char* str);
@@ -68,15 +69,18 @@ void touchpad_init(void) {
     int baytrail_probe = info && info->baytrail_i2c_found;
     if (!acpi_match && !baytrail_probe) {
         print("[touchpad] no ACPI HID-over-I2C touchpad found.\n");
+        driver_log_line("[touchpad] no ACPI HID-over-I2C touchpad found.");
         return;
     }
     if (!acpi_match && baytrail_probe) {
         print("[touchpad] no exact ACPI match; probing Bay Trail I2C for touchpad.\n");
+        driver_log_line("[touchpad] no exact ACPI match; probing Bay Trail I2C for touchpad.");
     }
 
     int controllers = i2c_controller_count();
     if (controllers <= 0) {
         print("[touchpad] no I2C controllers available.\n");
+        driver_log_line("[touchpad] no I2C controllers available.");
         return;
     }
 
@@ -109,6 +113,7 @@ void touchpad_init(void) {
 
     if (!i2c_hid_get_device()->ready) {
         print("[touchpad] HID-over-I2C init failed on all controllers.\n");
+        driver_log_line("[touchpad] HID-over-I2C init failed on all controllers.");
         return;
     }
 
@@ -120,6 +125,11 @@ void touchpad_init(void) {
     print("x");
     print_dec(g_tp.max_y);
     print("\n");
+    driver_log("[touchpad] I2C HID touchpad ready, range ");
+    driver_log_u32((uint32_t)g_tp.max_x);
+    driver_log("x");
+    driver_log_u32((uint32_t)g_tp.max_y);
+    driver_log("\n");
 }
 
 int touchpad_ready(void) {

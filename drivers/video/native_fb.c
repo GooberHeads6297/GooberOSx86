@@ -1,7 +1,9 @@
 #include "native_fb.h"
 #include "display.h"
+#include "intel_gfx.h"
 #include "../io/io.h"
 #include "../pci/pci.h"
+#include <stddef.h>
 
 /* ===================================================================== *
  *  Shared helpers                                                       *
@@ -126,7 +128,26 @@ static const display_driver_ops_t simplefb_ops = {
     "vesa",
     DISPLAY_DRIVER_VESA_LFB,
     simplefb_probe,
-    simplefb_init
+    simplefb_init,
+    intel_gfx_wait_vblank,
+    NULL,
+    NULL,
+    NULL
+};
+
+/*
+ * Basic Display Adapter: same firmware LFB adopt as "vesa", but no Intel
+ * vblank wait and no modeset. Selected via gooberos.display=basic.
+ */
+static const display_driver_ops_t basicfb_ops = {
+    "basic",
+    DISPLAY_DRIVER_BASIC_LFB,
+    simplefb_probe,
+    simplefb_init,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 
 /* ===================================================================== *
@@ -290,7 +311,11 @@ static const display_driver_ops_t bochs_ops = {
     "bochs",
     DISPLAY_DRIVER_NATIVE_GENERIC,
     bochs_probe,
-    bochs_init
+    bochs_init,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 
 /* ===================================================================== *
@@ -298,7 +323,8 @@ static const display_driver_ops_t bochs_ops = {
  * ===================================================================== */
 
 void native_fb_register_drivers(void) {
-    /* Priority order: inherited GRUB LFB first, then the dispi fallback. */
+    /* Priority: basic (firmware FB, no vblank) then vesa, then dispi. */
+    display_register_driver(&basicfb_ops);
     display_register_driver(&simplefb_ops);
     display_register_driver(&bochs_ops);
 }

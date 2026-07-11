@@ -4,6 +4,7 @@
 #include "../io/io.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Forward-declared hook into gui/vga_passthrough.c. The shim toggles this
  * (1=active, 0=inactive) and provides a redirect target for legacy 0xB8000
@@ -408,7 +409,11 @@ static const display_driver_ops_t vga_graphics_ops = {
     "vga-graphics",
     DISPLAY_DRIVER_VGA_GRAPHICS,
     vga_graphics_probe,
-    vga_graphics_drv_init
+    vga_graphics_drv_init,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 
 void vga_graphics_register_driver(void) {
