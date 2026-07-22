@@ -255,7 +255,14 @@ msg_no_lm:    db "GooberOSx86 boot64: FATAL: long mode (CPUID.80000001:EDX.LM) a
 section .bss
 ; 4 KiB-aligned page tables for the low-4-GiB identity map. Each table is
 ; one full 4 KiB frame so it is naturally aligned and trivially indexable.
+; Exported so fb_pat.c can retarget the GOP framebuffer PDEs to PAT WC.
 align 4096
+global pml4
+global pdpt
+global pd0
+global pd1
+global pd2
+global pd3
 pml4: resb 4096
 pdpt: resb 4096
 pd0:  resb 4096

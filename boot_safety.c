@@ -208,9 +208,15 @@ static void bs_print_ids(uint16_t vendor, uint16_t device) {
     bs_serial("]");
 }
 
+/* Panel-visible progress blocks (defined in kernel.c). Rows 18-21 sit below
+ * the pre-display stage trace so a hang inside a specific PCI sub-scan is
+ * pinpointed on real hardware where serial is unavailable. */
+extern void kernel_fbdbg_block(uint32_t row, uint32_t rgb);
+
 void boot_print_hardware_summary(void) {
     bs_out("\n=== Hardware summary (PCI, lspci-style) ===\n");
 
+    kernel_fbdbg_block(18, 0xFF00FF); /* magenta: display-controller scan */
     pci_display_device_t disp[8];
     int nd = pci_find_display_controllers(disp, 8);
     bs_out("Display controllers: ");
@@ -224,6 +230,7 @@ void boot_print_hardware_summary(void) {
         bs_out("\n");
     }
 
+    kernel_fbdbg_block(19, 0xFFFFFF); /* white: USB-controller scan */
     usb_pci_controller_t usbc[8];
     int nu = pci_find_usb_controllers(usbc, 8);
     bs_out("USB controllers: ");
@@ -238,4 +245,19 @@ void boot_print_hardware_summary(void) {
         bs_print_ids(usbc[i].vendor_id, usbc[i].device_id);
         bs_out("\n");
     }
+
+    kernel_fbdbg_block(20, 0x808080); /* gray: SDHCI/eMMC scan */
+    sdhci_pci_controller_t sdhc[8];
+    int ns = pci_find_sdhci_controllers(sdhc, 8);
+    bs_out("SDHCI/eMMC controllers: ");
+    bs_out_dec(ns);
+    bs_out("\n");
+    for (int i = 0; i < ns && i < 8; i++) {
+        bs_out("  ");
+        bs_print_bdf(sdhc[i].bus, sdhc[i].slot, sdhc[i].func);
+        bs_out(" sdhci ");
+        bs_print_ids(sdhc[i].vendor_id, sdhc[i].device_id);
+        bs_out("\n");
+    }
+    kernel_fbdbg_block(21, 0x00FF00); /* green: hardware summary complete */
 }

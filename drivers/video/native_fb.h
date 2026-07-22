@@ -9,10 +9,11 @@
  *
  * Two drivers live here:
  *
- *   "vesa"  - the inherited / simple-framebuffer driver. It adopts whatever
- *             linear framebuffer the bootloader (GRUB VBE) already handed us,
- *             formalizing the legacy boot path through the framework. This is
- *             registered first so a GRUB-provided LFB always wins.
+ *   "basic" - Basic Display Adapter: firmware/GRUB LFB only, no modeset and
+ *             no vblank wait. Preferred on real Intel laptops.
+ *
+ *   "vesa"  - the inherited / simple-framebuffer driver (same LFB adopt as
+ *             basic, but may wait on Intel vblank for present pacing).
  *
  *   "bochs" - the Bochs/QEMU "Bochs Dispi" (BGA) / stdvga VBE-extension
  *             driver. When GRUB did not hand us a usable framebuffer, this can

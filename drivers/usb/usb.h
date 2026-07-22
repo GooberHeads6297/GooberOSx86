@@ -43,11 +43,18 @@ int usb_has_touchpad_device(void);
 #define USB_CLASS_PER_INTERFACE    0
 #define USB_CLASS_COMM             2
 #define USB_CLASS_HID              3
+#define USB_CLASS_MASS_STORAGE     0x08
 
 /* HID subclass / protocol */
 #define USB_HID_SUBCLASS_BOOT      1
 #define USB_HID_PROTOCOL_KEYBOARD  1
 #define USB_HID_PROTOCOL_MOUSE     2
+
+/* MSC (Bulk-Only Transport) subclass / protocol */
+#define USB_MSC_SUBCLASS_SCSI      0x06
+#define USB_MSC_PROTOCOL_BOT       0x50
+/* Enumeration return tag for BOT MSC (distinct from HID protocol values). */
+#define USB_ENUM_PROTOCOL_MSC      0x50
 
 /* Request type: direction bits */
 #define USB_DIR_OUT                0
@@ -141,6 +148,7 @@ typedef struct {
     uint8_t  class_code;
     uint8_t  subclass;
     uint8_t  protocol;
+    uint8_t  interface_number;
     uint8_t  max_packet_size;
     uint8_t  ep_in;          /* IN endpoint address for interrupt */
     uint8_t  ep_out;         /* OUT endpoint address */

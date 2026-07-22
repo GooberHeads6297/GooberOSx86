@@ -1,0 +1,13 @@
+# Welcome To GooberOS — first GooberC GUI app (install-only).
+use goober.gui
+app gui
+
+window "Welcome To GooberOS" 440x260
+text "Welcome To GooberOS"
+text ""
+text "Thanks for installing GooberOS."
+text "Build apps with GooberC (.gc -> .gob)."
+text ""
+text "Click anywhere in this window to close."
+wait
+exit

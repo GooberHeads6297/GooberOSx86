@@ -1,0 +1,4 @@
+# GooberOS boot configuration (installed volume only).
+# HideGRUB=true  -> GRUB menu hidden (timeout 0, auto Smart boot)
+# HideGRUB=false -> GRUB menu shown (timeout 3)
+HideGRUB=false

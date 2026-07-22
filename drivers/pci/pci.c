@@ -1,6 +1,7 @@
 #include "pci.h"
 #include "../io/io.h"
 #include "../video/vga.h"
+#include "../diagnostics/driver_log.h"
 #include "../../lib/string.h"
 
 #define PCI_CONFIG_ADDRESS 0xCF8
@@ -50,6 +51,28 @@ void pci_write_config_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off
     outl(PCI_CONFIG_DATA, value);
 }
 
+int pci_read_mmio_bar(uint8_t bus, uint8_t slot, uint8_t func, uint8_t bar_index,
+                      uint64_t* out_addr) {
+    uint8_t off;
+    uint32_t lo;
+    uint32_t hi;
+
+    if (bar_index > 5 || !out_addr) return 0;
+    off = (uint8_t)(0x10 + bar_index * 4U);
+    lo = pci_read_config_dword(bus, slot, func, off);
+    if (lo == 0 || lo == 0xFFFFFFFFU) return 0;
+    if (lo & 0x1U) return 0; /* I/O space */
+
+    if (lo & 0x4U) {
+        hi = pci_read_config_dword(bus, slot, func, (uint8_t)(off + 4U));
+        *out_addr = ((uint64_t)hi << 32) | ((uint64_t)lo & ~0xFULL);
+        return 1;
+    }
+
+    *out_addr = (uint64_t)(lo & ~0xFULL);
+    return 1;
+}
+
 static const char* usb_prog_if_name(uint8_t prog_if) {
     if (prog_if == 0x00) return "UHCI";
     if (prog_if == 0x10) return "OHCI";
@@ -58,12 +81,124 @@ static const char* usb_prog_if_name(uint8_t prog_if) {
     return "Unknown";
 }
 
+/*
+ * How many functions to probe on (bus, slot):
+ *   0 -> slot empty (function 0 absent), skip entirely
+ *   1 -> single-function device
+ *   8 -> multifunction device (header-type bit 7 set)
+ *
+ * CRITICAL for real hardware: the old scanners blindly read all 8 functions of
+ * every slot. Probing a *phantom* function (function >0 on a single-function
+ * device, or any function of an absent device) can raise a master abort that
+ * some firmware routes through SMM; a buggy Braswell SMM handler (Acer
+ * R3-131T) spins there and hard-hangs the CPU bus, defeating the boot
+ * watchdog. Honouring the multifunction bit avoids ever touching those
+ * phantom functions.
+ */
+static uint8_t pci_slot_functions(uint16_t bus, uint8_t slot) {
+    uint32_t id0 = pci_read_config_dword((uint8_t)bus, slot, 0, 0x00);
+    uint16_t vendor0 = (uint16_t)(id0 & 0xFFFFU);
+    uint8_t htype;
+    if (vendor0 == 0xFFFFU || vendor0 == 0x0000U) return 0;
+    htype = pci_read_config_byte((uint8_t)bus, slot, 0, 0x0E);
+    return (htype & 0x80U) ? 8U : 1U;
+}
+
+/*
+ * Set of PCI buses that actually exist, discovered by following bridges from
+ * bus 0. This is a bitmap of 256 bits (one per bus number).
+ *
+ * CRITICAL for real hardware (Acer R3-131T / Braswell): firmware only
+ * populates bus 0 plus whatever lives behind PCI-to-PCI bridges. Blindly
+ * walking buses 0..255 issues config reads to non-existent high buses; the
+ * resulting master abort is routed through a Braswell SMM handler that spins
+ * and hard-hangs the CPU (the boot watchdog can't fire because interrupts are
+ * blocked). By enumerating only reachable buses we never touch phantom bus
+ * numbers.
+ */
+static uint8_t g_bus_valid[32];
+static int g_bus_discovered = 0;
+
+static void pci_bus_mark(uint8_t bus) {
+    g_bus_valid[bus >> 3] = (uint8_t)(g_bus_valid[bus >> 3] | (1u << (bus & 7)));
+}
+
+static int pci_bus_is_valid(uint8_t bus) {
+    return (g_bus_valid[bus >> 3] >> (bus & 7)) & 1u;
+}
+
+static void pci_discover_buses(void) {
+    uint8_t worklist[256];
+    uint8_t queued[32];
+    int wl_head = 0;
+    int wl_tail = 0;
+
+    if (g_bus_discovered) return;
+
+    for (int i = 0; i < 32; i++) { g_bus_valid[i] = 0; queued[i] = 0; }
+
+    /* Bus 0 is always present on the root complex. */
+    worklist[wl_tail++] = 0;
+    queued[0] |= 1u;
+
+    while (wl_head < wl_tail) {
+        uint8_t bus = worklist[wl_head++];
+        pci_bus_mark(bus);
+
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            uint8_t nfuncs = pci_slot_functions(bus, slot);
+            for (uint8_t func = 0; func < nfuncs; func++) {
+                uint32_t id = pci_read_config_dword(bus, slot, func, 0x00);
+                if ((id & 0xFFFFU) == 0xFFFFU) continue;
+
+                /* Header type 0x01 (masking the multifunction bit) => PCI-to-PCI bridge. */
+                uint8_t htype = (uint8_t)(pci_read_config_byte(bus, slot, func, 0x0E) & 0x7FU);
+                if (htype == 0x01) {
+                    uint8_t sec = pci_read_config_byte(bus, slot, func, 0x19);
+                    if (sec != 0 && sec != bus && !((queued[sec >> 3] >> (sec & 7)) & 1u)) {
+                        queued[sec >> 3] = (uint8_t)(queued[sec >> 3] | (1u << (sec & 7)));
+                        if (wl_tail < 256) worklist[wl_tail++] = sec;
+                    }
+                }
+            }
+        }
+    }
+
+    g_bus_discovered = 1;
+}
+
+int pci_for_each_device(pci_device_cb_t cb, void* ctx) {
+    int visited = 0;
+
+    if (!cb) return 0;
+    pci_discover_buses();
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        if (!pci_bus_is_valid((uint8_t)bus)) continue;
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            uint8_t nfuncs = pci_slot_functions(bus, slot);
+            for (uint8_t func = 0; func < nfuncs; func++) {
+                uint32_t id = pci_read_config_dword((uint8_t)bus, slot, func, 0x00);
+                uint16_t vendor_id = (uint16_t)(id & 0xFFFFU);
+                uint16_t device_id = (uint16_t)((id >> 16) & 0xFFFFU);
+                if (vendor_id == 0xFFFFU || vendor_id == 0x0000U) continue;
+                visited++;
+                if (cb((uint8_t)bus, slot, func, vendor_id, device_id, ctx))
+                    return visited;
+            }
+        }
+    }
+    return visited;
+}
+
 int pci_find_usb_controllers(usb_pci_controller_t* out, int max_out) {
     int found = 0;
 
+    pci_discover_buses();
     for (uint16_t bus = 0; bus < 256; bus++) {
+        if (!pci_bus_is_valid((uint8_t)bus)) continue;
         for (uint8_t slot = 0; slot < 32; slot++) {
-            for (uint8_t func = 0; func < 8; func++) {
+            uint8_t nfuncs = pci_slot_functions(bus, slot);
+            for (uint8_t func = 0; func < nfuncs; func++) {
                 uint32_t vendor_id = pci_read_config_dword(bus, slot, func, 0) & 0xFFFF;
                 if (vendor_id != 0xFFFF) {
                     uint32_t class_code = pci_read_config_dword(bus, slot, func, 0x08);
@@ -92,12 +227,64 @@ int pci_find_usb_controllers(usb_pci_controller_t* out, int max_out) {
     return found;
 }
 
+static int pci_is_intel_lpss_i2c(uint16_t vendor_id, uint16_t device_id,
+                                 uint8_t base_class, uint8_t sub_class) {
+    if (vendor_id == 0x8086) {
+        /* Bay Trail LPSS I2C controller IDs are commonly 0x0F41..0x0F45. */
+        if (device_id >= 0x0F41 && device_id <= 0x0F45) return 1;
+        /* Many Intel LPSS I2C devices report as "serial bus, other". */
+        if (base_class == 0x0C && sub_class == 0x80) return 1;
+    }
+    return 0;
+}
+
+int pci_find_i2c_controllers(i2c_pci_controller_t* out, int max_out) {
+    int found = 0;
+
+    pci_discover_buses();
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        if (!pci_bus_is_valid((uint8_t)bus)) continue;
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            uint8_t nfuncs = pci_slot_functions(bus, slot);
+            for (uint8_t func = 0; func < nfuncs; func++) {
+                uint32_t id = pci_read_config_dword(bus, slot, func, 0);
+                uint16_t vendor_id = (uint16_t)(id & 0xFFFF);
+                uint16_t device_id = (uint16_t)((id >> 16) & 0xFFFF);
+                if (vendor_id == 0xFFFF) continue;
+
+                uint32_t class_code = pci_read_config_dword(bus, slot, func, 0x08);
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                uint8_t sub_class = (class_code >> 16) & 0xFF;
+
+                if (!pci_is_intel_lpss_i2c(vendor_id, device_id, base_class, sub_class)) {
+                    continue;
+                }
+
+                if (out && found < max_out) {
+                    out[found].bus = (uint8_t)bus;
+                    out[found].slot = slot;
+                    out[found].func = func;
+                    out[found].vendor_id = vendor_id;
+                    out[found].device_id = device_id;
+                    out[found].bar0 = pci_read_config_dword(bus, slot, func, 0x10);
+                    out[found].bar1 = pci_read_config_dword(bus, slot, func, 0x14);
+                }
+                found++;
+            }
+        }
+    }
+    return found;
+}
+
 int pci_find_display_controllers(pci_display_device_t* out, int max_out) {
     int found = 0;
 
+    pci_discover_buses();
     for (uint16_t bus = 0; bus < 256; bus++) {
+        if (!pci_bus_is_valid((uint8_t)bus)) continue;
         for (uint8_t slot = 0; slot < 32; slot++) {
-            for (uint8_t func = 0; func < 8; func++) {
+            uint8_t nfuncs = pci_slot_functions(bus, slot);
+            for (uint8_t func = 0; func < nfuncs; func++) {
                 uint32_t vendor_id = pci_read_config_dword(bus, slot, func, 0) & 0xFFFF;
                 if (vendor_id == 0xFFFF) continue;
 
@@ -126,13 +313,103 @@ int pci_find_display_controllers(pci_display_device_t* out, int max_out) {
     return found;
 }
 
+#define PCI_COMMAND_OFFSET 0x04
+#define PCI_COMMAND_MEMORY 0x0002
+#define PCI_COMMAND_IO     0x0001
+#define PCI_COMMAND_BUSMASTER 0x0004
+
+void pci_enable_device(uint8_t bus, uint8_t slot, uint8_t func) {
+    uint8_t cap_ptr;
+    uint16_t cmd;
+
+    cmd = pci_read_config_word(bus, slot, func, PCI_COMMAND_OFFSET);
+    cmd = (uint16_t)(cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_IO | PCI_COMMAND_BUSMASTER);
+    pci_write_config_word(bus, slot, func, PCI_COMMAND_OFFSET, cmd);
+
+    cap_ptr = pci_read_config_byte(bus, slot, func, 0x34);
+    for (int guard = 0; guard < 48 && cap_ptr >= 0x40; guard++) {
+        uint8_t cap_id = pci_read_config_byte(bus, slot, func, cap_ptr);
+        if (cap_id == 0x01) {
+            uint16_t pmcsr = pci_read_config_word(bus, slot, func, (uint8_t)(cap_ptr + 4));
+            pmcsr = (uint16_t)(pmcsr & ~0x0003U);
+            pci_write_config_word(bus, slot, func, (uint8_t)(cap_ptr + 4), pmcsr);
+            break;
+        }
+        cap_ptr = pci_read_config_byte(bus, slot, func, (uint8_t)(cap_ptr + 1));
+        if (cap_ptr == 0) break;
+    }
+}
+
+static int pci_is_intel_sdhci_id(uint16_t vendor_id, uint16_t device_id) {
+    if (vendor_id != 0x8086U) return 0;
+    return device_id == 0x0F14U || device_id == 0x0F15U || device_id == 0x0F16U ||
+           device_id == 0x0F50U || device_id == 0x0F51U || device_id == 0x0F52U ||
+           device_id == 0x2294U || device_id == 0x2295U || device_id == 0x2296U;
+}
+
+static int pci_is_sdhci_class(uint8_t base_class, uint8_t sub_class) {
+    return base_class == 0x08 && sub_class == 0x05;
+}
+
+int pci_find_sdhci_controllers(sdhci_pci_controller_t* out, int max_out) {
+    int found = 0;
+
+    pci_discover_buses();
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        if (!pci_bus_is_valid((uint8_t)bus)) continue;
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            uint8_t nfuncs = pci_slot_functions(bus, slot);
+            for (uint8_t func = 0; func < nfuncs; func++) {
+                uint32_t id = pci_read_config_dword((uint8_t)bus, slot, func, 0x00);
+                uint16_t vendor_id = (uint16_t)(id & 0xFFFFU);
+                uint16_t device_id = (uint16_t)((id >> 16) & 0xFFFFU);
+                uint8_t base_class;
+                uint8_t sub_class;
+                uint8_t prog_if;
+
+                if (vendor_id == 0xFFFFU || vendor_id == 0x0000U) continue;
+
+                base_class = pci_read_config_byte((uint8_t)bus, slot, func, 0x0B);
+                sub_class = pci_read_config_byte((uint8_t)bus, slot, func, 0x0A);
+                prog_if = pci_read_config_byte((uint8_t)bus, slot, func, 0x09);
+
+                if (!pci_is_sdhci_class(base_class, sub_class) &&
+                    !pci_is_intel_sdhci_id(vendor_id, device_id))
+                    continue;
+
+                if (out && found < max_out) {
+                    out[found].bus = (uint8_t)bus;
+                    out[found].slot = slot;
+                    out[found].func = func;
+                    out[found].class_code = base_class;
+                    out[found].sub_class = sub_class;
+                    out[found].prog_if = prog_if;
+                    out[found].vendor_id = vendor_id;
+                    out[found].device_id = device_id;
+                    {
+                        uint64_t bar64 = 0;
+                        if (pci_read_mmio_bar((uint8_t)bus, slot, func, 0, &bar64))
+                            out[found].bar0 = (uint32_t)bar64;
+                        else
+                            out[found].bar0 = pci_read_config_dword((uint8_t)bus, slot, func, 0x10);
+                    }
+                }
+                found++;
+            }
+        }
+    }
+    return found;
+}
+
 static void pci_check_usb(void) {
     usb_pci_controller_t controllers[8];
     int found = pci_find_usb_controllers(controllers, 8);
 
     print("Scanning PCI bus for USB controllers...\n");
+    driver_log_line("[pci] scanning for USB controllers.");
     if (found <= 0) {
         print("No USB controllers found.\n");
+        driver_log_line("[pci] no USB controllers found.");
         return;
     }
 
@@ -145,9 +422,23 @@ static void pci_check_usb(void) {
         print(" (Type: ");
         print(usb_prog_if_name(controllers[i].prog_if));
         print(")\n");
+        driver_log("[pci] USB ");
+        driver_log(usb_prog_if_name(controllers[i].prog_if));
+        driver_log(" controller at ");
+        driver_log_u32(controllers[i].bus);
+        driver_log(":");
+        driver_log_u32(controllers[i].slot);
+        driver_log(":");
+        driver_log_u32(controllers[i].func);
+        driver_log(" vendor=");
+        driver_log_hex32(controllers[i].vendor_id);
+        driver_log(" device=");
+        driver_log_hex32(controllers[i].device_id);
+        driver_log("\n");
     }
 
     print("USB hardware detected.\n");
+    driver_log_line("[pci] USB hardware detected.");
 }
 
 void pci_init(void) {

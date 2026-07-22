@@ -70,17 +70,31 @@ typedef struct {
 
 void storage_init(void);
 void storage_scan(void);
+/* Probe deferred SDHCI controllers (eMMC) if not already brought up. */
+void storage_probe_sdhci(void);
+/* Boot log: list SDHCI/eMMC PCI nodes and probe state. */
+void storage_print_hw_summary(void);
+/* Dump PCI storage/USB/Intel-0Fxx nodes for hardware bring-up. */
+void storage_print_pci_inventory(void);
 int storage_count(void);
 const storage_device_info_t* storage_get(int index);
 int storage_target_count(void);
 const storage_device_info_t* storage_get_target(int index);
 int storage_read_sector(const storage_device_info_t* device, uint32_t lba, void* out_sector);
+int storage_read_optical_sector(const storage_device_info_t* device, uint32_t lba,
+                                void* out_sector);
 int storage_write_sector(const storage_device_info_t* device, uint32_t lba, const void* in_sector);
+int storage_write_sectors(const storage_device_info_t* device, uint32_t lba,
+                          const void* in_sectors, uint32_t count);
 int storage_flush(const storage_device_info_t* device);
 const char* storage_backend_name(uint8_t backend);
 const char* storage_install_state_name(uint8_t state);
 const char* storage_install_state_reason(const storage_device_info_t* device);
 const char* storage_bus_name(uint8_t bus);
 const char* storage_type_name(uint8_t type);
+
+/* USB MSC LUN registration (hotplug). Returns storage index or -1. */
+int storage_register_usb_msc(int port, uint64_t sectors, const char* model);
+void storage_unregister_usb_msc(int storage_index);
 
 #endif

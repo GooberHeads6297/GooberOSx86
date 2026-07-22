@@ -13,6 +13,33 @@ static uint32_t backbuffer_bytes = 0;
 static uint8_t  fb_bpp = 0;
 static int vesa_initialized = 0;
 static int use_backbuffer = 0;
+static int clip_enabled = 0;
+static int clip_x1 = 0, clip_y1 = 0, clip_x2 = 0, clip_y2 = 0;
+
+static int vesa_clip_rect(int* x, int* y, int* w, int* h) {
+    int x2 = *x + *w;
+    int y2 = *y + *h;
+    if (*x < 0) *x = 0;
+    if (*y < 0) *y = 0;
+    if ((uint32_t)x2 > fb_width) x2 = (int)fb_width;
+    if ((uint32_t)y2 > fb_height) y2 = (int)fb_height;
+    if (clip_enabled) {
+        if (*x < clip_x1) *x = clip_x1;
+        if (*y < clip_y1) *y = clip_y1;
+        if (x2 > clip_x2) x2 = clip_x2;
+        if (y2 > clip_y2) y2 = clip_y2;
+    }
+    *w = x2 - *x;
+    *h = y2 - *y;
+    return *w > 0 && *h > 0;
+}
+
+static int vesa_point_visible(int x, int y) {
+    if (x < 0 || y < 0 || (uint32_t)x >= fb_width || (uint32_t)y >= fb_height)
+        return 0;
+    if (!clip_enabled) return 1;
+    return x >= clip_x1 && x < clip_x2 && y >= clip_y1 && y < clip_y2;
+}
 
 static inline uint32_t rgb888_to_rgb565(uint32_t color) {
     uint32_t r = (color >> 16) & 0xFF;
@@ -61,6 +88,7 @@ void vesa_init(uint64_t fb_addr, uint32_t width, uint32_t height, uint32_t pitch
     backbuffer = NULL;
     backbuffer_bytes = 0;
     use_backbuffer = 0;
+    clip_enabled = 0;
     vesa_initialized = 1;
     display_pixel_format_t fmt = DISPLAY_FORMAT_UNKNOWN;
     if (bpp == 32) fmt = DISPLAY_FORMAT_XRGB8888;
@@ -102,9 +130,9 @@ void vesa_set_backbuffer_bytes(uint32_t* buffer, uint32_t bytes) {
  */
 void vesa_swap(void) {
     if (!use_backbuffer || !framebuffer || !backbuffer) return;
-    /* The pitch already includes any per-row padding the firmware chose, so
-     * copying `pitch * height` bytes is the canonical full-screen swap. */
     memcpy((void*)framebuffer, backbuffer, fb_pitch * fb_height);
+    /* Flush WC stores so the panel sees this frame (PAT WC / ioremap_wc). */
+    __asm__ volatile("sfence" ::: "memory");
 }
 
 /*
@@ -118,15 +146,13 @@ void vesa_present(void) {
 }
 
 void vesa_swap_rect(int x, int y, int w, int h) {
-    /*
-     * Phase 4: kept as a thin compatibility shim. The desktop's per-frame
-     * present is now whole-screen (vesa_present), but the existing dirty-
-     * rect machinery in gui/vesa_window.c still calls vesa_swap_rect for
-     * partial composites. Route it to a partial copy when a back-buffer
-     * is armed, no-op otherwise.
-     */
-    if (!use_backbuffer || !framebuffer || !backbuffer) return;
     if (w <= 0 || h <= 0) return;
+    (void)vesa_swap_rect_rows(x, y, w, h, h);
+}
+
+int vesa_swap_rect_rows(int x, int y, int w, int h, int max_rows) {
+    if (!use_backbuffer || !framebuffer || !backbuffer) return 0;
+    if (w <= 0 || h <= 0 || max_rows <= 0) return 0;
 
     int x2 = x + w;
     int y2 = y + h;
@@ -134,20 +160,26 @@ void vesa_swap_rect(int x, int y, int w, int h) {
     if (y < 0) y = 0;
     if ((uint32_t)x2 > fb_width) x2 = fb_width;
     if ((uint32_t)y2 > fb_height) y2 = fb_height;
-    if (x >= x2 || y >= y2) return;
+    if (x >= x2 || y >= y2) return 0;
 
     uint32_t bytes_per_px;
     if (fb_bpp == 32) bytes_per_px = 4;
     else if (fb_bpp == 24) bytes_per_px = 3;
     else if (fb_bpp == 16 || fb_bpp == 15) bytes_per_px = 2;
-    else return;
+    else return 0;
 
     uint32_t bytes = (uint32_t)(x2 - x) * bytes_per_px;
-    for (int row = y; row < y2; row++) {
+    int rows_left = y2 - y;
+    if (rows_left > max_rows) rows_left = max_rows;
+
+    for (int i = 0; i < rows_left; i++) {
+        int row = y + i;
         uint8_t* dst = (uint8_t*)framebuffer + row * fb_pitch + x * bytes_per_px;
         uint8_t* src = backbuffer + row * fb_pitch + x * bytes_per_px;
         memcpy(dst, src, bytes);
     }
+    __asm__ volatile("sfence" ::: "memory");
+    return rows_left;
 }
 
 uint32_t vesa_get_width(void) { return fb_width; }
@@ -160,36 +192,46 @@ int vesa_has_backbuffer(void) { return use_backbuffer; }
 int vesa_is_initialized(void) { return vesa_initialized; }
 
 void vesa_put_pixel(int x, int y, uint32_t color) {
+    if (!vesa_point_visible(x, y)) return;
     vesa_write_pixel_raw(vesa_draw_target(), x, y, color);
 }
 
 void vesa_fill_rect(int x, int y, int w, int h, uint32_t color) {
-    int x2 = x + w;
-    int y2 = y + h;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if ((uint32_t)x2 > fb_width) x2 = fb_width;
-    if ((uint32_t)y2 > fb_height) y2 = fb_height;
-
-    int width = x2 - x;
-    if (width <= 0 || y >= y2) return;
+    if (!vesa_clip_rect(&x, &y, &w, &h)) return;
 
     uint8_t* base = vesa_draw_target();
     if (!base) return;
 
     if (fb_bpp == 32) {
-        /* Fast path for the common 32-bpp case: write 4 bytes at a time. */
-        for (int row = y; row < y2; row++) {
+        for (int row = y; row < y + h; row++) {
             uint32_t* ptr = (uint32_t*)(base + row * fb_pitch) + x;
-            for (int col = 0; col < width; col++) ptr[col] = color;
+            for (int col = 0; col < w; col++) ptr[col] = color;
         }
     } else {
-        for (int row = y; row < y2; row++) {
-            for (int col = 0; col < width; col++) {
+        for (int row = y; row < y + h; row++) {
+            for (int col = 0; col < w; col++) {
                 vesa_write_pixel_raw(base, x + col, row, color);
             }
         }
     }
+}
+
+void vesa_set_clip(int x, int y, int w, int h) {
+    clip_enabled = 0;
+    if (!vesa_clip_rect(&x, &y, &w, &h)) {
+        clip_enabled = 1;
+        clip_x1 = clip_y1 = clip_x2 = clip_y2 = 0;
+        return;
+    }
+    clip_enabled = 1;
+    clip_x1 = x;
+    clip_y1 = y;
+    clip_x2 = x + w;
+    clip_y2 = y + h;
+}
+
+void vesa_clear_clip(void) {
+    clip_enabled = 0;
 }
 
 void vesa_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg) {
@@ -252,79 +294,60 @@ static void splash_hex32(char* dst, uint32_t v) {
     dst[10] = '\0';
 }
 
-/*
- * High-contrast boot splash designed to survive marginal LCD sync on real
- * hardware. We deliberately use pure white background + black text + a
- * primary-color test pattern so the user can immediately see whether the
- * panel is locking on to the framebuffer at all. Framebuffer dimensions are
- * printed so we know what mode GRUB actually negotiated.
- */
 void vesa_boot_splash(const char* status) {
     if (!vesa_initialized) return;
 
-    const uint32_t white = 0xFFFFFFFF;
-    const uint32_t black = 0x00000000;
-    const uint32_t red   = 0x00FF0000;
-    const uint32_t green = 0x0000C800;
-    const uint32_t blue  = 0x002060FF;
+    static uint32_t splash_step = 0;
+    const uint32_t bg       = 0x050608;
+    const uint32_t panel    = 0x111827;
+    const uint32_t border   = 0x263244;
+    const uint32_t accent   = 0x4C8BF5;
+    const uint32_t accent2  = 0x8AB4F8;
+    const uint32_t text     = 0xE8EAED;
+    const uint32_t muted    = 0x9AA0A6;
+    int w = (int)fb_width;
+    int h = (int)fb_height;
+    int card_w = w > 560 ? 520 : w - 40;
+    int card_h = 188;
+    int card_x = (w - card_w) / 2;
+    int card_y = (h - card_h) / 2;
+    int logo_x = card_x + 28;
+    int logo_y = card_y + 30;
+    int bar_x = card_x + 28;
+    int bar_y = card_y + card_h - 54;
+    int bar_w = card_w - 56;
+    int fill_w;
 
-    vesa_clear(white);
+    if (card_w < 260) card_w = w - 16;
+    if (card_w < 180) card_w = 180;
+    card_x = (w - card_w) / 2;
+    logo_x = card_x + 28;
+    bar_x = card_x + 28;
+    bar_w = card_w - 56;
 
-    /* Outer black border so panel edges are obvious. */
-    vesa_fill_rect(0, 0, (int)fb_width, 4, black);
-    vesa_fill_rect(0, (int)fb_height - 4, (int)fb_width, 4, black);
-    vesa_fill_rect(0, 0, 4, (int)fb_height, black);
-    vesa_fill_rect((int)fb_width - 4, 0, 4, (int)fb_height, black);
+    if (splash_step < 8) splash_step++;
+    fill_w = (bar_w * (int)(splash_step + 2)) / 10;
+    if (fill_w > bar_w) fill_w = bar_w;
 
-    /* Color sync bars across the top so we can confirm RGB ordering and the
-     * panel is locked to the framebuffer. If colors are swapped we know the
-     * driver mis-detected the pixel format. */
-    int bar_w = ((int)fb_width - 40) / 3;
-    if (bar_w < 30) bar_w = 30;
-    int bar_y = 20;
-    int bar_h = 24;
-    vesa_fill_rect(20,               bar_y, bar_w, bar_h, red);
-    vesa_fill_rect(20 + bar_w,       bar_y, bar_w, bar_h, green);
-    vesa_fill_rect(20 + bar_w * 2,   bar_y, bar_w, bar_h, blue);
+    vesa_clear(bg);
+    vesa_fill_rect(card_x, card_y, card_w, card_h, panel);
+    vesa_fill_rect(card_x, card_y, card_w, 2, border);
+    vesa_fill_rect(card_x, card_y + card_h - 2, card_w, 2, border);
+    vesa_fill_rect(card_x, card_y, 2, card_h, border);
+    vesa_fill_rect(card_x + card_w - 2, card_y, 2, card_h, border);
 
-    /* Header. */
-    int hx = 30, hy = 60;
-    vesa_draw_string(hx, hy, "GooberOS VESA boot", black, white);
+    vesa_fill_rect(logo_x, logo_y, 44, 44, accent);
+    vesa_fill_rect(logo_x + 8, logo_y + 8, 28, 28, panel);
+    vesa_fill_rect(logo_x + 16, logo_y + 16, 12, 12, accent2);
 
-    /* Framebuffer info dump. */
-    char buf[64];
-    int info_y = hy + 24;
+    vesa_draw_string(logo_x + 62, logo_y + 2, "GooberOSx86", text, panel);
+    vesa_draw_string(logo_x + 62, logo_y + 24, "Starting graphical desktop", muted, panel);
+    vesa_draw_string(bar_x, bar_y - 28, status ? status : "Loading...", text, panel);
 
-    vesa_draw_string(hx, info_y, "Resolution:", black, white);
-    splash_u32(buf, fb_width);
-    vesa_draw_string(hx + 110, info_y, buf, black, white);
-    vesa_draw_string(hx + 110 + 50, info_y, "x", black, white);
-    splash_u32(buf, fb_height);
-    vesa_draw_string(hx + 110 + 60, info_y, buf, black, white);
-
-    info_y += 16;
-    vesa_draw_string(hx, info_y, "Pitch:", black, white);
-    splash_u32(buf, fb_pitch);
-    vesa_draw_string(hx + 110, info_y, buf, black, white);
-
-    info_y += 16;
-    vesa_draw_string(hx, info_y, "BPP:", black, white);
-    splash_u32(buf, (uint32_t)fb_bpp);
-    vesa_draw_string(hx + 110, info_y, buf, black, white);
-
-    info_y += 16;
-    vesa_draw_string(hx, info_y, "FB addr:", black, white);
-    splash_hex32(buf, fb_addr32);
-    vesa_draw_string(hx + 110, info_y, buf, black, white);
-
-    info_y += 24;
-    vesa_draw_string(hx, info_y, "Status:", black, white);
-    vesa_draw_string(hx + 80, info_y, status ? status : "Initializing hardware...", blue, white);
-
-    info_y += 32;
-    vesa_draw_string(hx, info_y, "If you see this text, the panel is in sync.", black, white);
-    info_y += 16;
-    vesa_draw_string(hx, info_y, "Otherwise reboot and pick VGA Safe Mode in GRUB.", black, white);
+    vesa_fill_rect(bar_x, bar_y, bar_w, 14, bg);
+    vesa_fill_rect(bar_x, bar_y, fill_w, 14, accent);
+    vesa_fill_rect(bar_x, bar_y, bar_w, 1, border);
+    vesa_fill_rect(bar_x, bar_y + 13, bar_w, 1, border);
 
     vesa_swap();
 }

@@ -17,6 +17,7 @@ static void ohci_print(const char* s) {
 static volatile uint32_t* ohci_regs = NULL;
 static int ohci_ready = 0;
 static int ohci_fault_latched = 0;
+static int ohci_ndp = 2; /* NumberDownstreamPorts from HcRhDescriptorA */
 
 /*
  * Hard iteration ceiling for every hardware-polling busy-wait. Belt-and-
@@ -105,6 +106,7 @@ int ohci_init(const usb_pci_controller_t* controller) {
     if (!controller) return 0;
     ohci_ready = 0;
     ohci_fault_latched = 0;
+    ohci_ndp = 2;
     intr_active = 0;
     intr_ed = NULL;
     intr_td = NULL;
@@ -217,12 +219,24 @@ int ohci_init(const usb_pci_controller_t* controller) {
         return 0;
     }
 
-    /* Set port power (try Global first, then per-port) */
+    /* Set port power (global, then every root port). */
     ohci_write(OHCI_HcRhStatus, OHCI_RHS_SGP);
     timer_busy_wait_ms(20);
-    /* Try per-port power */
-    ohci_write(OHCI_HcRhPortStatus1, OHCI_PORT_PPS);
-    timer_busy_wait_ms(20);
+    {
+        uint32_t rhda = ohci_read(OHCI_HcRhDescriptorA);
+        int ndp = (int)(rhda & 0xFF);
+        if (ndp < 1) ndp = 1;
+        if (ndp > 15) ndp = 15;
+        ohci_ndp = ndp;
+        for (int p = 0; p < ohci_ndp; p++) {
+            uint32_t reg = OHCI_HcRhPortStatus1 + p * 4;
+            uint32_t ps = ohci_read(reg);
+            if (ps == 0xFFFFFFFFu) continue;
+            if (!(ps & OHCI_PORT_PPS))
+                ohci_write(reg, OHCI_PORT_PPS);
+        }
+        timer_busy_wait_ms(50);
+    }
 
     ohci_ready = 1;
 
@@ -246,28 +260,68 @@ int ohci_init(const usb_pci_controller_t* controller) {
     return 1;
 }
 
+int ohci_port_count(void) {
+    return ohci_ready ? ohci_ndp : 0;
+}
+
 /* ---- Port operations ---- */
+static int ohci_port_valid(int port) {
+    if (!ohci_ready || port < 0 || port >= ohci_ndp) return 0;
+    return 1;
+}
+
 int ohci_port_connected(int port) {
-    if (port < 0 || port >= 8) return 0;
-    return (ohci_read(OHCI_HcRhPortStatus1 + port * 4) & OHCI_PORT_CCS) != 0;
+    uint32_t v;
+    if (!ohci_port_valid(port)) return 0;
+    v = ohci_read(OHCI_HcRhPortStatus1 + port * 4);
+    if (v == 0xFFFFFFFFu) return 0;
+    return (v & OHCI_PORT_CCS) != 0;
 }
 
 int ohci_port_low_speed(int port) {
-    if (port < 0 || port >= 8) return 0;
-    return (ohci_read(OHCI_HcRhPortStatus1 + port * 4) & OHCI_PORT_LSDA) != 0;
+    uint32_t v;
+    if (!ohci_port_valid(port)) return 0;
+    v = ohci_read(OHCI_HcRhPortStatus1 + port * 4);
+    if (v == 0xFFFFFFFFu) return 0;
+    return (v & OHCI_PORT_LSDA) != 0;
 }
 
 void ohci_port_reset(int port) {
-    if (port < 0 || port >= 8) return;
-    uint32_t v = ohci_read(OHCI_HcRhPortStatus1 + port * 4);
-    /* Set reset bit */
-    ohci_write(OHCI_HcRhPortStatus1 + port * 4, v | OHCI_PORT_PRS);
-    timer_busy_wait_ms(60);   /* USB 2.0 reset hold (>= 50 ms) */
-    /* Clear reset bit */
-    ohci_write(OHCI_HcRhPortStatus1 + port * 4, v & ~OHCI_PORT_PRS);
+    uint32_t reg;
+    uint32_t v;
+    uint64_t deadline;
+    uint32_t guard;
+
+    if (!ohci_port_valid(port)) return;
+    reg = OHCI_HcRhPortStatus1 + port * 4;
+    v = ohci_read(reg);
+    if (v == 0xFFFFFFFFu) return;
+
+    /* Power the port first if needed. */
+    if (!(v & OHCI_PORT_PPS)) {
+        ohci_write(reg, OHCI_PORT_PPS);
+        timer_busy_wait_ms(20);
+        v = ohci_read(reg);
+    }
+    if (!(v & OHCI_PORT_CCS)) return;
+
+    /* Assert reset (write-1-to-set PRS). */
+    ohci_write(reg, OHCI_PORT_PRS);
+    deadline = timer_deadline_ms(100);
+    guard = OHCI_SPIN_CEILING;
+    while (!timer_deadline_expired(deadline)) {
+        v = ohci_read(reg);
+        if (v == 0xFFFFFFFFu) return;
+        /* PRSC set means reset completed; PRS clears when done. */
+        if ((v & OHCI_PORT_PRSC) || !(v & OHCI_PORT_PRS)) break;
+        if (--guard == 0) break;
+    }
+
+    v = ohci_read(reg);
+    if (v == 0xFFFFFFFFu) return;
+    /* Clear PRSC (RW1C) and enable the port. */
+    ohci_write(reg, OHCI_PORT_PRSC | OHCI_PORT_PES);
     timer_busy_wait_ms(10);
-    /* Enable port */
-    ohci_write(OHCI_HcRhPortStatus1 + port * 4, v | OHCI_PORT_PES);
 }
 
 /*
@@ -278,7 +332,7 @@ void ohci_port_reset(int port) {
  */
 int ohci_port_change_pending(int port) {
     if (!ohci_ready || ohci_fault_latched) return 0;
-    if (port < 0 || port >= 8) return 0;
+    if (!ohci_port_valid(port)) return 0;
     uint32_t v = ohci_read(OHCI_HcRhPortStatus1 + port * 4);
     if (v == 0xFFFFFFFFu) return 0;
     return (v & OHCI_PORT_CSC) != 0;
@@ -286,7 +340,7 @@ int ohci_port_change_pending(int port) {
 
 void ohci_port_change_ack(int port) {
     if (!ohci_ready || ohci_fault_latched) return;
-    if (port < 0 || port >= 8) return;
+    if (!ohci_port_valid(port)) return;
     /* OHCI: writing 1 to CSC clears the latch. The R/WC encoding of the
      * other status-change bits means writing zero to them leaves them as
      * they are; we only want to clear CSC here. */

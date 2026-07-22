@@ -7,6 +7,12 @@ typedef enum {
     DISPLAY_DRIVER_NONE = 0,
     DISPLAY_DRIVER_VGA_TEXT,
     DISPLAY_DRIVER_VESA_LFB,
+    /*
+     * Basic Display Adapter: firmware/GRUB LFB only, no modeset, no vblank.
+     * Prefer this on real Intel laptops (e.g. Lenovo 80M4) where aggressive
+     * display probes leave a wedged or invisible panel.
+     */
+    DISPLAY_DRIVER_BASIC_LFB,
     DISPLAY_DRIVER_NATIVE_INTEL,
     DISPLAY_DRIVER_NATIVE_GENERIC,
     /*
@@ -57,6 +63,24 @@ typedef struct {
     display_pixel_format_t format;
 } display_framebuffer_t;
 
+typedef enum {
+    DISPLAY_PRESENT_NONE = 0,
+    DISPLAY_PRESENT_COPY_RECT,
+    DISPLAY_PRESENT_COPY_FRAME,
+    DISPLAY_PRESENT_VBLANK_COPY_RECT,
+    DISPLAY_PRESENT_VBLANK_COPY_FRAME,
+    DISPLAY_PRESENT_PAGE_FLIP
+} display_present_mode_t;
+
+typedef struct {
+    uint32_t present_count;
+    uint32_t vblank_waits;
+    uint32_t vblank_misses;
+    uint32_t promoted_frames;
+    uint32_t last_dirty_area;
+    display_present_mode_t last_mode;
+} display_present_stats_t;
+
 /*
  * A candidate display driver. Drivers are registered into a fixed-size,
  * priority-ordered registry (no dynamic allocation) and tried in order until
@@ -80,6 +104,10 @@ typedef struct {
     int (*probe)(void);
     int (*init)(uint32_t req_w, uint32_t req_h, uint8_t req_bpp,
                 display_framebuffer_t* out);
+    int (*wait_vblank)(uint32_t timeout_ticks);
+    int (*present_rect)(int x, int y, int w, int h);
+    int (*present_frame)(void);
+    int (*page_flip)(void);
 } display_driver_ops_t;
 
 #define DISPLAY_MAX_DRIVERS 8
@@ -91,6 +119,8 @@ void display_register_framebuffer(display_driver_t driver,
                                   uint32_t height,
                                   uint32_t pitch,
                                   uint8_t bpp);
+/* Suppress driver_log side effects during critical early FB adopt. */
+void display_register_set_quiet(int quiet);
 void display_register_text_mode(void);
 
 /*
@@ -108,6 +138,20 @@ void display_restore_vga_text(void);
 const display_mode_info_t* display_get_mode(void);
 const char* display_driver_name(display_driver_t driver);
 const char* display_format_name(display_pixel_format_t format);
+const char* display_present_mode_name(display_present_mode_t mode);
+const display_present_stats_t* display_get_present_stats(void);
+int display_present_vblank_reliable(void);
+/* Acer/Braswell inherit path: GOP LFB is uncached; avoid giant blits. */
+void display_set_scanout_uncached(int uncached);
+int display_scanout_uncached(void);
+uint32_t display_present_budget_bytes(void);
+/* Finish the rect in one blit (window drag) instead of leaving pending bands. */
+void display_present_set_oneshot(int oneshot);
+int display_present_rect(int x, int y, int w, int h);
+int display_present_has_pending(void);
+void display_present_consume_pending(int* x, int* y, int* w, int* h);
+int display_present_frame(void);
+void display_present_note_promotion(void);
 
 /* ---- Driver framework ---- */
 

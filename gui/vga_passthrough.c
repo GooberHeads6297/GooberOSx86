@@ -2,6 +2,7 @@
 #include "vesa_window.h"
 #include "../drivers/video/vesa.h"
 #include "../drivers/video/font.h"
+#include "../drivers/video/textcon.h"
 #include "../lib/string.h"
 
 /*
@@ -104,6 +105,18 @@ void vga_passthrough_present_into_window(int cx, int cy, int cw, int ch) {
             vesa_draw_char(cx + col * FONT_WIDTH,
                            cy + row * FONT_HEIGHT,
                            c, fg, bg);
+        }
+    }
+}
+
+void vga_passthrough_sync_from_textcon(void) {
+    int row, col;
+    if (!con_ready()) return;
+    for (row = 0; row < VGA_PT_ROWS && row < CON_ROWS; row++) {
+        for (col = 0; col < VGA_PT_COLS && col < CON_COLS; col++) {
+            uint16_t cell = con_get_cell(row, col);
+            g_cells[row * VGA_PT_COLS + col] = (char)(cell & 0xFF);
+            g_attrs[row * VGA_PT_COLS + col] = (unsigned char)(cell >> 8);
         }
     }
 }

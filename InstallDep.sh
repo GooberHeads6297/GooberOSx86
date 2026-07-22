@@ -50,6 +50,7 @@ PKGS_X86=(
 
 PKGS_X64=(
   grub-efi-amd64-bin
+  grub-efi-ia32-bin
   ovmf
 )
 

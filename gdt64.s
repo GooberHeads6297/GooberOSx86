@@ -1,21 +1,13 @@
 ; -----------------------------------------------------------------------------
-; gdt64.s - 64-bit GDT for GooberOSx86 long mode.
+; gdt64.s - 64-bit GDT for GooberOSx86 long mode (+ ring-3 + TSS).
 ;
-; Three descriptors:
+; Selectors:
 ;   0x00  null
-;   0x08  ring-0 64-bit code (L=1, D=0, executable, readable)
-;   0x10  ring-0 data (writable; base/limit ignored in long mode)
-;
-; A 10-byte pseudo-descriptor (gdt64_pointer) is exported so boot64.s can
-; lgdt it before the far-jump to 64-bit code. We perform that lgdt while
-; still in compatibility mode (CS.D=1, CS.L=0) so the CPU reads only the
-; 16-bit limit + 32-bit base; that is fine because the GDT lives in low
-; memory (well below 4 GiB), and once we enter 64-bit the upper 32 bits of
-; the GDTR base remain zero - which is the truth.
-;
-; We never go back to 32-bit code after the trampoline, so a separate set of
-; legacy 32-bit selectors is unnecessary; the trampoline keeps using the
-; legacy selectors GRUB left in place until it executes the far-jump.
+;   0x08  ring-0 64-bit code
+;   0x10  ring-0 data
+;   0x18  ring-3 64-bit code
+;   0x20  ring-3 data
+;   0x28  64-bit TSS (16-byte descriptor)
 ; -----------------------------------------------------------------------------
 
 BITS 64
@@ -23,21 +15,25 @@ BITS 64
 global gdt64_pointer
 global gdt64_code_offset
 global gdt64_data_offset
+global gdt64_user_code_sel
+global gdt64_user_data_sel
+global gdt64_tss_sel
+global tss64
+global gdt64_reload
+global gdt64_set_tss_rsp0
+global gdt64_load_tr
 
-section .rodata
+section .bss
+align 16
+tss64:
+    resb 104
+
+section .data
 align 16
 gdt64_start:
-    ; 0x00 - null descriptor
     dq 0x0000000000000000
 
 gdt64_code:
-    ; 0x08 - 64-bit ring-0 code segment.
-    ;   limit_low  = 0xFFFF (ignored in long mode)
-    ;   base_low   = 0
-    ;   base_mid   = 0
-    ;   access     = 1001_1010b (P=1, DPL=00, S=1, type=Exec/Read non-conforming)
-    ;   flags+lim  = 1010_1111b (G=1, D=0, L=1, AVL=0, limit_high=1111)
-    ;   base_high  = 0
     dw 0xFFFF
     dw 0x0000
     db 0x00
@@ -46,23 +42,89 @@ gdt64_code:
     db 0x00
 
 gdt64_data:
-    ; 0x10 - ring-0 data segment. In long mode base/limit are ignored for
-    ; non-FS/GS data, but the descriptor must still be present and writable.
     dw 0xFFFF
     dw 0x0000
     db 0x00
-    db 10010010b               ; P=1, DPL=00, S=1, type=Read/Write data
-    db 11001111b               ; G=1, D=1, L=0, limit_high=1111 (all ignored)
+    db 10010010b
+    db 11001111b
     db 0x00
+
+gdt64_user_code:
+    dw 0xFFFF
+    dw 0x0000
+    db 0x00
+    db 11111010b
+    db 10101111b
+    db 0x00
+
+gdt64_user_data:
+    dw 0xFFFF
+    dw 0x0000
+    db 0x00
+    db 11110010b
+    db 11001111b
+    db 0x00
+
+; 16-byte TSS descriptor; base filled by gdt64_reload()
+gdt64_tss:
+    dw 103                     ; limit = sizeof(tss64)-1
+    dw 0                       ; base 15:0
+    db 0                       ; base 23:16
+    db 10001001b               ; present, type 9
+    db 0
+    db 0                       ; base 31:24
+    dd 0                       ; base 63:32
+    dd 0
 
 gdt64_end:
 
-; 10-byte pseudo-descriptor: 16-bit limit + 64-bit base.
 align 16
 gdt64_pointer:
     dw gdt64_end - gdt64_start - 1
     dq gdt64_start
 
-; Convenience selector offsets for any C/asm code that wants to refer by name.
 gdt64_code_offset: equ gdt64_code - gdt64_start
 gdt64_data_offset: equ gdt64_data - gdt64_start
+gdt64_user_code_sel: equ 0x18
+gdt64_user_data_sel: equ 0x20
+gdt64_tss_sel: equ 0x28
+
+section .text
+
+; void gdt64_reload(void) — patch TSS base, lgdt, reload data segs, ltr
+gdt64_reload:
+    ; Fill TSS descriptor base from &tss64
+    lea rax, [rel tss64]
+    mov word [rel gdt64_tss + 2], ax
+    shr rax, 16
+    mov byte [rel gdt64_tss + 4], al
+    mov byte [rel gdt64_tss + 7], ah
+    shr rax, 16
+    mov dword [rel gdt64_tss + 8], eax
+
+    lgdt [rel gdt64_pointer]
+
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+
+    ; Far return to reload CS = 0x08 (already in long mode)
+    push 0x08
+    lea rax, [rel .flush]
+    push rax
+    retfq
+.flush:
+    mov ax, 0x28
+    ltr ax
+    ret
+
+; void gdt64_set_tss_rsp0(uint64_t rsp0)
+gdt64_set_tss_rsp0:
+    mov qword [rel tss64 + 4], rdi
+    ret
+
+gdt64_load_tr:
+    mov ax, 0x28
+    ltr ax
+    ret

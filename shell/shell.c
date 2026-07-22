@@ -17,14 +17,28 @@
 #include "../editor/editor.h"
 #include "../taskmgr/taskmgr.h"
 #include "../drivers/storage/storage.h"
+#include "../drivers/storage/partition.h"
+#include "../drivers/usb/usb.h"
+#include "../drivers/usb/storage/msc.h"
+#include "../drivers/usb/host/host.h"
+#include "../drivers/input/touchpad.h"
 #include "../fs/filesystem.h"
+#include "../fs/fs_backend.h"
+#include "../install/install.h"
+#include "../userspace/userspace.h"
 #include "../lib/string.h"
 #include "../drivers/video/vga.h"
+#include "../drivers/video/textcon.h"
+#include "../drivers/video/display.h"
+#include "../drivers/video/connector.h"
+#include "../drivers/video/intel_gfx.h"
 #include "../drivers/keyboard/keyboard.h"
 #include "../drivers/timer/timer.h"
+#include "../drivers/diagnostics/driver_log.h"
 #include "../gui/window.h"
 
 #define PROMPT_COLOR VGA_COLOR_BLUE
+#define INPUT_COLOR VGA_COLOR_BLUE
 static uint8_t current_color = VGA_COLOR_LIGHT_GREEN;
 #define SCREEN_COLS 80
 #define SCREEN_ROWS 25
@@ -38,8 +52,17 @@ extern uint8_t cursor_col;
 #endif
 
 #if EMBED_INSTALL_ISO
+#ifdef __x86_64__
+extern unsigned char _binary_GooberOSx86_x64_iso_start;
+extern unsigned char _binary_GooberOSx86_x64_iso_end;
+#define INSTALL_IMAGE_START _binary_GooberOSx86_x64_iso_start
+#define INSTALL_IMAGE_END   _binary_GooberOSx86_x64_iso_end
+#else
 extern unsigned char _binary_GooberOSx86_iso_start;
 extern unsigned char _binary_GooberOSx86_iso_end;
+#define INSTALL_IMAGE_START _binary_GooberOSx86_iso_start
+#define INSTALL_IMAGE_END   _binary_GooberOSx86_iso_end
+#endif
 #endif
 
 extern FileHandle* fs_open(const char* filename);
@@ -49,6 +72,7 @@ extern int fs_create(const char* filename);
 extern int fs_delete(const char* filename);
 extern int fs_delete_dir(const char* dirname);
 extern int fs_create_dir(const char* dirname);
+extern int fs_rename(const char* old_name, const char* new_name);
 extern int fs_write(const char* filename, const uint8_t* data, size_t size);
 extern int fs_list(void);
 extern int fs_change_dir(const char* path);
@@ -110,12 +134,21 @@ static void shell_clear_display(void) {
         redirected_clear_sink(redirected_output_ctx);
         return;
     }
-    clear_screen();
+    /* The text console layer mirrors to whichever backend is active (VGA
+     * 0xB8000 on legacy BIOS, the GOP framebuffer on UEFI x64). Fall back
+     * to the legacy direct clear when no backend was ever bound -- that
+     * preserves the pre-textcon behaviour for the rare early-boot path
+     * where shell_clear_display is hit before shell_init. */
+    if (con_ready()) {
+        con_clear(0x0Fu);
+    } else {
+        clear_screen();
+    }
 }
 
 static void put_cell(int r, int c, char ch, uint8_t attr) {
     if (r < 0 || c < 0 || r >= SCREEN_ROWS || c >= SCREEN_COLS) return;
-    VIDEO_MEMORY[r * SCREEN_COLS + c] = ((uint16_t)attr << 8) | (uint8_t)ch;
+    con_put_cell(r, c, ch, attr);
 }
 
 static int input_index_to_pos(size_t idx, int* out_r, int* out_c) {
@@ -130,14 +163,11 @@ static int input_index_to_pos(size_t idx, int* out_r, int* out_c) {
 
 static void ensure_scroll() {
     while (cursor_row >= SCREEN_ROWS) {
-        for (int r = 1; r < SCREEN_ROWS; r++) {
-            for (int c = 0; c < SCREEN_COLS; c++) {
-                VIDEO_MEMORY[(r - 1) * SCREEN_COLS + c] = VIDEO_MEMORY[r * SCREEN_COLS + c];
-            }
-        }
-        for (int c = 0; c < SCREEN_COLS; c++) {
-            put_cell(SCREEN_ROWS - 1, c, ' ', current_color);
-        }
+        /* Scroll the whole console up one row through the text-console
+         * abstraction so the active backend (VGA cell plane on legacy
+         * BIOS, or the GOP framebuffer on UEFI x64) sees the shift in
+         * one batched call instead of cell-by-cell. */
+        con_scroll_up(1, current_color);
         cursor_row--;
         if (prompt_start_row > 0) prompt_start_row--;
         if (prev_cursor_row > 0) prev_cursor_row--;
@@ -160,7 +190,7 @@ static void draw_cursor() {
     ensure_scroll();
     // DO NOT restore here; we will restore at safe sites before drawing text.
     if (cursor_row < 0 || cursor_col < 0 || cursor_row >= SCREEN_ROWS || cursor_col >= SCREEN_COLS) return;
-    prev_cell_value = VIDEO_MEMORY[cursor_row * SCREEN_COLS + cursor_col];
+    prev_cell_value = con_get_cell(cursor_row, cursor_col);
     move_cursor(cursor_row, cursor_col);
     put_cell(cursor_row, cursor_col, '_', PROMPT_COLOR);
     prev_cursor_row = cursor_row;
@@ -251,7 +281,7 @@ static void set_input_line(const char* text) {
     input_pos = len;
     int r = prompt_start_row, c = prompt_start_col;
     for (size_t i = 0; i < INPUT_BUFFER_SIZE; i++) {
-        put_cell(r, c, (i < len) ? text[i] : ' ', current_color);
+        put_cell(r, c, (i < len) ? text[i] : ' ', INPUT_COLOR);
         c++;
         if (c >= SCREEN_COLS) { c = 0; r++; }
     }
@@ -535,7 +565,7 @@ static const storage_device_info_t* get_storage_device_by_id(int device_index) {
 
 static size_t install_image_size_bytes(void) {
 #if EMBED_INSTALL_ISO
-    return (size_t)(&_binary_GooberOSx86_iso_end - &_binary_GooberOSx86_iso_start);
+    return (size_t)(&INSTALL_IMAGE_END - &INSTALL_IMAGE_START);
 #else
     return 0;
 #endif
@@ -557,8 +587,36 @@ static int install_image_available(void) {
 static void list_devices() {
     storage_scan();
     int count = storage_count();
+    print("devices: build=2026-07-13-byt-fastep0\n");
+    storage_print_pci_inventory();
+
+    /* USB class devices are not the PCI controller line — report attach state. */
+    print("USB peripherals:\n");
+    {
+        char buf[16];
+        print("  HID pointer: ");
+        print(usb_has_pointer_device() ? "yes" : "no");
+        print(usb_has_touchpad_device() ? " (touchpad)" : "");
+        print("\n");
+        print("  MSC stick: ");
+        if (usb_msc_is_attached()) {
+            print("yes port=");
+            itoa(usb_msc_attached_port(), buf, 10);
+            print(buf);
+            print(" storage_index=");
+            itoa(usb_msc_storage_index(), buf, 10);
+            print(buf);
+            print("\n");
+        } else {
+            print("no (needs enum + BOT; sticks appear after mouse path works)\n");
+        }
+    }
+    usb_host_print_usb2_route(print);
+    touchpad_print_status(print);
+
     if (count <= 0) {
-        print("No storage hardware detected.\n");
+        print("No storage hardware detected in storage table.\n");
+        print("If PCI inventory above shows 8086:f14 or class 8/5, report that line.\n");
         return;
     }
     print("Storage hardware:\n");
@@ -588,6 +646,11 @@ static void list_devices() {
         if (d->selectable) {
             print(" [install target]");
         }
+        if (d->vendor_id) {
+            print(" id=");
+            itoa((int)d->vendor_id, buf, 16); print(buf); print(":");
+            itoa((int)d->device_id, buf, 16); print(buf);
+        }
         print("\n");
     }
 }
@@ -615,9 +678,35 @@ static void list_pending_install_paths(void) {
     }
 }
 
-static void list_install_targets(void) {
+/* Rescan storage and lazily bring up SDHCI/eMMC (safe at boot with storage=ata). */
+static void install_storage_refresh(void) {
+    int i;
+    int n;
+    print("install: storage refresh build=bsw8-20260719-sdr12\n");
     storage_scan();
-    int count = storage_target_count();
+    print("install: probing SDHCI/eMMC...\n");
+    storage_probe_sdhci();
+    n = storage_count();
+    for (i = 0; i < n; i++) {
+        const storage_device_info_t* d = storage_get(i);
+        char buf[16];
+        if (!d || !d->present || d->backend != STORAGE_BACKEND_SDHCI) continue;
+        if (d->install_state == STORAGE_INSTALL_STATE_READY) continue;
+        print("install: eMMC probe incomplete at ");
+        print(d->location);
+        print(" (step ");
+        itoa((int)d->init_step, buf, 10);
+        print(buf);
+        print("): ");
+        print(storage_install_state_reason(d));
+        print("\n");
+    }
+}
+
+static void list_install_targets(void) {
+    int count;
+    install_storage_refresh();
+    count = storage_target_count();
 
     if (count <= 0) {
         print("No installable storage targets detected in-kernel.\n");
@@ -651,11 +740,14 @@ static void print_install_help(void) {
     print("install commands:\n");
     print("  install list\n");
     print("  install info <target-id>\n");
+    print("  install fat32 <target-id> YES MBR|GPT\n");
+    print("  install memory\n");
     print("  install write <target-id> YES\n");
     print("  install host\n");
     print("\n");
-    print("Direct disk install currently supports ATA HDD/SSD targets in BIOS-style\n");
-    print("VM setups. eMMC/AHCI/NVMe still need their own write paths.\n");
+    print("  install fat32  MBR = BIOS/legacy, GPT = UEFI\n");
+    print("                 Reboot from the target disk when done.\n");
+    print("  install memory Memory-only root (not persistent).\n");
 }
 
 static void print_storage_device_info(const char* heading, const storage_device_info_t* d, int display_index) {
@@ -745,7 +837,7 @@ static void print_storage_device_info(const char* heading, const storage_device_
 
 static void print_install_target_info(int target_index) {
     const storage_device_info_t* d;
-    storage_scan();
+    install_storage_refresh();
     d = storage_get_target(target_index);
     if (!d) {
         print("install: target not found\n");
@@ -764,15 +856,18 @@ static void print_disk_device_info(int device_index) {
 }
 
 static void print_host_install_help(void) {
-    print("Host-side install flow:\n");
-    print("  1. Build the project: ./build.sh\n");
-    print("  2. List host disks: ./build.sh list-devices\n");
-    print("  3. Mount the target filesystem.\n");
-    print("  4. Install GRUB + kernel:\n");
+    print("Host-side install (recommended for first boot test):\n");
+    print("  1. Build: ./build.sh x86\n");
+    print("  2. Raw disk image (VirtualBox/QEMU):\n");
+    print("     ./scripts/make-installed-disk.sh build/GooberOS-installed.img\n");
+    print("  3. Or mount FAT32 + grub-install:\n");
+    print("     ./build.sh list-devices\n");
     print("     ./build.sh install --device /dev/sdX --mount /mnt/goober\n");
     print("\n");
-    print("This copies kernel.bin and grub.cfg into /boot and runs grub-install\n");
-    print("against the selected disk.\n");
+    print("In-OS install (inside live ISO):\n");
+    print("  install list\n");
+    print("  install fat32 <target-id> YES MBR|GPT\n");
+    print("  Reboot from the target disk (not the ISO).\n");
 }
 
 static void print_disk_help(void) {
@@ -786,154 +881,26 @@ static void print_disk_help(void) {
     print("Device IDs come from the `devices` command, not `install list`.\n");
 }
 
-static void print_partition_type_name(uint8_t type) {
-    if (type == 0x00) print("Unused");
-    else if (type == 0x07) print("NTFS/exFAT/HPFS");
-    else if (type == 0x0B || type == 0x0C) print("FAT32");
-    else if (type == 0x83) print("Linux");
-    else if (type == 0x82) print("Linux swap");
-    else if (type == 0xEE) print("GPT protective");
-    else if (type == 0xEF) print("EFI system");
-    else if (type == 0xAF) print("Apple HFS+");
-    else print("Unknown");
-}
-
-static void print_mbr_partitions(const uint8_t* sector0) {
-    char buf[16];
-    int found = 0;
-
-    print("MBR partitions:\n");
-    for (int i = 0; i < 4; i++) {
-        const uint8_t* entry = sector0 + 446 + (i * 16);
-        uint8_t type = entry[4];
-        uint32_t start_lba = read_le32(entry + 8);
-        uint32_t sectors = read_le32(entry + 12);
-        if (type == 0 || sectors == 0) continue;
-        found = 1;
-        print("  [");
-        itoa(i, buf, 10);
-        print(buf);
-        print("] type 0x");
-        print_hex_u32(type, 0);
-        print(" ");
-        print_partition_type_name(type);
-        print(", start ");
-        itoa((int)start_lba, buf, 10);
-        print(buf);
-        print(", sectors ");
-        itoa((int)sectors, buf, 10);
-        print(buf);
-        if (entry[0] == 0x80) print(", bootable");
-        print("\n");
-    }
-    if (!found) print("  No populated MBR entries.\n");
-}
-
-static void print_gpt_partitions(const storage_device_info_t* d) {
-    uint8_t sector[512];
-    uint8_t entry_sector[512];
-    char buf[16];
-
-    if (storage_read_sector(d, 1, sector) != 0) {
-        print("disk: failed to read GPT header\n");
-        return;
-    }
-    if (strncmp_local((const char*)sector, "EFI PART", 8) != 0) {
-        print("disk: GPT signature not present\n");
-        return;
-    }
-
-    {
-        uint32_t entry_lba = read_le32(sector + 72);
-        uint32_t entry_count = read_le32(sector + 80);
-        uint32_t entry_size = read_le32(sector + 84);
-        uint32_t max_entries = entry_count > 8 ? 8 : entry_count;
-        int printed = 0;
-
-        print("GPT partitions (first ");
-        itoa((int)max_entries, buf, 10);
-        print(buf);
-        print(" entries scanned):\n");
-
-        if (entry_size < 128) {
-            print("  Entry size too small to parse.\n");
-            return;
-        }
-
-        for (uint32_t i = 0; i < max_entries; i++) {
-            uint32_t byte_offset = i * entry_size;
-            uint32_t sector_lba = entry_lba + (byte_offset / 512U);
-            uint32_t sector_offset = byte_offset % 512U;
-            const uint8_t* entry;
-            uint64_t first_lba;
-            uint64_t last_lba;
-            char name[37];
-            int name_pos = 0;
-
-            if (storage_read_sector(d, sector_lba, entry_sector) != 0) {
-                print("  Failed to read GPT entry sector.\n");
-                return;
-            }
-            entry = entry_sector + sector_offset;
-            if (entry[0] == 0 && entry[1] == 0 && entry[2] == 0 && entry[3] == 0 &&
-                entry[4] == 0 && entry[5] == 0 && entry[6] == 0 && entry[7] == 0) {
-                continue;
-            }
-
-            first_lba = (uint64_t)read_le32(entry + 32) | ((uint64_t)read_le32(entry + 36) << 32);
-            last_lba = (uint64_t)read_le32(entry + 40) | ((uint64_t)read_le32(entry + 44) << 32);
-
-            for (int n = 0; n < 36; n++) {
-                uint16_t ch = read_le16(entry + 56 + (n * 2));
-                if (ch == 0) break;
-                name[name_pos++] = (ch >= 32 && ch < 127) ? (char)ch : '?';
-            }
-            name[name_pos] = '\0';
-
-            printed = 1;
-            print("  [");
-            itoa((int)i, buf, 10);
-            print(buf);
-            print("] first ");
-            print_u64(first_lba);
-            print(", last ");
-            print_u64(last_lba);
-            if (name[0]) {
-                print(", name ");
-                print(name);
-            }
-            print("\n");
-        }
-
-        if (!printed) print("  No populated GPT entries found in scanned range.\n");
-    }
-}
-
 static void disk_show_partitions(int device_index) {
     const storage_device_info_t* d = get_storage_device_by_id(device_index);
-    uint8_t sector0[512];
-
     if (!d) {
         print("disk: device not found\n");
         return;
     }
-    if (storage_read_sector(d, 0, sector0) != 0) {
-        print("disk: failed to read sector 0 from device\n");
-        return;
-    }
-    if (sector0[510] != 0x55 || sector0[511] != 0xAA) {
-        print("disk: sector 0 does not contain an MBR signature\n");
-        return;
-    }
+    partition_print_table(d, print);
+}
 
-    print_mbr_partitions(sector0);
-    for (int i = 0; i < 4; i++) {
-        const uint8_t* entry = sector0 + 446 + (i * 16);
-        if (entry[4] == 0xEE) {
-            print_gpt_partitions(d);
-            break;
-        }
-    }
+static void print_mount_status(void) {
+    const boot_config_t* cfg = boot_get_config();
+    print("Filesystem backend: ");
+    print(fs_backend_name());
+    print("\nMount: ");
+    print(fs_mount_description());
+    print("\nPersistent: ");
+    print(fs_is_persistent() ? "yes\n" : "no (live memfs)\n");
+    print("gooberos.root=");
+    print((cfg && cfg->root[0]) ? cfg->root : "live");
+    print("\n");
 }
 
 static void disk_zero_range(const storage_device_info_t* d, uint32_t start_lba, uint32_t count) {
@@ -1027,6 +994,37 @@ static void disk_wipe_table(int device_index) {
     }
 }
 
+static int install_parse_style(const char* s, install_partition_style_t* out) {
+    char a, b, c, d;
+    if (!s || !out || !s[0]) return -1;
+    a = s[0]; if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+    b = s[1]; if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+    c = s[2]; if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    d = s[3]; if (d >= 'a' && d <= 'z') d = (char)(d - 32);
+
+    if (a == 'M' && b == 'B' && c == 'R' && d == '\0') {
+        *out = INSTALL_STYLE_MBR;
+        return 0;
+    }
+    if (a == 'G' && b == 'P' && c == 'T' && d == '\0') {
+        *out = INSTALL_STYLE_GPT;
+        return 0;
+    }
+    return -1;
+}
+
+static void install_fat32_target(int target_index, install_partition_style_t style) {
+    const storage_device_info_t* d;
+
+    install_storage_refresh();
+    d = storage_get_target(target_index);
+    if (!d) {
+        print("install: target not found (see `install list`)\n");
+        return;
+    }
+    install_fat32_to_device(d, style);
+}
+
 static void install_write_target(int target_index) {
     const storage_device_info_t* d;
     char buf[16];
@@ -1050,7 +1048,7 @@ static void install_write_target(int target_index) {
 
 #if EMBED_INSTALL_ISO
     {
-        unsigned char* image = &_binary_GooberOSx86_iso_start;
+        unsigned char* image = &INSTALL_IMAGE_START;
         size_t image_bytes = install_image_size_bytes();
         size_t image_sectors = install_image_sector_count();
         uint8_t sector[512];
@@ -1098,7 +1096,11 @@ static void install_write_target(int target_index) {
         }
 
         print("\ninstall: complete\n");
+#ifdef __x86_64__
+        print("install: the target should now boot on UEFI-capable x64 systems.\n");
+#else
         print("install: the target should now boot in BIOS/legacy mode.\n");
+#endif
     }
 #endif
 }
@@ -1134,7 +1136,112 @@ void execute_command(const char* cmd) {
     }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\ninstall\ndisk\npartitions\nedit\nnew\nwrite\nmkdir\ndel\nrmdir\nread\ngui\ncolor\n");
+        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\nlspci\ndisplay\nboot\nlogs\ndriverlog\ninstall\ndisk\npartitions\nmount\numount\nsync\nedit\nnew\nwrite\nmkdir\nrename\ndel\nrmdir\nread\ngui\ncolor\nrun\ngooberc\n");
+    } else if (!strncmp_local(cmd, "run ", 4)) {
+        const char* path = cmd + 4;
+        while (*path == ' ') path++;
+        if (!*path) print("run: usage: run <path.gob>\n");
+        else if (gob_exec(path) != 0) print("run: failed\n");
+    } else if (!strncmp_local(cmd, "gooberc ", 8)) {
+        /* gooberc <src.gc> -o <out.gob> */
+        const char* arg = cmd + 8;
+        char src[64] = {0};
+        char out[64] = {0};
+        size_t i = 0;
+        while (arg[i] && arg[i] != ' ' && i + 1 < sizeof(src)) {
+            src[i] = arg[i];
+            i++;
+        }
+        src[i] = '\0';
+        while (arg[i] == ' ') i++;
+        if (arg[i] == '-' && arg[i + 1] == 'o') {
+            i += 2;
+            while (arg[i] == ' ') i++;
+            size_t j = 0;
+            while (arg[i] && arg[i] != ' ' && j + 1 < sizeof(out)) {
+                out[j++] = arg[i++];
+            }
+            out[j] = '\0';
+        }
+        if (!src[0] || !out[0])
+            print("gooberc: usage: gooberc <src.gc> -o <out.gob>\n");
+        else if (gooberc_compile(src, out) != 0)
+            print("gooberc: compile failed\n");
+    } else if (!strcmp_local(cmd, "boot")) {
+        const boot_config_t* cfg = boot_get_config();
+        const boot_smart_profile_t* smart = boot_smart_profile();
+        print("Boot request: ");
+        print(cfg->boot);
+        print("\n");
+        print("Display: ");
+        print(cfg->display);
+        print("\n");
+        print("Storage: ");
+        print(cfg->storage[0] ? cfg->storage : "(default)");
+        print("\n");
+        if (smart && smart->active) {
+            print("Smart profile: ");
+            print(smart->reason);
+            print("\n");
+        } else {
+            print("Smart profile: (inactive)\n");
+        }
+        print("Cmdline: ");
+        print(cfg->cmdline[0] ? cfg->cmdline : "(empty)");
+        print("\n");
+    } else if (!strcmp_local(cmd, "display") || !strcmp_local(cmd, "xrandr")) {
+        const display_mode_info_t* mode = display_get_mode();
+        char buf[16];
+        int i, n;
+        const boot_smart_profile_t* smart = boot_smart_profile();
+        if (smart && smart->active) {
+            print("Smart boot: ");
+            print(smart->reason);
+            print("\n");
+        }
+        print("Display driver: ");
+        print(display_driver_name(mode->driver));
+        print("\n");
+        if (mode->available) {
+            print("Mode: ");
+            itoa((int)mode->width, buf, 10); print(buf); print("x");
+            itoa((int)mode->height, buf, 10); print(buf); print("x");
+            itoa((int)mode->bpp, buf, 10); print(buf);
+            print(" (");
+            print(display_format_name(mode->format));
+            print(")\n");
+        }
+        if (display_connectors_count() == 0) {
+            const display_mode_info_t* m = display_get_mode();
+            if (intel_gfx_is_bay_trail_class() && m && m->available) {
+                display_connectors_stub_firmware_panel(m->width, m->height);
+            } else {
+                display_connectors_scan_ex(0);
+                if (m && m->available)
+                    display_connector_add_simplefb(m->width, m->height, "Active-FB");
+            }
+        }
+        n = display_connectors_count();
+        print("Connectors:\n");
+        for (i = 0; i < n; i++) {
+            const display_connector_t* c = display_connector_get(i);
+            if (!c) continue;
+            print("  ");
+            print(c->name);
+            print(" ");
+            print(display_connector_status_name(c->status));
+            if (c->preferred_width && c->preferred_height) {
+                print(" ");
+                itoa((int)c->preferred_width, buf, 10); print(buf); print("x");
+                itoa((int)c->preferred_height, buf, 10); print(buf);
+            }
+            if (c->monitor_name[0]) {
+                print(" \"");
+                print(c->monitor_name);
+                print("\"");
+            }
+            print("\n");
+        }
     } else if (!strcmp_local(cmd, "gui")) {
         if (redirected) {
             print("Already in GUI mode.\n");
@@ -1158,6 +1265,46 @@ void execute_command(const char* cmd) {
     } else if (!strncmp_local(cmd, "echo ", 5)) {
         print(cmd + 5);
         print("\n");
+    } else if (!strncmp_local(cmd, "mount ", 6)) {
+        const char* arg = cmd + 6;
+        int dev_idx = -1;
+        int part_idx = 0;
+        const char* colon = arg;
+        while (*colon && *colon != ':') colon++;
+        if (*colon == ':') {
+            char dev_buf[12];
+            size_t n = (size_t)(colon - arg);
+            size_t i;
+            if (n == 0 || n >= sizeof(dev_buf)) {
+                print("Usage: mount N:P   (device index : partition index)\n");
+            } else {
+                for (i = 0; i < n; i++) dev_buf[i] = arg[i];
+                dev_buf[n] = '\0';
+                dev_idx = atoi(dev_buf);
+                part_idx = atoi(colon + 1);
+                if (fat32_mount_device_loose(dev_idx, part_idx) == 0) {
+                    print("Mounted ");
+                    print(fat32_mount_description());
+                    print("\n");
+                } else {
+                    print("mount failed (need READY device with FAT32).\n");
+                }
+            }
+        } else {
+            print("Usage: mount N:P   (or 'mount' for status)\n");
+        }
+    } else if (!strcmp_local(cmd, "mount")) {
+        print_mount_status();
+    } else if (!strcmp_local(cmd, "umount") || !strcmp_local(cmd, "unmount")) {
+        if (!fat32_is_mounted()) {
+            print("Nothing mounted.\n");
+        } else {
+            fat32_unmount();
+            print("Unmounted.\n");
+        }
+    } else if (!strcmp_local(cmd, "sync")) {
+        if (fs_sync() == 0) print("Filesystem synced.\n");
+        else print("sync failed.\n");
     } else if (!strcmp_local(cmd, "ls")) {
         fs_list();
     } else if (!strncmp_local(cmd, "cd ", 3)) {
@@ -1239,6 +1386,34 @@ void execute_command(const char* cmd) {
                 print("\n");
             }
         }
+    } else if (!strncmp_local(cmd, "rename ", 7)) {
+        const char* arg = cmd + 7;
+        char old_name[INPUT_BUFFER_SIZE] = {0};
+        char new_name[INPUT_BUFFER_SIZE] = {0};
+        size_t i = 0;
+        size_t j = 0;
+        while (arg[i] == ' ') i++;
+        while (arg[i] && arg[i] != ' ' && j < sizeof(old_name) - 1)
+            old_name[j++] = arg[i++];
+        old_name[j] = '\0';
+        while (arg[i] == ' ') i++;
+        j = 0;
+        while (arg[i] && arg[i] != ' ' && j < sizeof(new_name) - 1)
+            new_name[j++] = arg[i++];
+        new_name[j] = '\0';
+        if (old_name[0] == '\0' || new_name[0] == '\0') {
+            print("rename: usage rename <old-name> <new-name>\n");
+        } else if (fs_rename(old_name, new_name) == 0) {
+            print("Renamed ");
+            print(old_name);
+            print(" to ");
+            print(new_name);
+            print("\n");
+        } else {
+            print("rename: failed to rename ");
+            print(old_name);
+            print("\n");
+        }
     } else if (!strncmp_local(cmd, "del ", 4)) {
         const char* target = cmd + 4;
         size_t len = 0;
@@ -1308,6 +1483,11 @@ void execute_command(const char* cmd) {
         }
     } else if (!strcmp_local(cmd, "devices")) {
         list_devices();
+    } else if (!strcmp_local(cmd, "lspci") || !strcmp_local(cmd, "pci")) {
+        storage_print_pci_inventory();
+    } else if (!strcmp_local(cmd, "logs") || !strcmp_local(cmd, "driverlog")) {
+        driver_log_sync_desktop_file();
+        driver_log_dump(print);
     } else if (!strcmp_local(cmd, "disk")) {
         print_disk_help();
     } else if (!strcmp_local(cmd, "partitions")) {
@@ -1401,6 +1581,11 @@ void execute_command(const char* cmd) {
         print("install: target id required\n");
     } else if (!strcmp_local(cmd, "install host")) {
         print_host_install_help();
+    } else if (!strcmp_local(cmd, "install memory")) {
+        if (install_memory_only() == 0)
+            print("install memory: done\n");
+        else
+            print("install memory: failed\n");
     } else if (!strncmp_local(cmd, "install info ", 13)) {
         const char* arg = cmd + 13;
         if (*arg == '\0') {
@@ -1426,6 +1611,35 @@ void execute_command(const char* cmd) {
             print("install: add YES to confirm destructive disk write\n");
         } else {
             install_write_target(atoi(target_buf));
+        }
+    } else if (!strncmp_local(cmd, "install fat32 ", 14)) {
+        const char* arg = cmd + 14;
+        char device_buf[16] = {0};
+        size_t i = 0;
+        install_partition_style_t style;
+
+        while (arg[i] && arg[i] != ' ' && i < sizeof(device_buf) - 1) {
+            device_buf[i] = arg[i];
+            i++;
+        }
+        device_buf[i] = '\0';
+        while (arg[i] == ' ') i++;
+
+        if (device_buf[0] == '\0') {
+            print("install: target id required (see `install list`)\n");
+        } else if (!(arg[i] == 'Y' && arg[i + 1] == 'E' && arg[i + 2] == 'S' &&
+                     (arg[i + 3] == '\0' || arg[i + 3] == ' '))) {
+            print("install: usage: install fat32 <id> YES MBR|GPT\n");
+        } else {
+            i += 3;
+            while (arg[i] == ' ') i++;
+            if (arg[i] == '\0') {
+                print("install: choose partition style: MBR or GPT\n");
+            } else if (install_parse_style(arg + i, &style) != 0) {
+                print("install: unknown style (use MBR or GPT)\n");
+            } else {
+                install_fat32_target(atoi(device_buf), style);
+            }
         }
     } else if (!strncmp_local(cmd, "edit ", 5)) {
         const char* filename = cmd + 5;
@@ -1482,6 +1696,15 @@ void execute_command(const char* cmd) {
 
 
 void shell_init() {
+    /* Make sure the text-console layer is bound before the prompt tries
+     * to write its first cell. The x64 VGA-compat boot path binds the
+     * console explicitly in framebuffer_bringup() (VGA on legacy BIOS,
+     * the GOP framebuffer on UEFI). For every other path -- and as a
+     * defensive fallback -- bind the VGA backend here so shell output
+     * always lands somewhere visible. con_init_vga is idempotent. */
+    if (!con_ready()) {
+        con_init_vga();
+    }
     clear_input();
     prompt();
 }
@@ -1578,7 +1801,7 @@ void shell_run() {
             int r = cursor_row, col = cursor_col;
             restore_prev_cursor_cell();
             input_buffer[input_pos++] = c;
-            put_cell(r, col, c, current_color);
+            put_cell(r, col, c, INPUT_COLOR);
             cursor_row = r;
             cursor_col = col;
             if (++cursor_col >= SCREEN_COLS) { cursor_col = 0; cursor_row++; ensure_scroll(); }

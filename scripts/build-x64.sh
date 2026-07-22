@@ -21,7 +21,7 @@
 #   - GooberOSx86-x64.iso   Hybrid BIOS + UEFI ISO (independent from x86 ISO).
 #
 # Sub-commands (positional, defaults to "build"):
-#   build           Compile + link + ISO.
+#   build           Compile + link + ISO (with embedded installer image).
 #   list-devices    Print host block devices (shared with x86 path).
 #   install         Install to a mounted target device (grub --target=x86_64-efi).
 #
@@ -42,7 +42,8 @@ cd "${REPO_ROOT}"
 BUILD_DIR=build64
 ISO_DIR=iso64
 ISO_OUTPUT="GooberOSx86-x64.iso"
-EMBED_INSTALL_ISO="${EMBED_INSTALL_ISO:-0}"   # off until Phase 3 wires installer back in
+EMBED_INSTALL_ISO="${EMBED_INSTALL_ISO:-0}"
+EMBED_INSTALL_PAYLOAD="${EMBED_INSTALL_PAYLOAD:-1}"
 CC="${X64_CC:-gcc}"
 LD="${X64_LD:-ld}"
 NASM="nasm"
@@ -84,7 +85,10 @@ EOF
 
 set_embed_defs() {
   if [ "${1}" = "1" ]; then
-    EXTRA_DEFS="-DEMBED_INSTALL_ISO=1"
+    EXTRA_DEFS="-DEMBED_INSTALL_PAYLOAD=1"
+    if [ "${EMBED_INSTALL_ISO}" = "1" ]; then
+      EXTRA_DEFS="${EXTRA_DEFS} -DEMBED_INSTALL_ISO=1"
+    fi
   else
     EXTRA_DEFS=""
   fi
@@ -255,6 +259,8 @@ EOF
 }
 
 build_image() {
+  local payload_requested="${EMBED_INSTALL_PAYLOAD}"
+
   print_migration_banner
 
   if ! build_kernel 0 ""; then
@@ -265,6 +271,29 @@ build_image() {
     echo "[x] x64 build failed. Re-run with X64_ALLOW_FAIL=1 to scaffold an ISO without the kernel." >&2
     exit 1
   fi
+
+  if [ "${payload_requested}" = "1" ]; then
+    prepare_install_payload
+    link_install_payload_objects_x64
+    if ! build_kernel 1 ""; then
+      echo "[x] x64 build failed while linking install payload." >&2
+      exit 1
+    fi
+    # ESP image must carry the final (payload-linked) kernel, not pass-1.
+    refresh_fat_template_with_final_kernel
+  fi
+
+  if [ "${EMBED_INSTALL_ISO}" = "1" ]; then
+    rm -f "${BUILD_DIR}/osimage.o"
+    ${LD} -m elf_x86_64 -r -b binary "${ISO_OUTPUT}" -o "${BUILD_DIR}/osimage.o"
+    if ! build_kernel 1 "${BUILD_DIR}/osimage.o"; then
+      echo "[x] x64 build failed while embedding installer ISO." >&2
+      exit 1
+    fi
+    refresh_fat_template_with_final_kernel
+  fi
+
+  stage_iso_install_files
   create_iso_hybrid
 }
 
@@ -305,13 +334,16 @@ build_image() {
 build_kernel() {
   local embed_flag="$1"
   local osimage_obj="${2:-}"
+  local install_objs=""
 
   set_embed_defs "${embed_flag}"
   mkdir -p "${BUILD_DIR}"
+  if [ "${embed_flag}" = "1" ]; then
+    install_objs="${BUILD_DIR}/install_kernel_payload.o ${BUILD_DIR}/install_grub_cfg.o ${BUILD_DIR}/install_boot_img.o ${BUILD_DIR}/install_core_img.o"
+  fi
 
-  # The osimage_obj plumbing is preserved for symmetry with the x86 builder
-  # but Phase 1/2/3a/3b do not embed an installer image. Suppress warning.
-  : "${osimage_obj}"
+  # osimage_obj is present on the second build pass when EMBED_INSTALL_ISO=1.
+  # The shell's `install write <target-id> YES` command streams it to disk.
 
   echo "[x64] Assembling Phase 1 boot stubs (elf64)..."
   ${NASM} -f elf64 boot64.s -o "${BUILD_DIR}/boot64.o"
@@ -322,8 +354,11 @@ build_kernel() {
   ${NASM} -f elf64 isr32_stub64.s     -o "${BUILD_DIR}/isr32_stub64.o"
   ${NASM} -f elf64 irq1_wrapper64.s   -o "${BUILD_DIR}/irq1_wrapper64.o"
   ${NASM} -f elf64 irq12_wrapper64.s  -o "${BUILD_DIR}/irq12_wrapper64.o"
+  ${NASM} -f elf64 irq_pic_stubs64.s  -o "${BUILD_DIR}/irq_pic_stubs64.o"
   ${NASM} -f elf64 setjmp64.s         -o "${BUILD_DIR}/setjmp64.o"
   ${NASM} -f elf64 idt_load64.s       -o "${BUILD_DIR}/idt_load64.o"
+  ${NASM} -f elf64 userspace/syscall64.s -o "${BUILD_DIR}/syscall64.o"
+  ${NASM} -f elf64 userspace/enter_user64.s -o "${BUILD_DIR}/enter_user64.o"
 
   echo "[x64] Compiling Phase 3b unified orchestrator (kernel.c, x64 mode)..."
   compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/timer -Idrivers/video -Ilib \
@@ -348,26 +383,60 @@ build_kernel() {
      vesa, intel_gfx) under -m64..."
   compile_c -I. -Idrivers/io \
     -c drivers/video/vga.c -o "${BUILD_DIR}/vga.o"
+  compile_c -I. -Ifs \
+    -c drivers/diagnostics/driver_log.c -o "${BUILD_DIR}/driver_log.o"
+  compile_c -I. -Idrivers/diagnostics \
+    -c drivers/video/edid.c -o "${BUILD_DIR}/edid.o"
+  compile_c -I. -Idrivers/diagnostics -Idrivers/video -Idrivers/io \
+    -c drivers/video/connector.c -o "${BUILD_DIR}/connector.o"
+  compile_c -I. -Idrivers/diagnostics \
+    -c drivers/video/fb_cache.c -o "${BUILD_DIR}/fb_cache.o"
+  compile_c -I. -Idrivers/diagnostics \
+    -c drivers/video/fb_pat.c -o "${BUILD_DIR}/fb_pat.o"
   compile_c -I. -Idrivers/io \
     -c drivers/video/display.c -o "${BUILD_DIR}/display.o"
+  compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/pci -Idrivers/bios -Idrivers/diagnostics \
+    -c drivers/video/basic_display.c -o "${BUILD_DIR}/basic_display.o"
+  compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/bios -Idrivers/diagnostics \
+    -c drivers/video/bios_vbe.c -o "${BUILD_DIR}/bios_vbe.o"
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/pci -Idrivers/timer \
     -c drivers/video/native_fb.c -o "${BUILD_DIR}/native_fb.o"
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/keyboard -Idrivers/mouse -Ilib \
     -c drivers/video/vesa.c -o "${BUILD_DIR}/vesa.o"
-  compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/pci \
+  compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/pci -Idrivers/diagnostics \
     -c drivers/video/intel_gfx.c -o "${BUILD_DIR}/intel_gfx.o"
+
+  # textcon: 80x25 text-console abstraction with VGA (0xB8000) and
+  # framebuffer (8x16 font into the top-left of the GOP LFB) backends.
+  # Required to give the x64 VGA-compatibility GRUB entries a visible,
+  # interactive shell on both legacy BIOS and UEFI hardware.
+  echo "[x64] Compiling drivers/video/textcon.c (text-console backends) under -m64..."
+  compile_c -I. -Idrivers/io -Idrivers/video \
+    -c drivers/video/textcon.c -o "${BUILD_DIR}/textcon.o"
 
   echo "[x64] Compiling Phase 3c drivers (input, keyboard, mouse) under -m64..."
   compile_c -I. -Idrivers/io \
     -c drivers/input/input.c -o "${BUILD_DIR}/input.o"
+  compile_c -I. -Idrivers/io -Idrivers/input -Idrivers/acpi -Idrivers/hid -Idrivers/i2c -Ilib \
+    -c drivers/input/touchpad.c -o "${BUILD_DIR}/touchpad.o"
   compile_c -I. -Idrivers/io \
     -c drivers/keyboard/keyboard.c -o "${BUILD_DIR}/keyboard.o"
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/input \
     -c drivers/mouse/mouse.c -o "${BUILD_DIR}/mouse.o"
 
+  echo "[x64] Compiling ACPI + I2C HID touchpad support under -m64..."
+  compile_c -I. -Idrivers/io -Ilib \
+    -c drivers/acpi/acpi.c -o "${BUILD_DIR}/acpi.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/timer -Ilib \
+    -c drivers/i2c/designware.c -o "${BUILD_DIR}/i2c_designware.o"
+  compile_c -I. -Idrivers/io -Idrivers/i2c -Ilib \
+    -c drivers/hid/i2c_hid.c -o "${BUILD_DIR}/i2c_hid.o"
+
   echo "[x64] Compiling Phase 3d drivers/pci/pci.c (real PCI scan) under -m64..."
   compile_c -I. -Idrivers/io -Ilib \
     -c drivers/pci/pci.c -o "${BUILD_DIR}/pci.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Ilib \
+    -c drivers/pci/iosf_mbi.c -o "${BUILD_DIR}/iosf_mbi.o"
 
   echo "[x64] Compiling Phase 3d USB host stack (uhci/ohci/ehci/xhci/host) under -m64..."
   compile_c -I. -Idrivers/io -Idrivers/pci \
@@ -377,15 +446,33 @@ build_kernel() {
   compile_c -I. -Idrivers/io -Idrivers/pci \
     -c drivers/usb/host/ehci.c -o "${BUILD_DIR}/usb_ehci.o"
   compile_c -I. -Idrivers/io -Idrivers/pci \
+    -c drivers/usb/host/xhci_port.c -o "${BUILD_DIR}/usb_xhci_port.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci \
+    -c drivers/usb/host/xhci_ctx.c -o "${BUILD_DIR}/usb_xhci_ctx.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci \
     -c drivers/usb/host/xhci.c -o "${BUILD_DIR}/usb_xhci.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/usb \
+    -c drivers/usb/host/xhci_hcd.c -o "${BUILD_DIR}/usb_xhci_hcd.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci \
+    -c drivers/usb/host/baytrail_usb.c -o "${BUILD_DIR}/usb_baytrail.o"
   compile_c -I. -Idrivers/io -Idrivers/pci \
     -c drivers/usb/host/host.c -o "${BUILD_DIR}/usb_host.o"
 
-  echo "[x64] Compiling Phase 3d USB enumeration + HID under -m64..."
+  echo "[x64] Compiling Phase 3d USB core + enumeration + HID under -m64..."
+  compile_c -I. -Idrivers/io -Idrivers/usb -Idrivers/pci \
+    -c drivers/usb/core/usb_device.c -o "${BUILD_DIR}/usb_device.o"
+  compile_c -I. -Idrivers/io -Idrivers/usb -Idrivers/pci \
+    -c drivers/usb/core/usb_hcd.c -o "${BUILD_DIR}/usb_hcd.o"
+  compile_c -I. -Idrivers/io -Idrivers/usb \
+    -c drivers/usb/core/usb_class.c -o "${BUILD_DIR}/usb_class.o"
+  compile_c -I. -Idrivers/io -Idrivers/usb -Idrivers/pci -Idrivers/input \
+    -c drivers/usb/core/usb_core.c -o "${BUILD_DIR}/usb_core.o"
   compile_c -I. -Idrivers/io -Idrivers/usb \
     -c drivers/usb/core/enumeration.c -o "${BUILD_DIR}/usb_enum.o"
   compile_c -I. -Idrivers/io -Idrivers/input \
     -c drivers/usb/hid/hid.c -o "${BUILD_DIR}/usb_hid.o"
+  compile_c -I. -Idrivers/io -Idrivers/usb -Idrivers/input \
+    -c drivers/usb/hid/hid_boot.c -o "${BUILD_DIR}/usb_hid_boot.o"
   compile_c -I. -Idrivers/io -Idrivers/usb \
     -c drivers/usb/usb.c -o "${BUILD_DIR}/usb.o"
 
@@ -404,18 +491,42 @@ build_kernel() {
   # fs_read / fs_write stack the x86 build uses. The desktop calls
   # fs_get_desktop_dir() during init so this must compile clean before the
   # shell or desktop translation units.
-  echo "[x64] Compiling Phase 3e fs/filesystem.c (in-memory tree) under -m64..."
-  compile_c -I. -Idrivers/io -Ilib \
-    -c fs/filesystem.c -o "${BUILD_DIR}/filesystem.o"
+  echo "[x64] Compiling Phase 3e fs/vfs.c + memfs.c + fat32.c under -m64..."
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Ilib -Ifs \
+    -c fs/vfs.c -o "${BUILD_DIR}/vfs.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs \
+    -c fs/memfs.c -o "${BUILD_DIR}/memfs.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Ilib -Ifs \
+    -c fs/fat32.c -o "${BUILD_DIR}/fat32.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs \
+    -c fs/config_boot.c -o "${BUILD_DIR}/config_boot.o"
 
-  # The command shell parser. Storage / editor / taskmgr / games command
-  # bodies are all gated behind `#ifdef __i386__` and replaced on x64 by
-  # `[shell] <cmd>: deferred to phase 3f` stubs (see shell.c::
-  # shell_deferred_3f). reboot() switches to the 8042 keyboard-controller
-  # reset on x64.
+  echo "[x64] Compiling userspace (.gob / GooberC / syscalls) under -m64..."
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Iuserspace \
+    -c userspace/userspace.c -o "${BUILD_DIR}/userspace.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Iuserspace \
+    -c userspace/gooberc.c -o "${BUILD_DIR}/gooberc.o"
+
+  echo "[x64] Compiling install payload + FAT32 deploy module under -m64..."
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib -Ifs \
+    -c install/install_payload.c -o "${BUILD_DIR}/install_payload.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib \
+    -c install/iso9660.c -o "${BUILD_DIR}/iso9660.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib \
+    -c install/grub_bios_embed.c -o "${BUILD_DIR}/install_grub_bios_embed.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib \
+    -c install/gpt_embed.c -o "${BUILD_DIR}/install_gpt_embed.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib \
+    -c install/fat32_mkfs.c -o "${BUILD_DIR}/install_fat32_mkfs.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib \
+    -c install/install_debug.c -o "${BUILD_DIR}/install_debug.o"
+  compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib \
+    -c install/install.c -o "${BUILD_DIR}/install.o"
+
+  # The command shell parser.
   echo "[x64] Compiling Phase 3e shell/shell.c (deferred-stub launchers) under -m64..."
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/keyboard \
-    -Idrivers/timer -Igui -Ifs -Ilib \
+    -Idrivers/timer -Igui -Ifs -Iinstall -Ilib -Iuserspace \
     -c shell/shell.c -o "${BUILD_DIR}/shell.o"
 
   # gui/window.c is the legacy text-mode window manager invoked by the
@@ -441,7 +552,7 @@ build_kernel() {
   echo "[x64] Compiling Phase 3e gui/desktop_vesa.c (desktop WM + apps) under -m64..."
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/keyboard \
     -Idrivers/mouse -Idrivers/input -Idrivers/timer -Idrivers/usb/host \
-    -Ifs -Ishell -Itaskmgr -Ilib \
+    -Ifs -Ishell -Itaskmgr -Ilib -Iuserspace \
     -c gui/desktop_vesa.c -o "${BUILD_DIR}/desktop_vesa.o"
 
   # Phase 4 (display polish, item 5): VGA-text application passthrough shim.
@@ -481,6 +592,10 @@ build_kernel() {
   compile_c -I. -Idrivers/io -c drivers/storage/storage.c -o "${BUILD_DIR}/storage.o"
   echo "[x64] Compiling Phase 3f drivers/storage/sdhci.c (SDHCI/eMMC bring-up) under -m64..."
   compile_c -I. -Idrivers/io -Idrivers/pci -c drivers/storage/sdhci.c -o "${BUILD_DIR}/sdhci.o"
+  echo "[x64] Compiling Phase 3f drivers/storage/ahci.c (AHCI/SATA block I/O) under -m64..."
+  compile_c -I. -Idrivers/io -Idrivers/pci -c drivers/storage/ahci.c -o "${BUILD_DIR}/ahci.o"
+  echo "[x64] Compiling Phase 3f drivers/storage/partition.c under -m64..."
+  compile_c -I. -Idrivers/io -Idrivers/pci -c drivers/storage/partition.c -o "${BUILD_DIR}/partition.o"
   # bios_disk.c is intentionally compiled in: the body is fully gated
   # under #ifdef __i386__, the resulting .o is empty for x64, and
   # --gc-sections drops it from the link. Keeps the build rule symmetry
@@ -517,8 +632,11 @@ build_kernel() {
       "${BUILD_DIR}/isr32_stub64.o" \
       "${BUILD_DIR}/irq1_wrapper64.o" \
       "${BUILD_DIR}/irq12_wrapper64.o" \
+      "${BUILD_DIR}/irq_pic_stubs64.o" \
       "${BUILD_DIR}/setjmp64.o" \
       "${BUILD_DIR}/idt_load64.o" \
+      "${BUILD_DIR}/syscall64.o" \
+      "${BUILD_DIR}/enter_user64.o" \
       "${BUILD_DIR}/kernel.o" \
       "${BUILD_DIR}/kernel_x64.o" \
       "${BUILD_DIR}/string.o" \
@@ -526,24 +644,58 @@ build_kernel() {
       "${BUILD_DIR}/timer.o" \
       "${BUILD_DIR}/boot_safety.o" \
       "${BUILD_DIR}/vga.o" \
+      "${BUILD_DIR}/driver_log.o" \
+      "${BUILD_DIR}/edid.o" \
+      "${BUILD_DIR}/connector.o" \
+      "${BUILD_DIR}/fb_cache.o" \
+      "${BUILD_DIR}/fb_pat.o" \
       "${BUILD_DIR}/display.o" \
+      "${BUILD_DIR}/bios_vbe.o" \
+      "${BUILD_DIR}/basic_display.o" \
       "${BUILD_DIR}/native_fb.o" \
       "${BUILD_DIR}/vesa.o" \
       "${BUILD_DIR}/intel_gfx.o" \
+      "${BUILD_DIR}/textcon.o" \
       "${BUILD_DIR}/input.o" \
+      "${BUILD_DIR}/touchpad.o" \
+      "${BUILD_DIR}/acpi.o" \
+      "${BUILD_DIR}/i2c_designware.o" \
+      "${BUILD_DIR}/i2c_hid.o" \
       "${BUILD_DIR}/keyboard.o" \
       "${BUILD_DIR}/mouse.o" \
       "${BUILD_DIR}/pci.o" \
+      "${BUILD_DIR}/iosf_mbi.o" \
       "${BUILD_DIR}/usb_uhci.o" \
       "${BUILD_DIR}/usb_ohci.o" \
       "${BUILD_DIR}/usb_ehci.o" \
+      "${BUILD_DIR}/usb_xhci_port.o" \
+      "${BUILD_DIR}/usb_xhci_ctx.o" \
       "${BUILD_DIR}/usb_xhci.o" \
+      "${BUILD_DIR}/usb_xhci_hcd.o" \
+      "${BUILD_DIR}/usb_baytrail.o" \
       "${BUILD_DIR}/usb_host.o" \
+      "${BUILD_DIR}/usb_device.o" \
+      "${BUILD_DIR}/usb_hcd.o" \
+      "${BUILD_DIR}/usb_class.o" \
+      "${BUILD_DIR}/usb_core.o" \
       "${BUILD_DIR}/usb_enum.o" \
       "${BUILD_DIR}/usb_hid.o" \
+      "${BUILD_DIR}/usb_hid_boot.o" \
       "${BUILD_DIR}/usb.o" \
       "${BUILD_DIR}/usb_msc.o" \
-      "${BUILD_DIR}/filesystem.o" \
+      "${BUILD_DIR}/vfs.o" \
+      "${BUILD_DIR}/memfs.o" \
+      "${BUILD_DIR}/fat32.o" \
+      "${BUILD_DIR}/config_boot.o" \
+      "${BUILD_DIR}/userspace.o" \
+      "${BUILD_DIR}/gooberc.o" \
+      "${BUILD_DIR}/install_payload.o" \
+      "${BUILD_DIR}/iso9660.o" \
+      "${BUILD_DIR}/install_grub_bios_embed.o" \
+      "${BUILD_DIR}/install_gpt_embed.o" \
+      "${BUILD_DIR}/install_fat32_mkfs.o" \
+      "${BUILD_DIR}/install_debug.o" \
+      "${BUILD_DIR}/install.o" \
       "${BUILD_DIR}/shell.o" \
       "${BUILD_DIR}/window.o" \
       "${BUILD_DIR}/vesa_window.o" \
@@ -551,6 +703,8 @@ build_kernel() {
       "${BUILD_DIR}/vga_passthrough.o" \
       "${BUILD_DIR}/storage.o" \
       "${BUILD_DIR}/sdhci.o" \
+      "${BUILD_DIR}/ahci.o" \
+      "${BUILD_DIR}/partition.o" \
       "${BUILD_DIR}/bios_disk.o" \
       "${BUILD_DIR}/editor.o" \
       "${BUILD_DIR}/taskmgr.o" \
@@ -558,7 +712,9 @@ build_kernel() {
       "${BUILD_DIR}/snake.o" \
       "${BUILD_DIR}/cubeDip.o" \
       "${BUILD_DIR}/pong.o" \
-      "${BUILD_DIR}/doom.o"
+      "${BUILD_DIR}/doom.o" \
+      ${osimage_obj} \
+      ${install_objs}
 
   echo "[+] x64 Kernel built: ${BUILD_DIR}/kernel.bin"
   return 0

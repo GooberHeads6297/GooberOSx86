@@ -38,13 +38,23 @@ irq1_handler_asm:
 
     ; Align stack for SysV AMD64 (15 pushes => 8 bytes off 16).
     sub rsp, 8
-    call irq1_handler_main
-    add rsp, 8
 
-    ; EOI to master PIC. (Kept here so the lifetime of the spurious-IRQ
-    ; window stays as small as possible; matches the 32-bit convention.)
+    ; Service the device FIRST (the C handler drains the 8042 output buffer,
+    ; which drops the IRQ1 line), THEN send EOI.
+    ;
+    ; EOI-first was wrong on VirtualBox: issuing a non-specific EOI while the
+    ; keyboard line is still asserted (OBF still full, data not yet read) left
+    ; the 8259 in-service bit for IRQ1 effectively stuck. The timer (IRQ0, higher
+    ; priority) kept firing, but every subsequent keypress filled OBF and was
+    ; never delivered -- the keyboard died after exactly one key. The C handler's
+    ; drain loop is bounded, so it cannot stall here; ack once it returns with
+    ; the line already low.
+    call irq1_handler_main
+
     mov al, 0x20
     out 0x20, al
+
+    add rsp, 8
 
     pop r15
     pop r14

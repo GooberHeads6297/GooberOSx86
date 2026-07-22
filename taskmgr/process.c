@@ -14,79 +14,22 @@ static void str_copy(char *dest, const char *src, size_t max_len) {
     dest[i] = '\0';
 }
 
-static void print_process_table_debug() {
-    vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    int row = 0;
-    for (int i = 0; i < process_count; i++) {
-        process_entry_t *p = &process_table[i];
-        if (!p->active) continue;
-        char line[64];
-        int pos = 0;
-        line[pos++] = 'P'; line[pos++] = 'I'; line[pos++] = 'D'; line[pos++] = ':';
-        line[pos++] = ' ';
-        int pid = p->pid;
-        char pid_buf[6] = {0};
-        int pid_len = 0;
-        if (pid == 0) {
-            pid_buf[pid_len++] = '0';
-        } else {
-            int temp = pid;
-            while (temp > 0) {
-                pid_buf[pid_len++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            for (int j = 0; j < pid_len/2; j++) {
-                char t = pid_buf[j];
-                pid_buf[j] = pid_buf[pid_len - 1 - j];
-                pid_buf[pid_len - 1 - j] = t;
-            }
-        }
-        for (int j = 0; j < pid_len; j++) {
-            line[pos++] = pid_buf[j];
-        }
-        line[pos++] = ' ';
-        line[pos++] = 'N'; line[pos++] = 'a'; line[pos++] = 'm'; line[pos++] = 'e'; line[pos++] = ':';
-        line[pos++] = ' ';
-        for (int j = 0; j < 15 && p->name[j] != '\0'; j++) {
-            line[pos++] = p->name[j];
-        }
-        line[pos++] = ' ';
-        line[pos++] = 'M'; line[pos++] = 'e'; line[pos++] = 'm'; line[pos++] = ':';
-        line[pos++] = ' ';
-        size_t mem = p->memory_kb;
-        char mem_buf[10] = {0};
-        int mem_len = 0;
-        if (mem == 0) {
-            mem_buf[mem_len++] = '0';
-        } else {
-            size_t temp = mem;
-            while (temp > 0) {
-                mem_buf[mem_len++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            for (int j = 0; j < mem_len/2; j++) {
-                char t = mem_buf[j];
-                mem_buf[j] = mem_buf[mem_len - 1 - j];
-                mem_buf[mem_len - 1 - j] = t;
-            }
-        }
-        for (int j = 0; j < mem_len; j++) {
-            line[pos++] = mem_buf[j];
-        }
-        line[pos++] = 'K';
-        line[pos++] = 'B';
-        line[pos++] = '\0';
-
-        for (int c = 0; c < pos; c++) {
-            vga_put_char_at(line[c], c, row, VGA_COLOR_LIGHT_GREEN | (VGA_COLOR_BLACK << 4));
-        }
-        row++;
+const char* process_state_name(process_state_t s) {
+    switch (s) {
+    case PROC_STATE_READY: return "Ready";
+    case PROC_STATE_RUNNING: return "Running";
+    case PROC_STATE_BLOCKED: return "Blocked";
+    case PROC_STATE_ZOMBIE: return "Zombie";
+    default: return "?";
     }
 }
 
-int create_process(const char *name, size_t memory_kb) {
-    if (process_count >= MAX_PROCESSES) return -1;
+const char* process_kind_name(process_kind_t k) {
+    return k == PROC_KIND_GOB ? "GooberApp" : "Kernel";
+}
 
+int create_process_ex(const char *name, size_t memory_kb, process_kind_t kind) {
+    if (process_count >= MAX_PROCESSES) return -1;
     process_entry_t *p = &process_table[process_count];
     p->pid = next_pid++;
     str_copy(p->name, name, sizeof(p->name));
@@ -96,26 +39,37 @@ int create_process(const char *name, size_t memory_kb) {
     p->render_ticks = 0;
     p->input_events = 0;
     p->active = true;
-
+    p->kind = kind;
+    p->state = PROC_STATE_RUNNING;
     process_count++;
-
-    
-
     return p->pid;
+}
+
+int create_process(const char *name, size_t memory_kb) {
+    return create_process_ex(name, memory_kb, PROC_KIND_KERNEL);
+}
+
+process_entry_t* process_get(int pid) {
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].pid == pid && process_table[i].active)
+            return &process_table[i];
+    }
+    return 0;
+}
+
+void process_set_state(int pid, process_state_t state) {
+    process_entry_t* p = process_get(pid);
+    if (p) p->state = state;
 }
 
 void kill_process(int pid) {
     for (int i = 0; i < process_count; i++) {
         if (process_table[i].pid == pid && process_table[i].active) {
             process_table[i].active = false;
-            // Shift remaining entries left to fill gap
-            for (int j = i; j < process_count - 1; j++) {
+            process_table[i].state = PROC_STATE_ZOMBIE;
+            for (int j = i; j < process_count - 1; j++)
                 process_table[j] = process_table[j + 1];
-            }
             process_count--;
-
-            print_process_table_debug();
-
             return;
         }
     }
@@ -144,9 +98,9 @@ int terminate_process(int pid) {
             if (names_equal(process_table[i].name, "kernel.bin"))
                 return PROCESS_KILL_PROTECTED;
             process_table[i].active = false;
-            for (int j = i; j < process_count - 1; j++) {
+            process_table[i].state = PROC_STATE_ZOMBIE;
+            for (int j = i; j < process_count - 1; j++)
                 process_table[j] = process_table[j + 1];
-            }
             process_count--;
             return 1;
         }
@@ -164,14 +118,10 @@ process_entry_t* get_kernel_process_table() {
 
 void update_process_runtime_metrics(int pid, uint32_t runtime_ticks, uint32_t frame_ticks,
                                     uint32_t render_ticks, uint32_t input_events) {
-    for (int i = 0; i < process_count; i++) {
-        process_entry_t *p = &process_table[i];
-        if (p->pid == pid && p->active) {
-            p->runtime_ticks = runtime_ticks;
-            p->frame_ticks = frame_ticks;
-            p->render_ticks = render_ticks;
-            p->input_events = input_events;
-            return;
-        }
-    }
+    process_entry_t *p = process_get(pid);
+    if (!p) return;
+    p->runtime_ticks = runtime_ticks;
+    p->frame_ticks = frame_ticks;
+    p->render_ticks = render_ticks;
+    p->input_events = input_events;
 }

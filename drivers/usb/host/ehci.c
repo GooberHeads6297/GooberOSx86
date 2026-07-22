@@ -1,6 +1,9 @@
 #include "ehci.h"
+#include "baytrail_usb.h"
 #include "../../io/io.h"
 #include "../../timer/timer.h"
+#include "../../pci/pci.h"
+#include "../../diagnostics/driver_log.h"
 
 extern void print(const char* str);
 
@@ -270,8 +273,10 @@ int ehci_init(const usb_pci_controller_t* controller) {
 
     uint16_t cmd = pci_read_config_word(controller->bus, controller->slot,
                                         controller->func, 0x04);
+    /* MEM|BM and clear Interrupt Disable (bit 10) — Bay Trail quirk. */
+    cmd = (uint16_t)((cmd | 0x0006U) & ~(1U << 10));
     pci_write_config_word(controller->bus, controller->slot,
-                          controller->func, 0x04, cmd | 0x06);
+                          controller->func, 0x04, cmd);
 
     ehci_cap = (volatile uint8_t*)(uintptr_t)(bar0 & 0xFFFFFFF0);
     uint8_t cap_len = *ehci_cap;
@@ -396,16 +401,21 @@ void ehci_port_change_ack(int port) {
 
 /*
  * EHCI port reset: high-speed handshake.
- * - If line status reports a low-/full-speed device, hand off to companion
- *   controller immediately (set PORT_OWNER) so UHCI/OHCI can drive it.
- * - Otherwise, hold reset for at least 50 ms (USB 2.0 §7.1.7.5), then clear
- *   and wait for the controller to enable the port. If it never enables,
- *   hand the port to the companion as well.
+ * - Low-speed (K-state): hand to UHCI/OHCI companion when one exists.
+ * - Otherwise hold reset ≥50 ms; if PE never sticks (typical FS) and a
+ *   companion exists, set PORT_OWNER. On Bay Trail with no companion, do NOT
+ *   orphan the port — log loudly (FS/LS need xHCI route or UHCI).
  */
 void ehci_port_reset(int port) {
     if (!ehci_ready || port < 0 || (uint32_t)port >= ehci_ports) return;
     uint32_t reg = EHCI_PORTSC_BASE + (uint32_t)port * 4;
     uint32_t v = ehci_read32(reg);
+    int have_companion = baytrail_usb_has_ls_companion();
+    /* Non-Bay Trail systems usually have UHCI/OHCI; assume companion present
+     * unless this is a Bay Trail SoC with an empty companion scan. */
+    if (!baytrail_usb_is_soc())
+        have_companion = 1;
+
     if (!(v & EHCI_PORT_CCS)) return;
 
     /* Make sure the port is powered before we read line status. */
@@ -415,10 +425,16 @@ void ehci_port_reset(int port) {
         v = ehci_read32(reg);
     }
 
-    /* Line status 01 = K-state = low-speed device. Hand it to companion. */
+    /* Line status 01 = K-state = low-speed device. */
     if ((v & EHCI_PORT_LINE) == (1U << 10)) {
-        ehci_write32(reg, v | EHCI_PORT_OWNER);
-        ehci_print("EHCI: low-speed device, handed to companion.\n");
+        if (have_companion) {
+            ehci_write32(reg, v | EHCI_PORT_OWNER);
+            ehci_print("EHCI: low-speed device, handed to companion.\n");
+        } else {
+            ehci_print("USB2ROUTE: LS mouse needs companion (absent) "
+                       "-- keep on EHCI (will fail without UHCI/xHCI route).\n");
+            driver_log_line("USB2ROUTE: LS mouse needs companion (absent).");
+        }
         return;
     }
 
@@ -440,9 +456,15 @@ void ehci_port_reset(int port) {
 
     v = ehci_read32(reg);
     if (!(v & EHCI_PORT_PE)) {
-        /* Reset didn't enable the port: full-speed device, hand to companion. */
-        ehci_write32(reg, v | EHCI_PORT_OWNER);
-        ehci_print("EHCI: port did not enable, handed to companion.\n");
+        if (have_companion) {
+            ehci_write32(reg, v | EHCI_PORT_OWNER);
+            ehci_print("EHCI: port did not enable, handed to companion.\n");
+        } else {
+            /* Bay Trail: classical EHCI cannot speak FS — need xHCI route. */
+            ehci_print("USB2ROUTE: FS device PE failed, no companion "
+                       "-- need XUSB2PR->xHCI (not orphaning).\n");
+            driver_log_line("USB2ROUTE: FS device PE failed, no companion.");
+        }
     }
 }
 

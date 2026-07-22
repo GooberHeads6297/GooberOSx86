@@ -8,6 +8,8 @@ void vesa_set_backbuffer(uint32_t* buffer);
 void vesa_set_backbuffer_bytes(uint32_t* buffer, uint32_t bytes);
 void vesa_swap(void);
 void vesa_swap_rect(int x, int y, int w, int h);
+/* Copy at most max_rows; returns rows actually copied. */
+int  vesa_swap_rect_rows(int x, int y, int w, int h, int max_rows);
 /*
  * Phase 4 (display polish): single tear-free whole-screen present. Copies
  * the back-buffer into the LFB in one shot using memcpy. No-op when no
@@ -18,6 +20,8 @@ void vesa_put_pixel(int x, int y, uint32_t color);
 void vesa_fill_rect(int x, int y, int w, int h, uint32_t color);
 void vesa_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg);
 void vesa_draw_string(int x, int y, const char* str, uint32_t fg, uint32_t bg);
+void vesa_set_clip(int x, int y, int w, int h);
+void vesa_clear_clip(void);
 void vesa_clear(uint32_t color);
 void vesa_update(void);
 void vesa_boot_splash(const char* status);

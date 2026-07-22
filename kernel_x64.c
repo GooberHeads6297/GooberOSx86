@@ -10,10 +10,8 @@
  *   - x64_arch_idt_install()                  -- 64-bit IDT (256 gates,
  *                                                exception_stubs + IRQ0/1/12)
  *   - x64_arch_pic_remap()                    -- legacy 8259 remap
- *   - x64_arch_walk_and_draw_framebuffer(info) -- Phase 3a/3a.1 preserved
- *                                                  output: mb2 framebuffer
- *                                                  tag walk + RGB bands +
- *                                                  3-line 8x16 proof-of-life
+ *   - x64_arch_walk_and_draw_framebuffer(info) -- mb2 framebuffer tag walk
+ *                                                  and serial diagnostics
  *   - x64_arch_legacy_vga_text_line(s)        -- one line of 0xB8000 text
  *                                                (visible on legacy BIOS;
  *                                                 silently dropped on UEFI)
@@ -64,10 +62,26 @@ void x64_arch_serial_init(void) {
  * is reachable (the Phase 1 hand-off log runs while x64_arch_serial_init
  * is still the only thing that has touched COM1). */
 
+/*
+ * Bounded COM1 wait. Real laptops (Acer R3-131T) often have no usable
+ * UART at 0x3F8; an unbounded LSR.THRE spin hangs boot mid-string and
+ * floating-bus reads make it intermittent. After one timeout, skip COM1
+ * for the rest of this file's early log; 0xE9 still works under QEMU.
+ */
+static int g_x64_com1_tx_ok = 1;
+
 static void x64_putc(char c) {
-    while ((inb(COM1 + 5) & 0x20) == 0) { /* spin on LSR.THRE */ }
-    outb(COM1, (uint8_t)c);
     outb(0xE9, (uint8_t)c);
+    if (g_x64_com1_tx_ok) {
+        uint32_t i;
+        for (i = 0; i < 100000u; i++) {
+            if (inb(COM1 + 5) & 0x20) {
+                outb(COM1, (uint8_t)c);
+                return;
+            }
+        }
+        g_x64_com1_tx_ok = 0;
+    }
 }
 
 static void x64_out(const char* s) { while (*s) x64_putc(*s++); }
@@ -154,11 +168,12 @@ void x64_arch_dump_multiboot(uint32_t magic, uintptr_t info) {
 }
 
 /* ========================================================================
- * Phase 3a / 3a.1: Multiboot2 framebuffer tag walk + RGB test pattern +
- * 8x16 on-panel proof-of-life. PRESERVED from the 3b.0 milestone, lifted
- * into x64_arch_walk_and_draw_framebuffer() so the unified kernel.c
- * orchestrator drives the same draw sequence in the same place in the
- * boot log.
+ * Multiboot2 framebuffer tag walk + serial diagnostics.
+ *
+ * Draw a tiny proof-of-life immediately after the trampoline hands control to
+ * the kernel. On some laptops the firmware logo remains on screen until the
+ * first GOP/LFB write; waiting for later driver stages makes a slow or wedged
+ * hardware probe look like a display failure.
  * ======================================================================== */
 
 struct goober_fb {
@@ -261,7 +276,7 @@ static void print_framebuffer_tag(const struct goober_fb* fb) {
     }
 }
 
-/* ---- channel-aware pixel packer + test pattern + 8x16 console renderer -- */
+/* ---- channel-aware pixel packer + 8x16 console renderer ---------------- */
 
 static uint32_t fb_pack_pixel(const struct goober_fb* fb, uint32_t xrgb) {
     uint32_t r = (xrgb >> 16) & 0xFFu;
@@ -319,50 +334,6 @@ static void fb_draw_band(const struct goober_fb* fb,
         }
         row += fb->pitch;
     }
-}
-
-static void draw_fb_test_pattern(const struct goober_fb* fb) {
-    if (!fb->present) return;
-
-    if (fb->type == 2) {
-        x64_out("[fb] EGA text mode from loader; skipping test pattern\n");
-        return;
-    }
-    if (fb->type != 1) {
-        x64_out("[fb] type=");
-        x64_out_dec((uint64_t)fb->type);
-        x64_out(" (not RGB); skipping test pattern\n");
-        return;
-    }
-    if (fb->bpp != 32 && fb->bpp != 24 && fb->bpp != 16 && fb->bpp != 15) {
-        x64_out("[fb] bpp=");
-        x64_out_dec((uint64_t)fb->bpp);
-        x64_out(" unsupported (need 15/16/24/32); skipping test pattern\n");
-        return;
-    }
-    if (fb->width == 0 || fb->height == 0 || fb->pitch == 0) {
-        x64_out("[fb] zero geometry; skipping test pattern\n");
-        return;
-    }
-
-    const uint32_t RED   = 0x00FF0000u;
-    const uint32_t GREEN = 0x0000FF00u;
-    const uint32_t BLUE  = 0x000000FFu;
-
-    uint32_t band_h = 200;
-    if (band_h > fb->height / 3) band_h = fb->height / 3;
-    if (band_h == 0) band_h = fb->height;
-
-    uint32_t middle_y = (fb->height / 2) - (band_h / 2);
-    uint32_t bottom_y = (fb->height > band_h) ? (fb->height - band_h) : 0;
-
-    fb_draw_band(fb, 0, 0,        fb->width, band_h, RED);
-    fb_draw_band(fb, 0, middle_y, fb->width, band_h, GREEN);
-    fb_draw_band(fb, 0, bottom_y, fb->width, band_h, BLUE);
-
-    x64_out("[fb] test pattern drawn (RGB, bpp=");
-    x64_out_dec((uint64_t)fb->bpp);
-    x64_out(")\n");
 }
 
 /* ---- 8x16 on-panel proof-of-life (preserved from 3b.0) ------------------ */
@@ -454,6 +425,7 @@ static void fb_render_proof_of_life(const struct goober_fb* fb) {
     const uint32_t WHITE = 0x00FFFFFFu;
     const uint32_t BLACK = 0x00000000u;
 
+    fb_draw_band(fb, 0, 0, fb->width, 64, BLACK);
     fb_print_at(0, 0, "GooberOSx86 x64  Phase 3a.1", WHITE, BLACK);
 
     char line1[96];
@@ -483,7 +455,6 @@ void x64_arch_walk_and_draw_framebuffer(uintptr_t info) {
      * framebuffer tag, so this is safe). */
     mb2_walk_framebuffer(info, &g_fb);
     print_framebuffer_tag(&g_fb);
-    draw_fb_test_pattern(&g_fb);
     fb_render_proof_of_life(&g_fb);
 }
 
@@ -538,8 +509,12 @@ typedef struct __attribute__((packed)) {
     uint64_t base;
 } idt64_pointer_t;
 
-static idt64_entry_t   g_idt[256];
-static idt64_pointer_t g_idt_ptr;
+/* Placed in .idt (linker64.ld) BEFORE the large .bss heap arena so a
+ * kmalloc overrun cannot wipe interrupt gates. */
+static idt64_entry_t   g_idt[256]
+    __attribute__((section(".idt"), aligned(16)));
+static idt64_pointer_t g_idt_ptr
+    __attribute__((section(".idt")));
 
 extern void load_idt64(idt64_pointer_t* ptr);
 
@@ -555,6 +530,19 @@ extern void isr28_stub(void); extern void isr29_stub(void); extern void isr30_st
 extern void isr32_stub(void);            /* IRQ0 timer */
 extern void irq1_handler_asm(void);      /* IRQ1 keyboard */
 extern void irq12_handler_asm(void);     /* IRQ12 mouse */
+extern void irq2_spurious_asm(void);
+extern void irq3_spurious_asm(void);
+extern void irq4_spurious_asm(void);
+extern void irq5_spurious_asm(void);
+extern void irq6_spurious_asm(void);
+extern void irq7_spurious_asm(void);
+extern void irq8_spurious_asm(void);
+extern void irq9_spurious_asm(void);
+extern void irq10_spurious_asm(void);
+extern void irq11_spurious_asm(void);
+extern void irq13_spurious_asm(void);
+extern void irq14_spurious_asm(void);
+extern void irq15_spurious_asm(void);
 
 static void (*const exception_stubs64[32])(void) = {
     isr0_stub,  isr1_stub,  isr2_stub,  isr3_stub,
@@ -586,13 +574,32 @@ void x64_arch_idt_install(void) {
         set_idt_entry64(v, exception_stubs64[v], 0x08, 0, 0x8E);
     set_idt_entry64(0x20, isr32_stub,        0x08, 0, 0x8E);  /* IRQ0 timer */
     set_idt_entry64(0x21, irq1_handler_asm,  0x08, 0, 0x8E);  /* IRQ1 kbd */
+    set_idt_entry64(0x22, irq2_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x23, irq3_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x24, irq4_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x25, irq5_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x26, irq6_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x27, irq7_spurious_asm, 0x08, 0, 0x8E);  /* IRQ7 spurious */
+    set_idt_entry64(0x28, irq8_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x29, irq9_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x2A, irq10_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x2B, irq11_spurious_asm, 0x08, 0, 0x8E);
     set_idt_entry64(0x2C, irq12_handler_asm, 0x08, 0, 0x8E);  /* IRQ12 mouse */
+    set_idt_entry64(0x2D, irq13_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x2E, irq14_spurious_asm, 0x08, 0, 0x8E);
+    set_idt_entry64(0x2F, irq15_spurious_asm, 0x08, 0, 0x8E); /* IRQ15 spurious */
 
     g_idt_ptr.limit = (uint16_t)(sizeof(g_idt) - 1);
     g_idt_ptr.base  = (uint64_t)(uintptr_t)&g_idt[0];
     load_idt64(&g_idt_ptr);
     x64_out("[phase3b] x64 IDT installed (256 gates, 32 exception stubs + "
-            "IRQ0/IRQ1/IRQ12).\n");
+            "full PIC 0x20..0x2F coverage).\n");
+}
+
+/* DPL=3 interrupt gate so ring-3 may execute `int 0x80`. */
+void x64_idt_set_user_gate(int vec, void (*handler)(void)) {
+    if (vec < 0 || vec >= 256 || !handler) return;
+    set_idt_entry64(vec, handler, 0x08, 0, 0xEE); /* present, DPL=3, interrupt gate */
 }
 
 /* ========================================================================
@@ -624,10 +631,15 @@ void x64_arch_pic_remap(void) {
 
     /* master: enable IRQ0,1,2 -> mask = 0xF8 */
     outb(0x21, 0xF8);
-    /* slave:  enable IRQ12 (bit 4) -> mask = 0xEF */
-    outb(0xA1, 0xEF);
+    /*
+     * Keep the entire slave PIC masked (including IRQ12). Acer R3-131T has
+     * no PS/2 aux mouse; unmasking IRQ12 before mouse_init() lets spurious
+     * slave IRQs preempt boot. USB HID enables its own path later; PS/2
+     * mouse_init() will clear the IRQ12 mask if ever called.
+     */
+    outb(0xA1, 0xFF);
     x64_out("[phase3b] PIC remapped: master=0x20..0x27 (IRQ0/1/2 unmasked), "
-            "slave=0x28..0x2F (IRQ12 unmasked).\n");
+            "slave=0x28..0x2F (all masked; IRQ12 deferred).\n");
 }
 
 /* ========================================================================

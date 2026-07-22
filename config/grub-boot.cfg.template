@@ -1,0 +1,3 @@
+# Generated from Config/boot.cfg — do not edit by hand; kernel resyncs this.
+set timeout=3
+set default=0

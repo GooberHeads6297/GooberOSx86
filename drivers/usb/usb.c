@@ -1,10 +1,15 @@
 #include "usb.h"
 #include "host/host.h"
+#include "host/baytrail_usb.h"
 #include "core/enumeration.h"
+#include "core/usb_core.h"
 #include "hid/hid.h"
+#include "storage/msc.h"
 #include "../input/input.h"
 #include "../io/io.h"
 #include "../timer/timer.h"
+#include "../pci/pci.h"
+#include "../diagnostics/driver_log.h"
 #include "../../kernel.h"
 #include <stddef.h>
 
@@ -66,6 +71,12 @@ static uint32_t hotplug_next_check = 0;
 static int hotplug_initialized = 0;
 static int hotplug_enabled = 0;
 static uint8_t port_addr[HOTPLUG_MAX_PORTS];
+static uint8_t port_kind[HOTPLUG_MAX_PORTS]; /* 0=none, 1=HID, 2=MSC */
+static uint32_t port_debounce_until[HOTPLUG_MAX_PORTS];
+#define HOTPLUG_KIND_NONE 0
+#define HOTPLUG_KIND_HID  1
+#define HOTPLUG_KIND_MSC  2
+#define HOTPLUG_DEBOUNCE_TICKS 20  /* ~200 ms at 100 Hz */
 
 /* Serial debug output via Bochs port 0xE9 */
 static void usb_serial(const char* s) {
@@ -74,14 +85,52 @@ static void usb_serial(const char* s) {
 
 /* Replacement for print() that also goes to serial port */
 static void usb_print(const char* s) {
+    driver_log(s);
     print(s);
     usb_serial(s);
 }
 
 static int usb_initialized = 0;
+static int usb_stack_is_new = 1;
+/* 1 when usb_init intentionally skipped host bring-up (Braswell desktop-first). */
+static int usb_poll_disabled = 0;
+
+/*
+ * Acer R3-131T / Braswell: detect 8086:22B5 via the safe PCI walk only.
+ * Any further USB init (print sink mid-line, xHCI MMIO, BYT companion) has
+ * hard-stalled this board; skip the whole stage so desktop boot can finish.
+ * Opt back in later with a hardened probe path.
+ */
+static int usb_pci_is_braswell_xhci(void) {
+    usb_pci_controller_t ctrls[8];
+    int n = pci_find_usb_controllers(ctrls, 8);
+    int i;
+    for (i = 0; i < n && i < 8; i++) {
+        if (ctrls[i].vendor_id == 0x8086U && ctrls[i].device_id == 0x22B5U &&
+            ctrls[i].prog_if == 0x30)
+            return 1;
+    }
+    return 0;
+}
+
+static int usb_stack_new_from_config(void) {
+    const boot_config_t* cfg = boot_get_config();
+    if (!cfg || !cfg->usb_stack[0]) return 1; /* default: new */
+    if (usb_str_eq(cfg->usb_stack, "legacy")) return 0;
+    return 1;
+}
 
 void usb_init(void) {
     if (usb_initialized) return;
+
+    if (usb_pci_is_braswell_xhci()) {
+        driver_log_line("USB: Braswell 8086:22B5 -- stage skipped (desktop-first)");
+        input_set_usb_pointer_active(0);
+        usb_initialized = 1;
+        usb_poll_disabled = 1;
+        usb_stack_is_new = 0;
+        return;
+    }
 
     usb_print("USB: init...\n");
 
@@ -101,6 +150,33 @@ void usb_init(void) {
         return;
     }
 
+    {
+        const boot_config_t* cfg = boot_get_config();
+        baytrail_usb_set_phy_quirks(cfg && cfg->usb_byt_phy);
+    }
+
+    usb_stack_is_new = usb_stack_new_from_config();
+    if (usb_stack_is_new) {
+        /*
+         * New stack currently ships an xHCI HCD. When cmdline asks for
+         * safe/minimal (skip xHCI / UHCI-OHCI only), fall back to legacy
+         * so companion controllers remain reachable.
+         */
+        if (safety >= 1) {
+            usb_print("USB: stack=new unavailable for gooberos.usb=safe|minimal; "
+                      "using legacy host path.\n");
+            usb_stack_is_new = 0;
+        } else {
+            usb_print("USB: stack=new (HCD registry + class drivers)\n");
+            usb_hid_init();
+            usb_core_init();
+            usb_initialized = 1;
+            usb_host_print_usb2_route(usb_print);
+            return;
+        }
+    }
+
+    usb_print("USB: stack=legacy (singleton host fallback)\n");
     usb_hid_init();
     usb_host_scan_reset();
 
@@ -112,20 +188,51 @@ void usb_init(void) {
      */
     int found_pointer = 0;
     int found_keyboard = 0;
-    while (usb_host_try_next_candidate()) {
-        usb_print("USB host candidate: ");
-        usb_print(usb_host_controller_name());
-        usb_print("\n");
-        usb_enumerate_devices();
-        if (usb_hid_has_pointer_device()) {
-            found_pointer = 1;
-            break;
+    int scan_round;
+    int first_round_healthy = 0;
+
+    /*
+     * Second full scan only if the first left the host unhealthy/faulted.
+     * Re-scanning every empty enum doubles port-0 Transaction Error pain on
+     * Bay Trail and can push into a PCI hang before the software watchdog.
+     */
+    for (scan_round = 0; scan_round < 2 && !found_pointer; scan_round++) {
+        if (scan_round > 0) {
+            if (first_round_healthy) {
+                usb_print("USB: skipping re-scan (first pass finished healthy).\n");
+                break;
+            }
+            usb_print("USB: re-scanning hosts once after empty/faulted enum...\n");
+            usb_hid_init();
+            usb_host_scan_reset();
         }
-        if (usb_hid_has_keyboard_device()) {
-            found_keyboard = 1;
-            break;
+
+        while (usb_host_try_next_candidate()) {
+            usb_print("USB host candidate: ");
+            usb_print(usb_host_controller_name());
+            usb_print("\n");
+            usb_enumerate_devices();
+            if (usb_hid_has_pointer_device()) {
+                found_pointer = 1;
+                break;
+            }
+            if (usb_hid_has_keyboard_device()) {
+                found_keyboard = 1;
+                usb_print("USB enum: keyboard present; continuing host fallback chain for pointer.\n");
+                continue;
+            }
+            /* Keep this host if MSC came up — do not tear down for HID-only fallback. */
+            if (usb_msc_is_attached()) {
+                usb_print("USB enum: MSC attached on this host; stopping host fallback.\n");
+                break;
+            }
+            usb_print("USB enum: candidate had no boot HID input, trying next host.\n");
         }
-        usb_print("USB enum: candidate had no boot HID input, trying next host.\n");
+
+        if (scan_round == 0)
+            first_round_healthy = usb_host_ready() && usb_host_is_healthy();
+
+        if (found_pointer || usb_msc_is_attached()) break;
     }
 
     if (found_pointer) {
@@ -136,6 +243,10 @@ void usb_init(void) {
         usb_host_promote_active();
         input_set_usb_pointer_active(0);
         usb_print("USB HID keyboard ready, using PS/2 pointer fallback.\n");
+    } else if (usb_msc_is_attached()) {
+        usb_host_promote_active();
+        input_set_usb_pointer_active(0);
+        usb_print("USB MSC ready (no HID pointer; PS/2 fallback).\n");
     } else {
         input_set_usb_pointer_active(0);
         usb_print("USB HID pointer not available, using PS/2 fallback.\n");
@@ -180,6 +291,8 @@ void usb_init(void) {
     }
 
     usb_initialized = 1;
+    /* Always emit sticky route line at end of init (driverlog may trim). */
+    usb_host_print_usb2_route(usb_print);
 }
 
 /*
@@ -243,16 +356,40 @@ static void usb_hotplug_scan(void) {
         uint16_t bit = (uint16_t)(1u << i);
         if (!(to_examine & bit)) continue;
 
+        /* Debounce CSC chatter (~100-200 ms). */
+        if ((int32_t)(timer_ticks() - port_debounce_until[i]) < 0) {
+            continue;
+        }
+
         int now_connected  = (mask & bit) != 0;
         int was_connected  = (last_port_mask & bit) != 0;
 
         if (now_connected && !was_connected) {
-            /* Connect: enumerate the port + attach the class driver. */
             uint8_t addr = 0;
             int proto = usb_enumerate_port_hotplug(i, &addr);
-            if (proto > 0) {
-                if (i < HOTPLUG_MAX_PORTS) port_addr[i] = addr ? addr : 1;
+            port_debounce_until[i] = timer_ticks() + HOTPLUG_DEBOUNCE_TICKS;
+            if (proto == USB_HID_PROTOCOL_MOUSE ||
+                proto == USB_HID_PROTOCOL_KEYBOARD) {
+                if (i < HOTPLUG_MAX_PORTS) {
+                    port_addr[i] = addr ? addr : 1;
+                    port_kind[i] = HOTPLUG_KIND_HID;
+                }
+                /* Single-device: MSC cannot share the xHCI slot with HID. */
+                if (usb_msc_is_attached()) usb_msc_detach_all();
                 usb_hid_attach(i, addr ? addr : 1, proto);
+            } else if (proto == USB_ENUM_PROTOCOL_MSC) {
+                if (i < HOTPLUG_MAX_PORTS) {
+                    port_addr[i] = addr ? addr : 1;
+                    port_kind[i] = HOTPLUG_KIND_MSC;
+                }
+                usb_print("[usb] hotplug: port-");
+                {
+                    char b[3];
+                    if (i >= 10) { b[0] = '0' + i / 10; b[1] = '0' + i % 10; b[2] = 0; }
+                    else         { b[0] = '0' + i; b[1] = 0; }
+                    usb_print(b);
+                }
+                usb_print(" connect, MSC attached.\n");
             } else if (proto < 0) {
                 usb_print("[usb] hotplug: enumerate aborted "
                           "(controller faulted).\n");
@@ -264,29 +401,51 @@ static void usb_hotplug_scan(void) {
                     else         { b[0] = '0' + i; b[1] = 0; }
                     usb_print(b);
                 }
-                usb_print(" connect, no boot-HID device found.\n");
+                usb_print(" connect, no boot-HID/MSC device found.\n");
             }
         } else if (!now_connected && was_connected) {
-            /* Disconnect: detach the HID driver + drain queued events. */
-            usb_hid_detach(i);
-            input_remove_device(INPUT_DEVICE_USB_MOUSE);
-            input_remove_device(INPUT_DEVICE_USB_TOUCHPAD);
+            port_debounce_until[i] = timer_ticks() + HOTPLUG_DEBOUNCE_TICKS;
+            if (port_kind[i] == HOTPLUG_KIND_MSC ||
+                (usb_msc_is_attached() && usb_msc_attached_port() == i)) {
+                usb_msc_detach(i);
+            } else {
+                usb_hid_detach(i);
+                input_remove_device(INPUT_DEVICE_USB_MOUSE);
+                input_remove_device(INPUT_DEVICE_USB_TOUCHPAD);
+            }
             usb_enumeration_release_active();
-            if (i < HOTPLUG_MAX_PORTS) port_addr[i] = 0;
+            if (i < HOTPLUG_MAX_PORTS) {
+                port_addr[i] = 0;
+                port_kind[i] = HOTPLUG_KIND_NONE;
+            }
         } else if (now_connected && was_connected && (change_mask & bit)) {
-            /* Bus reset event without connectivity change: re-run the
-             * port enumeration so the device returns to a known good
-             * state (e.g. user toggled the cable, hub reset). */
             usb_print("[usb] hotplug: port reset detected, re-enumerating.\n");
-            usb_hid_detach(i);
-            input_remove_device(INPUT_DEVICE_USB_MOUSE);
-            input_remove_device(INPUT_DEVICE_USB_TOUCHPAD);
+            port_debounce_until[i] = timer_ticks() + HOTPLUG_DEBOUNCE_TICKS;
+            if (port_kind[i] == HOTPLUG_KIND_MSC)
+                usb_msc_detach(i);
+            else {
+                usb_hid_detach(i);
+                input_remove_device(INPUT_DEVICE_USB_MOUSE);
+                input_remove_device(INPUT_DEVICE_USB_TOUCHPAD);
+            }
             usb_enumeration_release_active();
             uint8_t addr = 0;
             int proto = usb_enumerate_port_hotplug(i, &addr);
-            if (proto > 0) {
-                if (i < HOTPLUG_MAX_PORTS) port_addr[i] = addr ? addr : 1;
+            if (proto == USB_HID_PROTOCOL_MOUSE ||
+                proto == USB_HID_PROTOCOL_KEYBOARD) {
+                if (i < HOTPLUG_MAX_PORTS) {
+                    port_addr[i] = addr ? addr : 1;
+                    port_kind[i] = HOTPLUG_KIND_HID;
+                }
                 usb_hid_attach(i, addr ? addr : 1, proto);
+            } else if (proto == USB_ENUM_PROTOCOL_MSC) {
+                if (i < HOTPLUG_MAX_PORTS) {
+                    port_addr[i] = addr ? addr : 1;
+                    port_kind[i] = HOTPLUG_KIND_MSC;
+                }
+            } else if (i < HOTPLUG_MAX_PORTS) {
+                port_addr[i] = 0;
+                port_kind[i] = HOTPLUG_KIND_NONE;
             }
         }
     }
@@ -295,11 +454,26 @@ static void usb_hotplug_scan(void) {
 }
 
 void usb_poll(void) {
-    if (!usb_initialized) return;
+    if (!usb_initialized || usb_poll_disabled) return;
+
+    if (usb_stack_is_new) {
+        usb_core_poll();
+        return;
+    }
 
     usb_host_poll();
 
-    if (!usb_host_is_healthy()) {
+    if (usb_host_consumed_recovery()) {
+        usb_hid_register_boot_pointer(0, 0);
+        usb_hid_register_boot_keyboard(0);
+        input_set_usb_pointer_active(0);
+        input_remove_device(INPUT_DEVICE_USB_MOUSE);
+        input_remove_device(INPUT_DEVICE_USB_TOUCHPAD);
+        usb_print("USB: re-enumerating HID after host recovery...\n");
+        usb_enumerate_devices();
+        if (usb_hid_has_pointer_device())
+            input_set_usb_pointer_active(1);
+    } else if (!usb_host_is_healthy()) {
         if (usb_hid_has_pointer_device() || usb_hid_has_keyboard_device()) {
             usb_hid_register_boot_pointer(0, 0);
             usb_hid_register_boot_keyboard(0);
@@ -319,6 +493,7 @@ void usb_poll(void) {
 }
 
 int usb_has_pointer_device(void) {
+    if (usb_stack_is_new) return usb_core_has_pointer();
     return usb_hid_has_pointer_device();
 }
 

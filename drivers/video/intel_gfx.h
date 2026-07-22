@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include "display.h"
+#include "edid.h"
+#include "connector.h"
 
 /*
  * Intel integrated graphics support (Gen7 / Ivy Bridge, HD Graphics 4000).
@@ -144,9 +146,57 @@ typedef struct {
  * heuristics. out must not be NULL. */
 int intel_gfx_probe_scanout(uint32_t fb_w, uint32_t fb_h, intel_scanout_probe_t* out);
 
+/*
+ * MS Basic Display-style firmware scanout query: read the BIOS-programmed
+ * primary plane surface (DSPSURF + DSPSTRIDE) without writing any registers.
+ * The multiboot/GOP framebuffer tag often points at a different buffer than
+ * the one the panel is actually scanning on Bay Trail-class hardware.
+ */
+typedef struct {
+    int      ok;
+    int      pipe;
+    uint32_t fb_phys;      /* GMADR base + DSPSURF graphics offset */
+    uint32_t stride;       /* DSPSTRIDE (bytes per scanline) */
+    uint32_t gfx_offset;   /* raw DSPSURF value (aperture-relative) */
+    uint32_t dspcntr;
+} intel_firmware_scanout_t;
+
+int intel_gfx_read_firmware_scanout(uint32_t expect_w, uint32_t expect_h,
+                                    intel_firmware_scanout_t* out);
+
 /* Detect an Intel display controller. Returns non-zero and fills *out if one
  * is present. out may be NULL. */
 int intel_gfx_detect(intel_gfx_info_t* out);
+
+/* Guarded present helper. Returns non-zero only when a supported Intel display
+ * pipe matching the active framebuffer advances its frame counter before the
+ * timeout. This is read-only and safe for generic inherited-framebuffer use. */
+int intel_gfx_wait_vblank(uint32_t timeout_ticks);
+
+/* Best-effort Intel GMBUS EDID read. Bounded, logs failures, and returns
+ * non-zero only when a checksum-valid base EDID block was parsed. */
+int intel_gfx_read_edid(edid_info_t* out);
+
+/*
+ * Per-port connector inventory (eDP / HDMI / DP / VGA) via GMBUS + HPD.
+ * Fills up to max_out entries; returns the number written. Does not modeset.
+ * allow_gmbus=0: skip DDC/EDID writes (HPD-only / empty); use when firmware
+ * LFB is already scanning — GMBUS has hung Bay Trail / Braswell panels.
+ */
+int intel_gfx_scan_connectors(display_connector_t* out, int max_out);
+int intel_gfx_scan_connectors_ex(display_connector_t* out, int max_out,
+                                 int allow_gmbus);
+
+const char* intel_gfx_generation_name(uint16_t device_id);
+int intel_gfx_uses_ivb_display_regs(uint16_t device_id);
+int intel_gfx_has_gmbus_ddc(uint16_t device_id);
+int intel_gfx_supports_plane_repoint(uint16_t device_id);
+/* Bay Trail / Valleyview (Lenovo 80M4 class). Display MMIO/GMBUS has hung
+ * these panels while a firmware LFB is live — callers should avoid it. */
+int intel_gfx_is_valleyview(uint16_t device_id);
+int intel_gfx_is_braswell(uint16_t device_id);
+/* Non-zero when PCI shows Valleyview/Braswell (safe: config space only). */
+int intel_gfx_is_bay_trail_class(void);
 
 /* Register the Intel display driver with the framework. Registered at LOW
  * priority (after the inherited "vesa" LFB and "bochs" dispi drivers) so the

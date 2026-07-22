@@ -19,7 +19,7 @@ static uint32_t tsc_cycles_per_ms = 0;
 static int      tsc_calibrated = 0;
 
 /* Number of PIT ticks (10 ms each at 100 Hz) to average TSC over at init. */
-#define TSC_CAL_TICKS 10
+#define TSC_CAL_TICKS 3
 
 /*
  * Absolute spin ceiling for the bounded fixed-delay helper. Sized so it never
@@ -27,7 +27,7 @@ static int      tsc_calibrated = 0;
  * still guarantees termination (a few seconds) in the impossible case where
  * the TSC itself stops advancing.
  */
-#define TIMER_DELAY_CEILING 1000000000U
+#define TIMER_DELAY_CEILING 2000000U
 
 void timer_phase(uint32_t hz) {
     uint16_t divisor = (uint16_t)(PIT_FREQUENCY / hz);
@@ -50,12 +50,36 @@ void timer_interrupt_handler() {
 void timer_sleep(uint32_t ms) {
     uint32_t start = tick;
     uint32_t ticks_needed = ms;
+    uint32_t spins = 0;
+    uint32_t last = start;
     if (timer_hz > 0) {
         ticks_needed = (ms * timer_hz + 999) / 1000;
         if (ticks_needed == 0) ticks_needed = 1;
     }
+    /*
+     * Prefer HLT (IRQ0 wakes us). CRITICAL: if IF=0, HLT never returns and
+     * a post-increment spin guard never runs — that hard-froze the desktop
+     * after the first keypress on both VirtualBox and real hardware.
+     * Check RFLAGS.IF; if clear, spin with pause and bail out.
+     */
     while ((tick - start) < ticks_needed) {
-        __asm__ volatile ("hlt");
+        uintptr_t flags;
+#ifdef __x86_64__
+        __asm__ volatile("pushfq; pop %0" : "=r"(flags) :: "memory");
+#else
+        __asm__ volatile("pushf; pop %0" : "=r"(flags) :: "memory");
+#endif
+        if (flags & (1u << 9))
+            __asm__ volatile("hlt");
+        else
+            __asm__ volatile("pause");
+        spins++;
+        if (tick != last) {
+            last = tick;
+            spins = 0;
+        } else if (spins > 100000u) {
+            return;
+        }
     }
 }
 
@@ -88,7 +112,7 @@ void timer_calibrate_tsc(void) {
     /*
      * Bound the calibration spins so that if IRQ0 is somehow not advancing
      * the tick, we fall back to the PIT-tick path instead of hanging here.
-     * The ceiling is huge relative to the ~100 ms we actually expect to wait.
+     * The ceiling is huge relative to the ~30 ms we actually expect to wait.
      */
     uint32_t guard;
 
@@ -105,7 +129,7 @@ void timer_calibrate_tsc(void) {
     uint64_t c1 = rdtsc();
 
     uint64_t elapsed = c1 - c0;
-    /* A 10-tick (100 ms) window stays well under 2^32 cycles for realistic
+    /* A short PIT-tick window stays well under 2^32 cycles for realistic
      * CPU clocks, so reduce to 32 bits before the constant-divisor divide. */
     uint32_t elapsed32 = (uint32_t)elapsed;
     if ((elapsed >> 32) != 0) {
@@ -149,6 +173,7 @@ void timer_busy_wait_ms(uint32_t ms) {
     uint64_t deadline = timer_deadline_ms(ms);
     uint32_t guard = TIMER_DELAY_CEILING;
     while (!timer_deadline_expired(deadline)) {
+        __asm__ volatile("pause");
         if (--guard == 0) break;  /* belt-and-suspenders: never spin forever */
     }
 }

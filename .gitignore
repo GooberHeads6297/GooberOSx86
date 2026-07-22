@@ -1,0 +1,29 @@
+# Build outputs
+/build/
+/build64/
+*.o
+*.bin
+*.iso
+*.img
+
+# Generated ISO staging trees (grub-mkrescue rebuilds these from grub/grub.cfg
+# + build/*.bin every compile; the source config lives under grub/).
+/iso/
+/iso64/
+
+# Install payload staging (rebuilt every compile)
+build/install/
+build64/install/
+**/install-root/
+
+# QEMU / smoke logs
+build/qemu_*.txt
+build64/qemu_*.txt
+
+# Host install scratch
+/mnt/goober/
+
+# Editor / OS junk
+*~
+*.swp
+.DS_Store

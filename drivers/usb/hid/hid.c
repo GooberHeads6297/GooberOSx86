@@ -10,6 +10,24 @@ static int pointer_present = 0;
 static int touchpad_present = 0;
 static int keyboard_present = 0;
 static uint8_t last_keys[6];
+static uint32_t pointer_report_count = 0;
+static uint32_t keyboard_report_count = 0;
+static int logged_left_click = 0;
+static int logged_right_click = 0;
+static int logged_wheel = 0;
+
+typedef struct {
+    uint8_t present;
+    uint8_t is_touchpad;
+    uint8_t port;
+    uint8_t address;
+    uint8_t endpoint;
+    uint16_t max_packet;
+    uint8_t interval;
+} hid_boot_endpoint_state_t;
+
+static hid_boot_endpoint_state_t pointer_state;
+static hid_boot_endpoint_state_t keyboard_state;
 
 /* Single output sink shared by attach/detach so the hot-plug log format is
  * canonical across all callers (boot scan + hot-plug poll). */
@@ -17,12 +35,40 @@ static void hid_serial(const char* s) { while (*s) outb(0xE9, *s++); }
 static void hid_print(const char* s) { print(s); hid_serial(s); }
 
 static void hid_print_int(int n) {
-    char buf[6];
+    char tmp[12];
+    char buf[12];
+    int i = 0;
+    int j = 0;
     if (n < 0) { hid_print("-"); n = -n; }
-    if (n >= 100) { buf[0] = '0' + (n / 100); buf[1] = '0' + ((n / 10) % 10); buf[2] = '0' + (n % 10); buf[3] = 0; }
-    else if (n >= 10) { buf[0] = '0' + (n / 10); buf[1] = '0' + (n % 10); buf[2] = 0; }
-    else { buf[0] = '0' + n; buf[1] = 0; }
+    if (n == 0) {
+        hid_print("0");
+        return;
+    }
+    while (n > 0 && i < (int)sizeof(tmp)) {
+        tmp[i++] = (char)('0' + (n % 10));
+        n /= 10;
+    }
+    while (i > 0 && j < (int)sizeof(buf) - 1) {
+        buf[j++] = tmp[--i];
+    }
+    buf[j] = 0;
     hid_print(buf);
+}
+
+static void hid_print_endpoint(const char* label, const hid_boot_endpoint_state_t* s) {
+    hid_print("[usb-hid] ");
+    hid_print(label);
+    hid_print(": port=");
+    hid_print_int((int)s->port);
+    hid_print(" addr=");
+    hid_print_int((int)s->address);
+    hid_print(" ep=");
+    hid_print_int((int)s->endpoint);
+    hid_print(" maxpkt=");
+    hid_print_int((int)s->max_packet);
+    hid_print(" interval=");
+    hid_print_int((int)s->interval);
+    hid_print(s->is_touchpad ? " touchpad=1\n" : " touchpad=0\n");
 }
 
 static const char hid_key_ascii[128] = {
@@ -63,18 +109,61 @@ void usb_hid_init(void) {
     pointer_present = 0;
     touchpad_present = 0;
     keyboard_present = 0;
+    pointer_state.present = 0;
+    keyboard_state.present = 0;
+    pointer_report_count = 0;
+    keyboard_report_count = 0;
+    logged_left_click = 0;
+    logged_right_click = 0;
+    logged_wheel = 0;
     for (int i = 0; i < 6; i++) last_keys[i] = 0;
 }
 
 void usb_hid_register_boot_pointer(uint8_t present, uint8_t is_touchpad) {
+    usb_hid_register_boot_pointer_detail(present, is_touchpad, 0, 0, 0, 0, 0);
+}
+
+void usb_hid_register_boot_pointer_detail(uint8_t present, uint8_t is_touchpad,
+                                          uint8_t port, uint8_t address,
+                                          uint8_t endpoint, uint16_t max_packet,
+                                          uint8_t interval) {
     pointer_present = present ? 1 : 0;
     touchpad_present = (present && is_touchpad) ? 1 : 0;
+    pointer_state.present = pointer_present;
+    pointer_state.is_touchpad = touchpad_present;
+    pointer_state.port = port;
+    pointer_state.address = address;
+    pointer_state.endpoint = endpoint;
+    pointer_state.max_packet = max_packet;
+    pointer_state.interval = interval;
+    if (pointer_present) {
+        pointer_report_count = 0;
+        hid_print_endpoint("boot pointer attached", &pointer_state);
+        input_set_usb_pointer_active(1);
+        input_set_usb_pointer_kind(touchpad_present);
+    }
 }
 
 void usb_hid_register_boot_keyboard(uint8_t present) {
+    usb_hid_register_boot_keyboard_detail(present, 0, 0, 0, 0, 0);
+}
+
+void usb_hid_register_boot_keyboard_detail(uint8_t present, uint8_t port,
+                                           uint8_t address, uint8_t endpoint,
+                                           uint16_t max_packet, uint8_t interval) {
     keyboard_present = present ? 1 : 0;
+    keyboard_state.present = keyboard_present;
+    keyboard_state.is_touchpad = 0;
+    keyboard_state.port = port;
+    keyboard_state.address = address;
+    keyboard_state.endpoint = endpoint;
+    keyboard_state.max_packet = max_packet;
+    keyboard_state.interval = interval;
     if (!keyboard_present) {
         for (int i = 0; i < 6; i++) last_keys[i] = 0;
+    } else {
+        keyboard_report_count = 0;
+        hid_print_endpoint("boot keyboard attached", &keyboard_state);
     }
 }
 
@@ -89,6 +178,10 @@ static void usb_hid_handle_keyboard_report(const uint8_t* report, uint8_t length
     if (!report || length < 8 || !keyboard_present) return;
     uint8_t modifiers = report[0];
     int shifted = (modifiers & ((1U << 1) | (1U << 5))) != 0;
+    if (keyboard_report_count == 0) {
+        hid_print("[usb-hid] first keyboard interrupt report received.\n");
+    }
+    keyboard_report_count++;
 
     for (int i = 2; i < 8; i++) {
         uint8_t key = report[i];
@@ -115,20 +208,77 @@ void usb_hid_handle_boot_report(const uint8_t* report, uint8_t length) {
     if (length < 3 || !pointer_present) return;
 
     /*
+     * Absolute HID tablets (VirtualBox USB Tablet, many USB 2/3 pointers)
+     * send 16-bit X/Y. Prefer that when the report is long enough.
+     */
+    if (length >= 5) {
+        int off = 0;
+        uint8_t abs_buttons;
+        uint16_t ax;
+        uint16_t ay;
+
+        if (length >= 6 && report[0] >= 1 && report[0] <= 15 &&
+            (report[1] & 0xF8) == 0) {
+            off = 1;
+        }
+        abs_buttons = (uint8_t)(report[off] & 0x07);
+        ax = (uint16_t)report[off + 1] | ((uint16_t)report[off + 2] << 8);
+        ay = (uint16_t)report[off + 3] | ((uint16_t)report[off + 4] << 8);
+        if ((report[off + 2] != 0 || report[off + 4] != 0) &&
+            ax <= 32767U && ay <= 32767U) {
+            if (pointer_report_count == 0) {
+                hid_print("[usb-hid] first absolute pointer report: x=");
+                hid_print_int((int)ax);
+                hid_print(" y=");
+                hid_print_int((int)ay);
+                hid_print("\n");
+            }
+            pointer_report_count++;
+            input_report_pointer_absolute_scaled(
+                touchpad_present ? INPUT_DEVICE_USB_TOUCHPAD : INPUT_DEVICE_USB_MOUSE,
+                (int)ax, (int)ay, 32767, 32767, abs_buttons, 0);
+            return;
+        }
+    }
+
+    /*
      * Boot-protocol mouse report layout (we force boot protocol during
      * enumeration, so there is never a leading report-ID byte):
      *   byte 0: buttons (bit0 left, bit1 right, bit2 middle)
      *   byte 1: signed X delta
      *   byte 2: signed Y delta (positive = up)
-     *   byte 3: optional signed wheel delta (many mice append this even in
-     *           boot mode; host buffers are cleared before each transfer so
-     *           this reads 0 when the device does not send it)
+     *   byte 3: optional signed wheel delta
      * Screen Y grows downward, so invert the reported Y delta.
      */
     uint8_t buttons = report[0] & 0x07;
     int dx = (int)((int8_t)report[1]);
     int dy = -(int)((int8_t)report[2]);
     int8_t wheel = (length >= 4) ? (int8_t)report[3] : 0;
+
+    if (pointer_report_count == 0) {
+        hid_print("[usb-hid] first pointer interrupt report: dx=");
+        hid_print_int(dx);
+        hid_print(" dy=");
+        hid_print_int(dy);
+        hid_print(" buttons=");
+        hid_print_int((int)buttons);
+        hid_print("\n");
+    }
+    if (!logged_left_click && (buttons & 0x01)) {
+        logged_left_click = 1;
+        hid_print("[usb-hid] first LEFT click confirmed.\n");
+    }
+    if (!logged_right_click && (buttons & 0x02)) {
+        logged_right_click = 1;
+        hid_print("[usb-hid] first RIGHT click confirmed.\n");
+    }
+    if (!logged_wheel && wheel != 0) {
+        logged_wheel = 1;
+        hid_print("[usb-hid] first WHEEL scroll confirmed wheel=");
+        hid_print_int((int)wheel);
+        hid_print("\n");
+    }
+    pointer_report_count++;
 
     input_report_pointer_delta(
         touchpad_present ? INPUT_DEVICE_USB_TOUCHPAD : INPUT_DEVICE_USB_MOUSE,
@@ -152,15 +302,15 @@ int usb_hid_has_keyboard_device(void) {
 
 void usb_hid_attach(int port, uint8_t address, int protocol) {
     if (protocol == USB_HID_PROTOCOL_MOUSE) {
-        usb_hid_register_boot_pointer(1, 0);
+        /* enumerate_device() already registered endpoint/address details. */
         input_set_usb_pointer_active(1);
+        input_set_usb_pointer_kind(touchpad_present);
         hid_print("[usb] hotplug: port-");
         hid_print_int(port);
         hid_print(" connect, addr=");
         hid_print_int((int)address);
         hid_print(", class=HID, protocol=mouse, attaching to HID driver\n");
     } else if (protocol == USB_HID_PROTOCOL_KEYBOARD) {
-        usb_hid_register_boot_keyboard(1);
         hid_print("[usb] hotplug: port-");
         hid_print_int(port);
         hid_print(" connect, addr=");
@@ -178,6 +328,7 @@ void usb_hid_attach(int port, uint8_t address, int protocol) {
 void usb_hid_detach(int port) {
     int had_pointer = pointer_present;
     int had_keyboard = keyboard_present;
+    int was_touchpad = touchpad_present;
     if (had_pointer || had_keyboard) {
         hid_print("[usb] hotplug: port-");
         hid_print_int(port);
@@ -185,7 +336,11 @@ void usb_hid_detach(int port) {
     }
     if (had_pointer) {
         usb_hid_register_boot_pointer(0, 0);
-        input_set_usb_pointer_active(0);
+        /* Drop queued USB events + synthesize button-ups. */
+        input_remove_device(was_touchpad ? INPUT_DEVICE_USB_TOUCHPAD
+                                          : INPUT_DEVICE_USB_MOUSE);
+        input_remove_device(INPUT_DEVICE_USB_MOUSE);
+        input_remove_device(INPUT_DEVICE_USB_TOUCHPAD);
     }
     if (had_keyboard) {
         usb_hid_register_boot_keyboard(0);

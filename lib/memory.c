@@ -142,6 +142,16 @@ static void heap_split(heap_block_t* b, size_t need) {
     g_heap_free_bytes -= sizeof(heap_block_t);
 }
 
+static int heap_block_in_arena(const heap_block_t* b) {
+    uintptr_t p = (uintptr_t)b;
+    uintptr_t start = (uintptr_t)g_heap_start;
+    uintptr_t end = start + g_heap_capacity;
+    if (p < start || p >= end) return 0;
+    if (p + sizeof(heap_block_t) > end) return 0;
+    if (p + sizeof(heap_block_t) + b->size > end) return 0;
+    return 1;
+}
+
 void* kmalloc(size_t size) {
     if (size == 0)   return 0;
     if (!g_heap_start) return 0;
@@ -150,6 +160,7 @@ void* kmalloc(size_t size) {
 
     heap_block_t* b = heap_find_fit(need);
     if (!b) return 0;
+    if (!heap_block_in_arena(b) || b->magic != HEAP_MAGIC_FREE) return 0;
 
     heap_freelist_unlink(b);
     g_heap_free_bytes -= b->size;
@@ -162,7 +173,7 @@ void* kmalloc(size_t size) {
 static void heap_coalesce(heap_block_t* b) {
     /* Merge b with its right neighbour if free. */
     heap_block_t* next = b->next_phys;
-    if (next && next->magic == HEAP_MAGIC_FREE) {
+    if (next && heap_block_in_arena(next) && next->magic == HEAP_MAGIC_FREE) {
         heap_freelist_unlink(next);
         b->size      += sizeof(heap_block_t) + next->size;
         b->next_phys  = next->next_phys;
@@ -172,7 +183,7 @@ static void heap_coalesce(heap_block_t* b) {
     }
     /* Merge b with its left neighbour if free. */
     heap_block_t* prev = b->prev_phys;
-    if (prev && prev->magic == HEAP_MAGIC_FREE) {
+    if (prev && heap_block_in_arena(prev) && prev->magic == HEAP_MAGIC_FREE) {
         heap_freelist_unlink(b);
         prev->size      += sizeof(heap_block_t) + b->size;
         prev->next_phys  = b->next_phys;
@@ -187,10 +198,8 @@ void kfree(void* ptr) {
     if (!g_heap_start) return;
 
     heap_block_t* b = (heap_block_t*)((uint8_t*)ptr - sizeof(heap_block_t));
-    if (b->magic != HEAP_MAGIC_USED) {
-        /* Double-free or wild-pointer free: silently drop, but do not
-         * walk the heap into corruption. The caller bug is logged
-         * elsewhere in the storage stack. */
+    if (!heap_block_in_arena(b) || b->magic != HEAP_MAGIC_USED) {
+        /* Double-free, wild pointer, or arena smash: drop without walking. */
         return;
     }
     b->magic = HEAP_MAGIC_FREE;

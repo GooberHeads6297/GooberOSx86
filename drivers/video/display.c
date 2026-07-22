@@ -1,5 +1,8 @@
 #include "display.h"
 #include "font.h"
+#include "vesa.h"
+#include "intel_gfx.h"
+#include "../diagnostics/driver_log.h"
 #include "../io/io.h"
 #include <stddef.h>
 
@@ -10,8 +13,52 @@ static display_mode_info_t active_display = {
 };
 
 static const display_driver_ops_t* driver_registry[DISPLAY_MAX_DRIVERS];
+static const display_driver_ops_t* active_driver_ops = NULL;
 static int driver_count = 0;
 static const char* display_error = NULL;
+static display_present_stats_t present_stats;
+static display_present_mode_t last_logged_present_mode = DISPLAY_PRESENT_NONE;
+static uint32_t last_present_log_count = 0;
+/* Firmware GOP LFB without write-combining (Bay Trail / Braswell inherit):
+ * a single multi-megabyte memcpy into scanout can bus-stall the CPU mid-copy
+ * (top of panel updates, then total freeze -- no IRQs, no input). */
+static int g_scanout_uncached = 0;
+static int pending_present_h = 0;
+static int pending_present_x = 0;
+static int pending_present_y = 0;
+static int pending_present_w = 0;
+
+void display_set_scanout_uncached(int uncached) {
+    g_scanout_uncached = uncached ? 1 : 0;
+}
+
+int display_scanout_uncached(void) {
+    return g_scanout_uncached;
+}
+
+/* Per-call LFB write budget: keep 64 KiB on UC GOP; 512 KiB when WC/cached. */
+uint32_t display_present_budget_bytes(void) {
+    return g_scanout_uncached ? 65536u : (512u * 1024u);
+}
+
+static int g_present_oneshot = 0;
+
+void display_present_set_oneshot(int oneshot) {
+    g_present_oneshot = oneshot ? 1 : 0;
+}
+
+int display_present_has_pending(void) {
+    return pending_present_h > 0;
+}
+
+void display_present_consume_pending(int* x, int* y, int* w, int* h) {
+    if (!pending_present_h) return;
+    if (x) *x = pending_present_x;
+    if (y) *y = pending_present_y;
+    if (w) *w = pending_present_w;
+    if (h) *h = pending_present_h;
+    pending_present_h = 0;
+}
 
 /* Local case-sensitive string compare; we have no libc in this layer. */
 static int display_streq(const char* a, const char* b) {
@@ -21,6 +68,12 @@ static int display_streq(const char* a, const char* b) {
         a++; b++;
     }
     return *a == *b;
+}
+
+static int g_display_register_quiet = 0;
+
+void display_register_set_quiet(int quiet) {
+    g_display_register_quiet = quiet ? 1 : 0;
 }
 
 void display_register_framebuffer(display_driver_t driver,
@@ -38,6 +91,18 @@ void display_register_framebuffer(display_driver_t driver,
     active_display.pitch = pitch;
     active_display.bpp = bpp;
     active_display.available = 1;
+    if (g_display_register_quiet) return;
+    driver_log("[display] active framebuffer driver=");
+    driver_log(display_driver_name(driver));
+    driver_log(" mode=");
+    driver_log_u32(width);
+    driver_log("x");
+    driver_log_u32(height);
+    driver_log("x");
+    driver_log_u32(bpp);
+    driver_log(" pitch=");
+    driver_log_u32(pitch);
+    driver_log("\n");
 }
 
 void display_register_text_mode(void) {
@@ -49,6 +114,7 @@ void display_register_text_mode(void) {
     active_display.pitch = 160;
     active_display.bpp = 16;
     active_display.available = 1;
+    driver_log_line("[display] active mode: VGA text 80x25.");
 }
 
 const display_mode_info_t* display_get_mode(void) {
@@ -179,6 +245,7 @@ const char* display_driver_name(display_driver_t driver) {
     switch (driver) {
         case DISPLAY_DRIVER_VGA_TEXT: return "VGA text";
         case DISPLAY_DRIVER_VESA_LFB: return "VESA linear framebuffer";
+        case DISPLAY_DRIVER_BASIC_LFB: return "Basic Display (firmware FB)";
         case DISPLAY_DRIVER_NATIVE_INTEL: return "Native Intel display";
         case DISPLAY_DRIVER_NATIVE_GENERIC: return "Native generic framebuffer";
         case DISPLAY_DRIVER_VGA_GRAPHICS: return "VGA mode-13h (320x200x8)";
@@ -195,19 +262,184 @@ const char* display_format_name(display_pixel_format_t format) {
     }
 }
 
+const char* display_present_mode_name(display_present_mode_t mode) {
+    switch (mode) {
+        case DISPLAY_PRESENT_COPY_RECT: return "copy-rect";
+        case DISPLAY_PRESENT_COPY_FRAME: return "copy-frame";
+        case DISPLAY_PRESENT_VBLANK_COPY_RECT: return "vblank-copy-rect";
+        case DISPLAY_PRESENT_VBLANK_COPY_FRAME: return "vblank-copy-frame";
+        case DISPLAY_PRESENT_PAGE_FLIP: return "page-flip";
+        default: return "none";
+    }
+}
+
+const display_present_stats_t* display_get_present_stats(void) {
+    return &present_stats;
+}
+
+void display_present_note_promotion(void) {
+    present_stats.promoted_frames++;
+}
+
+int display_present_vblank_reliable(void) {
+    if (!active_driver_ops || !active_driver_ops->wait_vblank) return 0;
+    if (present_stats.vblank_waits == 0) return 0;
+    if (present_stats.vblank_misses >= present_stats.vblank_waits) return 0;
+    if (present_stats.vblank_waits < 8) return 1;
+    return present_stats.vblank_misses * 3U < present_stats.vblank_waits;
+}
+
+static void display_record_present(display_present_mode_t mode, int x, int y, int w, int h) {
+    (void)x;
+    (void)y;
+    present_stats.present_count++;
+    present_stats.last_mode = mode;
+    if (w > 0 && h > 0)
+        present_stats.last_dirty_area = (uint32_t)w * (uint32_t)h;
+    else
+        present_stats.last_dirty_area = active_display.width * active_display.height;
+    /*
+     * Present mode can alternate every frame (small dirty rect vs. promoted
+     * frame). Logging every transition made both VM and real hardware visibly
+     * slower because Desktop log.txt is filesystem-backed. Keep the current
+     * mode in stats/System Info, and log only the first mode plus a sparse
+     * heartbeat.
+     */
+    if (last_logged_present_mode == DISPLAY_PRESENT_NONE ||
+        present_stats.present_count - last_present_log_count >= 300U) {
+        driver_log("[display] present mode: ");
+        driver_log(display_present_mode_name(mode));
+        driver_log(" area=");
+        driver_log_u32(present_stats.last_dirty_area);
+        driver_log("\n");
+        last_logged_present_mode = mode;
+        last_present_log_count = present_stats.present_count;
+    }
+}
+
+int display_present_rect(int x, int y, int w, int h) {
+    /*
+     * Direct-to-LFB when no RAM back-buffer is armed: drawing already landed
+     * on scanout; skip the memcpy.
+     */
+    if (!vesa_has_backbuffer()) return 1;
+
+    int waited = 0;
+    if (w <= 0 || h <= 0) return 0;
+    /*
+     * Never touch Intel display MMIO for vblank on Bay Trail/Braswell — those
+     * reads can hard-stall the CPU bus. Generic VESA/basic drivers have a NULL
+     * wait_vblank and are fine.
+     */
+    if (active_driver_ops && active_driver_ops->wait_vblank &&
+        !intel_gfx_is_bay_trail_class()) {
+        waited = active_driver_ops->wait_vblank(2);
+        present_stats.vblank_waits++;
+        if (!waited) present_stats.vblank_misses++;
+    }
+    if (active_driver_ops && active_driver_ops->present_rect) {
+        if (active_driver_ops->present_rect(x, y, w, h)) {
+            display_record_present(waited ? DISPLAY_PRESENT_VBLANK_COPY_RECT
+                                          : DISPLAY_PRESENT_COPY_RECT,
+                                   x, y, w, h);
+            return 1;
+        }
+    }
+    /*
+     * Cap LFB write bandwidth per call. Uncached GOP keeps ~64 KiB so one
+     * keypress cannot bus-stall Braswell; WC/cached uses ~512 KiB. Window
+     * drag sets oneshot so the dirty AABB finishes in this call (no striped
+     * mid-window bands).
+     */
+    {
+        uint32_t row_bytes = (uint32_t)w * 4u;
+        uint32_t budget = display_present_budget_bytes();
+        int max_rows;
+        int copied;
+        if (row_bytes == 0) row_bytes = 4u;
+        if (g_present_oneshot)
+            max_rows = h;
+        else {
+            max_rows = (int)(budget / row_bytes);
+            if (max_rows < 1) max_rows = 1;
+            if (max_rows > h) max_rows = h;
+        }
+        copied = vesa_swap_rect_rows(x, y, w, h, max_rows);
+        display_record_present(waited ? DISPLAY_PRESENT_VBLANK_COPY_RECT
+                                      : DISPLAY_PRESENT_COPY_RECT,
+                               x, y, w, copied);
+        if (copied < h) {
+            pending_present_x = x;
+            pending_present_y = y + copied;
+            pending_present_w = w;
+            pending_present_h = h - copied;
+        } else {
+            pending_present_h = 0;
+        }
+        return 1;
+    }
+}
+
+int display_present_frame(void) {
+    if (!vesa_has_backbuffer()) return 1;
+
+    int waited = 0;
+    if (active_driver_ops && active_driver_ops->wait_vblank &&
+        !intel_gfx_is_bay_trail_class()) {
+        waited = active_driver_ops->wait_vblank(2);
+        present_stats.vblank_waits++;
+        if (!waited) present_stats.vblank_misses++;
+    }
+    if (active_driver_ops && active_driver_ops->page_flip) {
+        if (active_driver_ops->page_flip()) {
+            display_record_present(DISPLAY_PRESENT_PAGE_FLIP, 0, 0, 0, 0);
+            return 1;
+        }
+    }
+    if (active_driver_ops && active_driver_ops->present_frame) {
+        if (active_driver_ops->present_frame()) {
+            display_record_present(waited ? DISPLAY_PRESENT_VBLANK_COPY_FRAME
+                                          : DISPLAY_PRESENT_COPY_FRAME,
+                                   0, 0, 0, 0);
+            return 1;
+        }
+    }
+    vesa_present();
+    display_record_present(waited ? DISPLAY_PRESENT_VBLANK_COPY_FRAME
+                                  : DISPLAY_PRESENT_COPY_FRAME,
+                           0, 0, 0, 0);
+    return 1;
+}
+
 void display_reset_drivers(void) {
     driver_count = 0;
     for (int i = 0; i < DISPLAY_MAX_DRIVERS; i++) driver_registry[i] = NULL;
+    active_driver_ops = NULL;
+    for (uint32_t i = 0; i < sizeof(present_stats); i++) ((uint8_t*)&present_stats)[i] = 0;
+    last_logged_present_mode = DISPLAY_PRESENT_NONE;
+    last_present_log_count = 0;
 }
 
 void display_register_driver(const display_driver_ops_t* ops) {
     if (!ops || !ops->init) return;
     if (driver_count >= DISPLAY_MAX_DRIVERS) return;
     driver_registry[driver_count++] = ops;
+    driver_log("[display] registered driver ");
+    driver_log(ops->name ? ops->name : "?");
+    driver_log("\n");
 }
 
 void display_set_error(const char* msg) {
     display_error = msg;
+    if (msg) {
+        driver_log("[display] error: ");
+        driver_log(msg);
+        if (msg[0]) {
+            uint32_t i = 0;
+            while (msg[i]) i++;
+            if (i > 0 && msg[i - 1] != '\n') driver_log("\n");
+        }
+    }
 }
 
 const char* display_last_error(void) {
@@ -231,17 +463,40 @@ const display_driver_ops_t* display_probe_drivers(const char* force_name,
         if (!ops || !ops->init) continue;
         if (force && !display_streq(force_name, ops->name)) continue;
 
-        if (ops->probe && !ops->probe()) continue;
+        driver_log("[display] probe driver ");
+        driver_log(ops->name ? ops->name : "?");
+        driver_log("\n");
+
+        if (ops->probe && !ops->probe()) {
+            driver_log("[display] probe declined ");
+            driver_log(ops->name ? ops->name : "?");
+            driver_log("\n");
+            continue;
+        }
 
         display_framebuffer_t fb = {0, 0, 0, 0, 0, DISPLAY_FORMAT_UNKNOWN};
-        if (!ops->init(req_w, req_h, req_bpp, &fb)) continue;
+        if (!ops->init(req_w, req_h, req_bpp, &fb)) {
+            driver_log("[display] init failed ");
+            driver_log(ops->name ? ops->name : "?");
+            driver_log("\n");
+            continue;
+        }
 
         /* Rung initialized; gate it on the visibility confirmation (if any).
          * A rejected rung is abandoned cleanly and we fall through to the next
          * candidate -- the caller's confirm() is responsible for logging why. */
-        if (confirm && !confirm(ops, &fb, confirm_ctx)) continue;
+        if (confirm && !confirm(ops, &fb, confirm_ctx)) {
+            driver_log("[display] visibility rejected ");
+            driver_log(ops->name ? ops->name : "?");
+            driver_log("\n");
+            continue;
+        }
 
         *out = fb;
+        active_driver_ops = ops;
+        driver_log("[display] selected driver ");
+        driver_log(ops->name ? ops->name : "?");
+        driver_log("\n");
         return ops;
     }
 

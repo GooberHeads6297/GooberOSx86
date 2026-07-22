@@ -9,8 +9,16 @@
 
 /* Multiboot info flags */
 #define MULTIBOOT_INFO_CMDLINE      (1 << 2)
+#define MULTIBOOT_INFO_MODS         (1 << 3)
 #define MULTIBOOT_INFO_MEM_MAP      (1 << 6)
 #define MULTIBOOT_INFO_FRAMEBUFFER  (1 << 12)
+
+/* Multiboot 1 module list entry (mods_addr points to an array of these). */
+typedef struct {
+    uint32_t mod_start;
+    uint32_t mod_end;
+    char     string[0];
+} __attribute__((packed)) multiboot_module_t;
 
 /* Multiboot 1 info structure */
 typedef struct {
@@ -47,7 +55,29 @@ typedef struct {
 /* Multiboot 2 tag types */
 #define MULTIBOOT2_TAG_END             0
 #define MULTIBOOT2_TAG_CMDLINE         1
+#define MULTIBOOT2_TAG_MODULE          3
 #define MULTIBOOT2_TAG_FRAMEBUFFER     8
+#define MULTIBOOT2_TAG_ACPI_OLD        14  /* copy of ACPI 1.0 RSDP */
+#define MULTIBOOT2_TAG_ACPI_NEW        15  /* copy of ACPI 2.0+ RSDP */
+
+/* Multiboot 2 ACPI RSDP-copy tag. The bootloader (GRUB) embeds a verbatim
+ * copy of the RSDP it obtained from firmware. On UEFI this is the ONLY safe
+ * way to locate ACPI -- the legacy 0xE0000..0xFFFFF BIOS scan is invalid and
+ * can stall the CPU bus on real hardware (Acer R3-131T / Braswell). */
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint8_t  rsdp[8];  /* variable-length; RSDP copy starts here */
+} __attribute__((packed)) multiboot2_tag_acpi_t;
+
+/* Multiboot 2 module tag (payload follows the header; cmdline is optional). */
+typedef struct {
+    uint32_t type;
+    uint32_t size;
+    uint32_t mod_start;
+    uint32_t mod_end;
+    char     cmdline[1];
+} __attribute__((packed)) multiboot2_tag_module_t;
 
 /* Multiboot 2 command line tag */
 typedef struct {

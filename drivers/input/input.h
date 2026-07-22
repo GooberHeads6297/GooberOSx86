@@ -14,7 +14,8 @@ typedef enum {
     INPUT_DEVICE_NONE = 0,
     INPUT_DEVICE_PS2_MOUSE,
     INPUT_DEVICE_USB_MOUSE,
-    INPUT_DEVICE_USB_TOUCHPAD
+    INPUT_DEVICE_USB_TOUCHPAD,
+    INPUT_DEVICE_I2C_TOUCHPAD
 } input_device_t;
 
 typedef enum {
@@ -39,7 +40,14 @@ void input_init(void);
 void input_set_bounds(int width, int height);
 int input_poll_event(input_event_t* event);
 void input_set_usb_pointer_active(int active);
+/* Refine the USB pointer kind (mouse vs USB touchpad) once known. */
+void input_set_usb_pointer_kind(int is_touchpad);
+void input_set_i2c_touchpad_active(int active);
 void input_report_pointer_delta(input_device_t device, int dx, int dy, uint8_t buttons, int8_t wheel);
+void input_report_pointer_absolute(input_device_t device, int x, int y, uint8_t buttons, int8_t wheel);
+void input_report_pointer_absolute_scaled(input_device_t device, int x, int y,
+                                          int raw_max_x, int raw_max_y,
+                                          uint8_t buttons, int8_t wheel);
 
 int input_get_pointer_x(void);
 int input_get_pointer_y(void);

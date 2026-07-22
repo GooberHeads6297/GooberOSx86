@@ -1,5 +1,19 @@
 #!/bin/bash
 
-# OHCI provides correct BAR assignment in QEMU 10.2. The current USB HID stack
-# supports boot-protocol relative mice, so use usb-mouse instead of usb-tablet.
-qemu-system-i386 -cdrom GooberOSx86.iso -device pci-ohci,id=ohci -device usb-mouse,bus=ohci.0
+# Prefer xHCI + usb-mouse for USB HID verification (matches Lenovo 80M4 path).
+# Fallback OHCI line kept for older QEMU / companion testing.
+#
+# Success looks like: "USB HID pointer ready." (not merely PS/2 fallback).
+
+set -e
+ISO="${1:-GooberOSx86-x64.iso}"
+ARCH_QEMU=qemu-system-x86_64
+if [[ "$ISO" == *x86* ]] && [[ "$ISO" != *x64* ]]; then
+  ARCH_QEMU=qemu-system-i386
+fi
+
+exec "$ARCH_QEMU" -cdrom "$ISO" -m 512 \
+  -machine q35 \
+  -device nec-usb-xhci,id=xhci \
+  -device usb-mouse,bus=xhci.0 \
+  "$@"

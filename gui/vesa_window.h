@@ -46,6 +46,7 @@ typedef enum {
     VDESK_APP_DISPLAY_SETTINGS,
     VDESK_APP_SYSTEM_SETTINGS,
     VDESK_APP_PAINT,
+    VDESK_APP_WELCOME,
     /*
      * Phase 4 (display polish, item 5): generic launcher for an app that
      * historically painted to the legacy 0xB8000 80x25 plane. The window
@@ -77,7 +78,23 @@ typedef struct {
     color_t shadow;
     color_t accent;
     color_t button_bg;
+    color_t shell_bg;
+    color_t shell_output;
+    color_t shell_input;
+    color_t shell_muted;
 } VTheme;
+
+typedef enum {
+    VDESK_APPEARANCE_ORIGINAL = 0,
+    VDESK_APPEARANCE_MODERN_DARK,
+    VDESK_APPEARANCE_LIGHT,
+    VDESK_APPEARANCE_COUNT
+} VDeskAppearance;
+
+typedef enum {
+    VDESK_TASKBAR_TOP = 0,
+    VDESK_TASKBAR_BOTTOM
+} VDeskTaskbarPosition;
 
 typedef struct {
     uint32_t frame_count;
@@ -89,15 +106,23 @@ typedef struct {
     uint32_t swap_ticks;
     uint32_t sleep_ticks;
     uint32_t fps;
+    uint32_t present_count;
+    uint32_t vblank_waits;
+    uint32_t vblank_misses;
+    uint32_t present_area;
+    int present_mode;
+    int promoted_frames;
     int last_dirty_x;
     int last_dirty_y;
     int last_dirty_w;
     int last_dirty_h;
     int active_pointer;
     int usb_pointer_active;
+    int i2c_touchpad_active;
     int window_count;
     int icon_count;
     int theme_mode;
+    int appearance;
 } VDeskMetrics;
 
 /* Desktop icon kind: app launcher vs. a filesystem item rendered on the desktop. */
@@ -149,6 +174,8 @@ typedef struct VWindow {
     /* Pointer click inside the client area; coords are client-relative. */
     void (*click_handler)(struct VWindow* win, int client_x, int client_y);
     void* user_data;
+    /* Ring-0 app framework: process table PID for taskmgr End Task. */
+    int process_pid;
 } VWindow;
 
 typedef struct {
@@ -163,7 +190,21 @@ typedef struct {
     int start_open;
     int context_open;
     int context_x, context_y;
+    int context_kind;
+    int context_target_icon;
+    int context_target_window_id;
+    int rename_open;
+    int rename_target_kind;
+    char rename_old_name[VICON_NAME_MAX];
+    char rename_input[VICON_NAME_MAX];
+    int rename_len;
+    int rename_status;
     int theme_mode;
+    int appearance;
+    int primary_shell_id;
+    int shell_first_mode;
+    int desktop_experience_visible;
+    int taskbar_position;
     int target_frame_ms;
     int adaptive_pacing;
     int dirty;
@@ -183,6 +224,8 @@ typedef struct {
     int mouse_x, mouse_y;
     int mouse_buttons;
     int running;
+    char status_msg[64];
+    uint32_t status_until_tick;
 } VDesktop;
 
 /* Desktop functions */
@@ -190,15 +233,35 @@ void vdesk_init(int screen_w, int screen_h);
 void vdesk_run(void);
 VWindow* vdesk_create_window(const char* title, int x, int y, int w, int h);
 void vdesk_close_window(VWindow* win);
+/* Close every visible window registered with the given process PID. */
+void vdesk_close_windows_by_pid(int pid);
 void vdesk_bring_to_front(VWindow* win);
 VWindow* vdesk_window_at(int x, int y);
 void vdesk_set_app_launcher(void (*launcher)(VDeskAppId app_id));
 void vdesk_set_file_opener(void (*opener)(const char* name, int kind));
 void vdesk_add_icon(const char* label, VDeskAppId app_id, int x, int y);
 void vdesk_refresh_desktop_items(int force);
+void vdesk_set_status(const char* msg);
 void vdesk_mark_dirty(int x, int y, int w, int h);
 void vdesk_mark_full_dirty(void);
+/* One paint+present while a long sync command (e.g. install) holds the event loop. */
+void vdesk_pump_one_frame(void);
 void vdesk_toggle_theme(void);
+void vdesk_set_appearance(int appearance);
+void vdesk_set_primary_shell(VWindow* win);
+void vdesk_focus_primary_shell(void);
+int vdesk_has_active_app_focus(void);
+void vdesk_toggle_desktop_experience(void);
+int vdesk_desktop_experience_visible(void);
+void vdesk_tile_window(VWindow* win);
+color_t vdesk_shell_bg_color(void);
+color_t vdesk_shell_output_color(void);
+color_t vdesk_shell_input_color(void);
+color_t vdesk_shell_muted_color(void);
+void vdesk_cycle_shell_output_color(void);
+void vdesk_cycle_shell_input_color(void);
+int vdesk_workspace_top(void);
+int vdesk_workspace_bottom(void);
 const VTheme* vdesk_get_theme(void);
 const VDeskMetrics* vdesk_get_metrics(void);
 const char* vdesk_get_theme_name(void);

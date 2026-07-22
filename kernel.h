@@ -1,6 +1,7 @@
 #ifndef KERNEL_H
 #define KERNEL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "include/multiboot.h"
@@ -15,6 +16,18 @@ void print(const char* str);
 void kernel_set_print_sink(kernel_print_sink_t sink, void* ctx);
 void kernel_clear_print_sink(void);
 void clear_screen(void);
+
+/*
+ * Pure-serial diagnostic sink (COM1 + port 0xE9), bypassing the framebuffer/
+ * panel entirely. Use for low-level oracles where the on-screen console cannot
+ * be trusted (e.g. verifying the desktop pump keeps running after a keypress on
+ * VirtualBox). Host captures via VBox COM1 -> file or QEMU -serial file:. */
+void kserial_note(const char* s);
+
+/* Enable/disable COM1 (0x3F8) transmit at runtime. On x64 COM1 TX starts
+ * disabled (real laptops lack a usable UART); the debug path enables it so the
+ * kserial_note oracle reaches a VM's COM1 raw-file capture. */
+void kernel_serial_com1_enable(int on);
 
 /* Boot mode detection */
 int is_vesa_mode(void);
@@ -68,6 +81,8 @@ typedef struct {
     char display[24];   /* gooberos.display= (default "auto"; "safe" = adopt
                          * firmware FB only, arm probe + on-panel auto-revert) */
     char usb[16];       /* gooberos.usb=     ("" if unset) */
+    char i2c[16];       /* gooberos.i2c=     (""/"full", "off", "safe") */
+    char touchpad[16];  /* gooberos.touchpad=(""/"poll", "off", "irq") */
     char theme[16];     /* gooberos.theme=   ("" if unset) */
     char native[16];    /* gooberos.native=WxH (preferred native panel mode;
                          * "" if unset). Diagnostics warn when committed != native */
@@ -94,7 +109,51 @@ typedef struct {
      * before hotplug bookkeeping is initialized.
      */
     int  usb_hotplug;
+    /*
+     * gooberos.usb.stack= ("new"|"legacy"; default "new")
+     *
+     * new    -> redesigned HCD registry + class drivers (usb_core_*)
+     * legacy -> singleton host fallback / enumeration.c path
+     */
+    char usb_stack[16];
+    /*
+     * gooberos.usb.byt.phy= ("on"|"off"; default "on")
+     * Bay Trail PHY/MMIO/clock-gating scripts (needed for EP0 after XUSB2PR).
+     */
+    int  usb_byt_phy;
+    char root[24];      /* gooberos.root= ("auto", "live", or "dev:part") */
+    /*
+     * gooberos.storage= ("ata"|"sdhci"|"all"|"off"; default "")
+     *
+     * Controls which storage backends run MMIO/bring-up probes:
+     *   ata   -> ATA PIO only; PCI controllers are inventoried, not probed
+     *   sdhci -> ATA + SDHCI/eMMC probe
+     *   all   -> ATA + SDHCI + USB-MSC scaffold probes
+     *   off   -> ATA only, skip PCI storage inventory
+     *   ""    -> live root: ata; persistent root (auto/dev:part): sdhci
+     */
+    char storage[16];
+    /*
+     * gooberos.vbe= ("bios"|"loader"|"off"; default depends on display=)
+     *   bios   -> INT 10h VBE modeset via real-mode trampoline before adopting LFB
+     *   loader -> use GRUB/multiboot framebuffer only (retry BIOS on confirm fail)
+     *   off    -> never call the BIOS VBE trampoline
+     */
+    char vbe[16];
 } boot_config_t;
+
+/*
+ * Smart boot profile: filled when gooberos.boot=smart resolves hardware
+ * signals (loader FB, Bay Trail, Bochs, SDHCI) into concrete display/storage
+ * settings before framebuffer_bringup(). Explicit cmdline fields win.
+ */
+typedef struct {
+    int  active;            /* 1 if this boot used Smart resolution */
+    char display[24];       /* resolved gooberos.display= value */
+    char storage[16];       /* resolved gooberos.storage= value */
+    char reason[96];        /* human-readable decision for diagnostics */
+    boot_display_confirm_t confirm;
+} boot_smart_profile_t;
 
 /*
  * Phase 4: the user enhancement-2 display-polish layer adds a real back-
@@ -113,7 +172,28 @@ int kernel_display_target_fps(void);
  */
 int kernel_display_is_vga_graphics(void);
 
+/*
+ * x64 VGA compatibility: returns 1 when the display stage committed to
+ * the 80x25 text console (either explicitly via gooberos.boot=vga /
+ * gooberos.display=vga-text, or as the last-resort fallback when every
+ * graphical rung was rejected). The x64 kernel_main runs the full
+ * interactive text shell in that case instead of the VESA desktop.
+ */
+int kernel_display_is_text_console(void);
+
+/* Mute/enable the x64 framebuffer print overlay (boot log glyphs). Desktop
+ * mode disables this so print() cannot scribble over the VESA compositor. */
+void kernel_set_fb_console_echo(int enabled);
+
 const boot_config_t* boot_get_config(void);
 int boot_safe_mode(void);
+const boot_smart_profile_t* boot_smart_profile(void);
+
+/*
+ * FAT partition template loaded by GRUB as a multiboot2 module
+ * (module2 /boot/install/FAT_PART.IMG). Used by install fat32 on USB live
+ * boots where no ATAPI optical drive is present. Returns NULL if absent.
+ */
+const uint8_t* boot_fat_template_module(size_t* size_out);
 
 #endif

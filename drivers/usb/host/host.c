@@ -3,7 +3,9 @@
 #include "ohci.h"
 #include "ehci.h"
 #include "xhci.h"
+#include "baytrail_usb.h"
 #include "../../io/io.h"
+#include "../../diagnostics/driver_log.h"
 
 extern void print(const char* str);
 
@@ -33,6 +35,7 @@ static uint8_t host_controller_type = HCTRL_NONE;
  * on scan reset and whenever a fresh candidate comes online.
  */
 static int host_faulted = 0;
+static int host_recovered_flag = 0;
 
 /* Scan state for the pointer enumeration loop. */
 #define USB_HOST_MAX_CONTROLLERS 8
@@ -70,6 +73,15 @@ static const usb_host_driver_t host_drivers[] = {
     { HCTRL_UHCI, "UHCI", uhci_init }
 };
 
+/* Default: EHCI then xHCI (companion handoff). Bay Trail with XUSB2PR!=0
+ * flips to xHCI-first via baytrail_usb_prefer_xhci(). */
+static const uint8_t host_order_default[] = {
+    HCTRL_EHCI, HCTRL_XHCI, HCTRL_OHCI, HCTRL_UHCI
+};
+static const uint8_t host_order_xhci_first[] = {
+    HCTRL_XHCI, HCTRL_EHCI, HCTRL_OHCI, HCTRL_UHCI
+};
+
 /* ---- Serial debug helpers ----
  *
  * host_serial routes through print() (panel + COM1 + 0xE9 via the active
@@ -79,6 +91,7 @@ static const usb_host_driver_t host_drivers[] = {
  * diagnostics invisible on `-serial file:` setups (only `-debugcon`
  * captures port 0xE9). */
 static void host_serial(const char* s) {
+    driver_log(s);
     print(s);
     const char* p = s;
     while (*p) { outb(0xE9, *p++); }
@@ -173,6 +186,8 @@ void usb_host_scan_reset(void) {
         scan_pass = 0;
         return;
     }
+    /* Unhide Bay Trail EHCI before the PCI class scan (XUSB2PR=0 path). */
+    baytrail_usb_prepare_companion();
     scan_count = pci_find_usb_controllers(scan_controllers, USB_HOST_MAX_CONTROLLERS);
     if (scan_count < 0) scan_count = 0;
     if (scan_count > USB_HOST_MAX_CONTROLLERS) scan_count = USB_HOST_MAX_CONTROLLERS;
@@ -203,24 +218,32 @@ void usb_host_scan_reset(void) {
 static void log_priority_order(void) {
     if (order_logged) return;
     order_logged = 1;
+    const uint8_t* order = baytrail_usb_prefer_xhci()
+                               ? host_order_xhci_first : host_order_default;
     host_serial("[usb] host: priority order =");
-    const int driver_count = (int)(sizeof(host_drivers) / sizeof(host_drivers[0]));
-    for (int i = 0; i < driver_count; i++) {
+    for (int i = 0; i < 4; i++) {
+        const usb_host_driver_t* d = driver_for_prog_if(order[i]);
+        if (!d) continue;
         host_serial(" ");
-        host_serial(host_drivers[i].name);
-        if (!safety_allows_prog_if(host_drivers[i].prog_if))
+        host_serial(d->name);
+        if (!safety_allows_prog_if(d->prog_if))
             host_serial("(skipped-by-safety)");
     }
     host_serial("\n");
 }
 
 int usb_host_try_next_candidate(void) {
-    const int driver_count = (int)(sizeof(host_drivers) / sizeof(host_drivers[0]));
+    const uint8_t* order = baytrail_usb_prefer_xhci()
+                               ? host_order_xhci_first : host_order_default;
 
     log_priority_order();
 
-    while (scan_pass < driver_count) {
-        const usb_host_driver_t* pass_driver = &host_drivers[scan_pass];
+    while (scan_pass < 4) {
+        const usb_host_driver_t* pass_driver = driver_for_prog_if(order[scan_pass]);
+        if (!pass_driver) {
+            scan_pass++;
+            continue;
+        }
         if (!safety_allows_prog_if(pass_driver->prog_if)) {
             host_serial("[usb] host: skip ");
             host_serial(pass_driver->name);
@@ -261,21 +284,24 @@ int usb_host_try_next_candidate(void) {
     }
 
     /*
-     * Fallback chain exhausted. We deliberately do NOT zero host_state.active
-     * here: if some EARLIER pass already brought a controller online, that
-     * controller's hardware is still live (init() programmed the operational
-     * registers + freed it from BIOS) and the post-boot hot-plug poll path
-     * needs host_state.active to keep dispatching to it. The boot-time scan
-     * loop in usb.c reads usb_host_ready() AFTER usb_host_try_next_candidate
-     * stops returning 1; without this preservation, a successful xHCI init
-     * followed by a failed companion init would silently disable hot-plug
-     * for the rest of the boot.
+     * Fallback chain exhausted. Keep a healthy active controller for hot-plug,
+     * but drop a poisoned one (Bay Trail has only xHCI — keeping a faulted
+     * controller just soft-locks USB and blocks PS/2 clarity).
      */
     if (host_state.active) {
-        host_serial("[usb] host: fallback chain exhausted, "
-                    "keeping previously-selected ");
-        host_serial(usb_host_controller_name());
-        host_serial(" as active.\n");
+        if (host_faulted || !active_controller_healthy()) {
+            host_serial("[usb] host: fallback chain exhausted, "
+                        "dropping faulted ");
+            host_serial(usb_host_controller_name());
+            host_serial(".\n");
+            host_state.active = 0;
+            host_controller_type = HCTRL_NONE;
+        } else {
+            host_serial("[usb] host: fallback chain exhausted, "
+                        "keeping previously-selected ");
+            host_serial(usb_host_controller_name());
+            host_serial(" as active.\n");
+        }
     } else {
         host_controller_type = HCTRL_NONE;
         host_serial("[usb] host: fallback chain exhausted, "
@@ -290,6 +316,26 @@ void usb_host_promote_active(void) {
         print(usb_host_controller_name());
         print(".\n");
     }
+}
+
+int usb_host_consumed_recovery(void) {
+    int v = host_recovered_flag;
+    host_recovered_flag = 0;
+    return v;
+}
+
+static int usb_host_recover_next(const char* why) {
+    host_serial(why);
+    print(why);
+    host_state.active = 0;
+    host_faulted = 1;
+    host_controller_type = HCTRL_NONE;
+    if (usb_host_try_next_candidate()) {
+        host_recovered_flag = 1;
+        usb_host_promote_active();
+        return 1;
+    }
+    return 0;
 }
 
 void usb_host_init(void) {
@@ -308,30 +354,38 @@ void usb_host_poll(void) {
     if (host_controller_type == HCTRL_UHCI) {
         uhci_poll();
         if (!uhci_controller_healthy()) {
-            host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
-                      "USB host: runtime error, USB features soft-locked.\n");
-            host_state.active = 0;
+            if (!usb_host_recover_next(
+                    "USB host: UHCI runtime error, trying next controller.\n")) {
+                host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
+                          "USB host: runtime error, USB features soft-locked.\n");
+            }
         }
     } else if (host_controller_type == HCTRL_OHCI) {
         ohci_poll();
         if (!ohci_controller_healthy()) {
-            host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
-                      "USB host: runtime error, USB features soft-locked.\n");
-            host_state.active = 0;
+            if (!usb_host_recover_next(
+                    "USB host: OHCI runtime error, trying next controller.\n")) {
+                host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
+                          "USB host: runtime error, USB features soft-locked.\n");
+            }
         }
     } else if (host_controller_type == HCTRL_EHCI) {
         ehci_poll();
         if (!ehci_controller_healthy()) {
-            host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
-                      "USB host: EHCI runtime error, USB features soft-locked.\n");
-            host_state.active = 0;
+            if (!usb_host_recover_next(
+                    "USB host: EHCI runtime error, trying next controller.\n")) {
+                host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
+                          "USB host: EHCI runtime error, USB features soft-locked.\n");
+            }
         }
     } else if (host_controller_type == HCTRL_XHCI) {
         xhci_poll();
         if (!xhci_controller_healthy()) {
-            host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
-                      "USB host: xHCI runtime error, USB features soft-locked.\n");
-            host_state.active = 0;
+            if (!usb_host_recover_next(
+                    "USB host: xHCI runtime error, trying next controller.\n")) {
+                host_lock(USB_HOST_LOCK_RUNTIME | USB_HOST_LOCK_POINTER_ENUM,
+                          "USB host: xHCI runtime error, USB features soft-locked.\n");
+            }
         }
     }
 }
@@ -367,7 +421,7 @@ int host_controller_healthy(void) {
 
 int host_port_count(void) {
     if (host_controller_type == HCTRL_UHCI) return 2;
-    if (host_controller_type == HCTRL_OHCI) return 8;
+    if (host_controller_type == HCTRL_OHCI) return ohci_port_count();
     if (host_controller_type == HCTRL_EHCI) return ehci_port_count();
     if (host_controller_type == HCTRL_XHCI) return xhci_port_count();
     return 0;
@@ -395,13 +449,43 @@ int host_port_low_speed(int port) {
     return 0;
 }
 
-void host_port_reset(int port) {
-    if (host_faulted) return;  /* controller wedged: do not poke it further */
+int host_port_protocol_speed(int port) {
+    if (host_controller_type == HCTRL_XHCI) return xhci_port_protocol_speed(port);
+    if (host_port_low_speed(port)) return 2; /* LS */
+    if (host_port_connected(port)) return 3; /* treat as HS for ranking */
+    return 0;
+}
+
+int host_port_reset(int port) {
+    int ret = 0;
+    if (host_faulted) return -1;  /* controller wedged: do not poke it further */
     if (host_controller_type == HCTRL_UHCI) uhci_port_reset(port);
     else if (host_controller_type == HCTRL_OHCI) ohci_port_reset(port);
     else if (host_controller_type == HCTRL_EHCI) ehci_port_reset(port);
-    else if (host_controller_type == HCTRL_XHCI) xhci_port_reset(port);
+    else if (host_controller_type == HCTRL_XHCI) ret = xhci_port_reset(port);
+    else ret = -1;
     host_note_health();
+    return ret;
+}
+
+int host_has_active_slot(void) {
+    if (host_faulted) return 0;
+    if (host_controller_type == HCTRL_XHCI) return xhci_has_active_slot();
+    /* UHCI/OHCI/EHCI do not track a slot id; treat as always-ready after reset. */
+    return 1;
+}
+
+int host_ep0_soft_fail_pending(void) {
+    if (host_controller_type == HCTRL_XHCI) return xhci_ep0_soft_fail_pending();
+    return 0;
+}
+
+void host_clear_ep0_soft_fail(void) {
+    if (host_controller_type == HCTRL_XHCI) xhci_clear_ep0_soft_fail();
+}
+
+void host_abandon_slot(void) {
+    if (host_controller_type == HCTRL_XHCI) xhci_abandon_slot();
 }
 
 /*
@@ -442,6 +526,26 @@ int host_control_transfer(uint8_t dev_addr, uint8_t endpoint,
         ret = ehci_control_transfer(dev_addr, endpoint, setup_pkt, data, data_len, direction_in);
     else if (host_controller_type == HCTRL_XHCI)
         ret = xhci_control_transfer(dev_addr, endpoint, setup_pkt, data, data_len, direction_in);
+    host_note_health();
+    return ret;
+}
+
+int host_bulk_transfer(uint8_t endpoint, uint8_t* data, uint16_t data_len,
+                       int direction_in) {
+    if (host_faulted) return -1;
+    int ret = -1;
+    if (host_controller_type == HCTRL_XHCI)
+        ret = xhci_bulk_transfer(endpoint, data, data_len, direction_in);
+    host_note_health();
+    return ret;
+}
+
+int host_configure_bulk_eps(uint8_t ep_out, uint8_t ep_in,
+                            uint16_t mps_out, uint16_t mps_in) {
+    if (host_faulted) return -1;
+    int ret = -1;
+    if (host_controller_type == HCTRL_XHCI)
+        ret = xhci_configure_bulk_eps(ep_out, ep_in, mps_out, mps_in);
     host_note_health();
     return ret;
 }
@@ -491,4 +595,8 @@ void host_ack_report(void) {
     else if (host_controller_type == HCTRL_OHCI) ohci_ack_report();
     else if (host_controller_type == HCTRL_EHCI) ehci_ack_report();
     else if (host_controller_type == HCTRL_XHCI) xhci_ack_report();
+}
+
+void usb_host_print_usb2_route(void (*write)(const char*)) {
+    baytrail_usb_print_status(write);
 }

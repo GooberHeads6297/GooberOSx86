@@ -157,6 +157,7 @@ typedef struct __attribute__((packed, aligned(256))) ohci_hcca {
 
 /* OHCI functions (mirror UHCI API) */
 int  ohci_init(const usb_pci_controller_t* controller);
+int  ohci_port_count(void);
 int  ohci_port_connected(int port);
 int  ohci_port_low_speed(int port);
 void ohci_port_reset(int port);

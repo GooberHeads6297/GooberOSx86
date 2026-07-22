@@ -2,9 +2,11 @@
 #include <stddef.h>
 #include "../host/host.h"
 #include "../hid/hid.h"
+#include "../storage/msc.h"
 #include "../usb.h"
 #include "../../timer/timer.h"
 #include "../../io/io.h"
+#include "../../diagnostics/driver_log.h"
 
 extern void print(const char* str);
 
@@ -12,6 +14,7 @@ static void enum_serial(const char* s) {
     while (*s) { outb(0xE9, *s++); }
 }
 static void enum_print(const char* s) {
+    driver_log(s);
     print(s);
     enum_serial(s);
 }
@@ -54,17 +57,21 @@ static void enum_print_retry(int port, int attempt, int total,
  *   - per-scan:        hard wall-time cap for one usb_enumerate_devices() call
  * Plus a Linux-style stable-connect debounce and per-port reset retries.
  */
-#define ENUM_PORT_BUDGET_MS      1500U   /* ~150 ticks per reset+enumerate */
-#define ENUM_CTRL_BUDGET_MS      3000U   /* ~300 ticks controller bring-up  */
-#define ENUM_SCAN_BUDGET_MS      5000U   /* ~500 ticks hard per-scan cap     */
-#define ENUM_PORT_RETRIES        3       /* reset/enumerate attempts/port    */
-#define ENUM_DEBOUNCE_POLL_MS    25U     /* connect poll interval            */
-#define ENUM_DEBOUNCE_STABLE_MS  100U    /* connection must persist this long */
-#define ENUM_DEBOUNCE_CAP_MS     2000U   /* total debounce window cap        */
+#define ENUM_PORT_BUDGET_MS       400U   /* reset+enumerate cap per port      */
+#define ENUM_CTRL_BUDGET_MS      2000U   /* controller bring-up cap           */
+#define ENUM_SCAN_BUDGET_MS      3000U   /* hard cap for one scan             */
+#define ENUM_PORT_RETRIES        1       /* base try/port                     */
+#define ENUM_PORT_RETRIES_XHCI   2       /* one extra attempt after EP0 soft fail */
+#define ENUM_DEBOUNCE_POLL_MS    20U     /* connect poll interval             */
+#define ENUM_DEBOUNCE_STABLE_MS  60U     /* connection must persist this long */
+#define ENUM_DEBOUNCE_CAP_MS     400U    /* total debounce window cap         */
 
 static usb_device_t devices[MAX_DEVICES];
 static int device_count = 0;
 static int current_address = 1;
+static uint32_t hid_control_next_poll = 0;
+static int hid_control_logged = 0;
+static int hid_interrupt_logged = 0;
 
 static uint8_t buf_scratch[256];
 
@@ -91,18 +98,15 @@ static int do_ctrl(uint8_t dev_addr, uint8_t bmReqType, uint8_t bRequest,
 
 /* ---- Read 8 bytes of device descriptor to get max packet size ---- */
 static int get_device_desc_short(uint8_t addr, usb_device_descriptor_t* desc) {
-    for (int attempt = 0; attempt < 3; attempt++) {
-        int ret = do_ctrl(addr,
-                          USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-                          USB_REQ_GET_DESCRIPTOR,
-                          0x0100,
-                          0,
-                          8,
-                          (uint8_t*)desc, 1);
-        if (ret == 0) return 0;
-        tiny_delay_ms(20);
-    }
-    return -1;
+    /* Single attempt: retries after Transaction Error re-hit a dead EP0 and
+     * on Bay Trail can wedge the xHCI command path for the rest of boot. */
+    return do_ctrl(addr,
+                   USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
+                   USB_REQ_GET_DESCRIPTOR,
+                   0x0100,
+                   0,
+                   8,
+                   (uint8_t*)desc, 1);
 }
 
 /* ---- Read full device descriptor ---- */
@@ -204,6 +208,12 @@ static int port_budget_blown(uint64_t port_deadline) {
     return host_controller_faulted() || timer_deadline_expired(port_deadline);
 }
 
+static int vid_is_touchpad(uint16_t vendor_id) {
+    /* ELAN, Synaptics, ALPS, and Cypress commonly ship laptop touchpads. */
+    return vendor_id == 0x04F3 || vendor_id == 0x06CB ||
+           vendor_id == 0x044E || vendor_id == 0x04B4;
+}
+
 /* ---- Enumerate a single device on a given port ---- */
 static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
     if (device_count >= MAX_DEVICES) return -1;
@@ -214,9 +224,24 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
     int ret;
 
     if (port_budget_blown(port_deadline)) { current_address--; return -1; }
+
+    /* xHCI: never issue EP0 unless reset left a live slot. */
+    if (!host_has_active_slot()) {
+        enum_print("USB enum: short desc skipped (no active slot");
+        enum_print(", slot_active=0 host_faulted=");
+        enum_print(host_controller_faulted() ? "1).\n" : "0).\n");
+        current_address--;
+        return -1;
+    }
+
+    host_clear_ep0_soft_fail();
     ret = get_device_desc_short(0, &dd);
     if (ret != 0) {
-        enum_print("USB enum: short desc failed.\n");
+        enum_print("USB enum: short desc failed (slot_active=");
+        enum_print(host_has_active_slot() ? "1" : "0");
+        enum_print(" host_faulted=");
+        enum_print(host_controller_faulted() ? "1" : "0");
+        enum_print(host_ep0_soft_fail_pending() ? " soft_ep0=1).\n" : ").\n");
         current_address--;  /* reclaim unused address */
         return -1;
     }
@@ -250,12 +275,17 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
     usb_interface_descriptor_t* intf = NULL;
     usb_endpoint_descriptor_t* mouse_ep_in = NULL;
     usb_endpoint_descriptor_t* keyboard_ep_in = NULL;
+    usb_endpoint_descriptor_t* msc_ep_in = NULL;
+    usb_endpoint_descriptor_t* msc_ep_out = NULL;
     int found_hid_mouse = 0;
     int found_hid_keyboard = 0;
+    int found_msc = 0;
     int config_value = 0;
     int mouse_interface_number = 0;
     int keyboard_interface_number = 0;
+    int msc_interface_number = 0;
     int active_hid_protocol = 0;
+    int parsing_msc = 0;
 
     uint8_t* p = buf_scratch;
     uint8_t* end = p + ret;
@@ -273,18 +303,40 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
 
             if (type == USB_DT_INTERFACE && len >= 9) {
                 intf = (usb_interface_descriptor_t*)p;
+                parsing_msc = 0;
+                /*
+                 * Prefer boot-protocol HID. Also accept non-boot HID mouse/
+                 * keyboard interfaces (common on VirtualBox USB tablet/mice
+                 * and many USB 2/3 devices) and force boot protocol later.
+                 */
                 if (intf->bInterfaceClass == USB_CLASS_HID &&
-                    intf->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT &&
-                    intf->bInterfaceProtocol == USB_HID_PROTOCOL_MOUSE) {
+                    intf->bInterfaceProtocol == USB_HID_PROTOCOL_MOUSE &&
+                    (intf->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT ||
+                     intf->bInterfaceSubClass == 0)) {
                     found_hid_mouse = 1;
                     active_hid_protocol = USB_HID_PROTOCOL_MOUSE;
                     mouse_interface_number = intf->bInterfaceNumber;
                 } else if (intf->bInterfaceClass == USB_CLASS_HID &&
-                           intf->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT &&
-                           intf->bInterfaceProtocol == USB_HID_PROTOCOL_KEYBOARD) {
+                           intf->bInterfaceProtocol == USB_HID_PROTOCOL_KEYBOARD &&
+                           (intf->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT ||
+                            intf->bInterfaceSubClass == 0)) {
                     found_hid_keyboard = 1;
                     active_hid_protocol = USB_HID_PROTOCOL_KEYBOARD;
                     keyboard_interface_number = intf->bInterfaceNumber;
+                } else if (intf->bInterfaceClass == USB_CLASS_HID &&
+                           intf->bInterfaceSubClass == 0 &&
+                           intf->bInterfaceProtocol == 0 &&
+                           !found_hid_mouse) {
+                    /* Generic HID: treat as mouse candidate if it has IN interrupt. */
+                    active_hid_protocol = USB_HID_PROTOCOL_MOUSE;
+                    mouse_interface_number = intf->bInterfaceNumber;
+                } else if (intf->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
+                           intf->bInterfaceSubClass == USB_MSC_SUBCLASS_SCSI &&
+                           intf->bInterfaceProtocol == USB_MSC_PROTOCOL_BOT) {
+                    found_msc = 1;
+                    parsing_msc = 1;
+                    active_hid_protocol = 0;
+                    msc_interface_number = intf->bInterfaceNumber;
                 } else {
                     active_hid_protocol = 0;
                 }
@@ -294,10 +346,21 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
                 usb_endpoint_descriptor_t* ep = (usb_endpoint_descriptor_t*)p;
                 if ((ep->bEndpointAddress & 0x80) &&
                     (ep->bmAttributes & 0x03) == 3) {
-                    if (active_hid_protocol == USB_HID_PROTOCOL_MOUSE)
+                    if (active_hid_protocol == USB_HID_PROTOCOL_MOUSE) {
                         mouse_ep_in = ep;
-                    else if (active_hid_protocol == USB_HID_PROTOCOL_KEYBOARD)
+                        found_hid_mouse = 1;
+                    } else if (active_hid_protocol == USB_HID_PROTOCOL_KEYBOARD) {
                         keyboard_ep_in = ep;
+                        found_hid_keyboard = 1;
+                    }
+                }
+            }
+
+            if (type == USB_DT_ENDPOINT && len >= 7 && parsing_msc) {
+                usb_endpoint_descriptor_t* ep = (usb_endpoint_descriptor_t*)p;
+                if ((ep->bmAttributes & 0x03) == 2) {
+                    if (ep->bEndpointAddress & 0x80) msc_ep_in = ep;
+                    else msc_ep_out = ep;
                 }
             }
 
@@ -316,13 +379,19 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
         chosen_protocol = USB_HID_PROTOCOL_KEYBOARD;
         ep_in = keyboard_ep_in;
         interface_number = keyboard_interface_number;
+    } else if (found_msc && msc_ep_in && msc_ep_out) {
+        chosen_protocol = USB_ENUM_PROTOCOL_MSC;
+        interface_number = msc_interface_number;
     }
 
-    if (!chosen_protocol || !ep_in) {
+    if (!chosen_protocol ||
+        (chosen_protocol != USB_ENUM_PROTOCOL_MSC && !ep_in)) {
         if (intf && intf->bInterfaceClass == USB_CLASS_HID) {
             enum_print("USB enum: HID device is not boot mouse/keyboard compatible.\n");
+        } else if (intf && intf->bInterfaceClass == USB_CLASS_MASS_STORAGE) {
+            enum_print("USB enum: MSC present but not BOT/SCSI with bulk EPs.\n");
         } else {
-            enum_print("USB enum: no HID boot mouse/keyboard.\n");
+            enum_print("USB enum: no HID boot mouse/keyboard or BOT MSC.\n");
         }
         current_address--;  /* reclaim: device never configured */
         return -1;
@@ -336,12 +405,49 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
         return -1;
     }
 
+    if (chosen_protocol == USB_ENUM_PROTOCOL_MSC) {
+        if (host_configure_bulk_eps(msc_ep_out->bEndpointAddress,
+                                    msc_ep_in->bEndpointAddress,
+                                    msc_ep_out->wMaxPacketSize,
+                                    msc_ep_in->wMaxPacketSize) != 0) {
+            enum_print("USB enum: MSC bulk EP configure failed.\n");
+            current_address--;
+            return -1;
+        }
+
+        usb_device_t* mdev = &devices[device_count++];
+        mdev->address = addr;
+        mdev->port = (uint8_t)port;
+        mdev->speed = (uint8_t)low_speed;
+        mdev->configured = 1;
+        mdev->class_code = USB_CLASS_MASS_STORAGE;
+        mdev->subclass = USB_MSC_SUBCLASS_SCSI;
+        mdev->protocol = USB_MSC_PROTOCOL_BOT;
+        mdev->interface_number = (uint8_t)interface_number;
+        mdev->max_packet_size = max_pkt;
+        mdev->ep_in = msc_ep_in->bEndpointAddress;
+        mdev->ep_out = msc_ep_out->bEndpointAddress;
+        mdev->ep_in_max_pkt = msc_ep_in->wMaxPacketSize;
+        mdev->ep_in_interval = 0;
+
+        if (usb_msc_attach(port, addr, msc_ep_out->bEndpointAddress,
+                           msc_ep_in->bEndpointAddress,
+                           msc_ep_out->wMaxPacketSize,
+                           msc_ep_in->wMaxPacketSize) != 0) {
+            enum_print("USB enum: MSC attach failed.\n");
+            if (device_count > 0) device_count--;
+            current_address--;
+            return -1;
+        }
+        enum_print("USB MSC BOT device enumerated.\n");
+        return USB_ENUM_PROTOCOL_MSC;
+    }
+
     if (port_budget_blown(port_deadline)) { current_address--; return -1; }
     ret = hid_set_protocol(addr, interface_number);
     if (ret != 0) {
-        enum_print("USB enum: set_protocol failed.\n");
-        current_address--;
-        return -1;
+        /* Non-boot devices may reject SET_PROTOCOL; continue anyway. */
+        enum_print("USB enum: set_protocol failed (continuing).\n");
     }
 
     hid_set_idle(addr, interface_number, 0);
@@ -355,6 +461,7 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
     dev->class_code = USB_CLASS_HID;
     dev->subclass = USB_HID_SUBCLASS_BOOT;
     dev->protocol = (uint8_t)chosen_protocol;
+    dev->interface_number = (uint8_t)interface_number;
     dev->max_packet_size = max_pkt;
     dev->ep_in = ep_in->bEndpointAddress;
     dev->ep_out = 0;
@@ -372,12 +479,19 @@ static int enumerate_device(int port, int low_speed, uint64_t port_deadline) {
     }
 
     if (chosen_protocol == USB_HID_PROTOCOL_MOUSE) {
-        usb_hid_register_boot_pointer(1, 0);
+        uint8_t is_touchpad = vid_is_touchpad(dd.idVendor) ? 1 : 0;
+        usb_hid_register_boot_pointer_detail(1, is_touchpad, (uint8_t)port, addr,
+                                             ep_in->bEndpointAddress,
+                                             ep_in->wMaxPacketSize,
+                                             ep_in->bInterval);
         enum_print("USB HID boot mouse enumerated.\n");
         return USB_HID_PROTOCOL_MOUSE;
     }
 
-    usb_hid_register_boot_keyboard(1);
+    usb_hid_register_boot_keyboard_detail(1, (uint8_t)port, addr,
+                                          ep_in->bEndpointAddress,
+                                          ep_in->wMaxPacketSize,
+                                          ep_in->bInterval);
     enum_print("USB HID boot keyboard enumerated.\n");
     return USB_HID_PROTOCOL_KEYBOARD;
 }
@@ -388,6 +502,9 @@ void usb_enumerate_devices(void) {
 
     device_count = 0;
     current_address = 1;
+    hid_control_next_poll = 0;
+    hid_control_logged = 0;
+    hid_interrupt_logged = 0;
 
     if (!host_controller_healthy()) {
         enum_print("USB enum: controller not healthy.\n");
@@ -465,8 +582,56 @@ void usb_enumerate_devices(void) {
     uint64_t scan_deadline = timer_deadline_ms(ENUM_SCAN_BUDGET_MS);
     uint64_t ctrl_deadline = timer_deadline_ms(ENUM_CTRL_BUDGET_MS);
 
-    for (int port = 0; port < ports && !found_pointer && !found_keyboard; port++) {
+    /*
+     * Port visit order: higher protocol speed first (SS>HS>FS>LS), then
+     * higher port index. External mice are usually HS/SS; Bay Trail often
+     * has internal FS phantoms on low ports that burn EP0 then slots.
+     */
+    int port_order[32];
+    int port_order_n = 0;
+    int prefer_later = 0;
+    for (int port = 0; port < ports && port < 32; port++) {
+        if (host_port_connected(port)) port_order[port_order_n++] = port;
+    }
+    /* Insertion sort by (speed desc, port desc). */
+    for (int i = 1; i < port_order_n; i++) {
+        int p = port_order[i];
+        int sp = host_port_protocol_speed(p);
+        int j = i;
+        while (j > 0) {
+            int prev = port_order[j - 1];
+            int psp = host_port_protocol_speed(prev);
+            if (sp < psp || (sp == psp && p < prev)) break;
+            port_order[j] = prev;
+            j--;
+        }
+        port_order[j] = p;
+    }
+    if (port_order_n > 0) {
+        enum_print("USB enum: port scan order (speed-first):");
+        for (int i = 0; i < port_order_n; i++) {
+            char c[8];
+            int p = port_order[i];
+            int sp = host_port_protocol_speed(p);
+            enum_print(" ");
+            if (p >= 10) { c[0] = '0' + p / 10; c[1] = '0' + p % 10; c[2] = 0; }
+            else { c[0] = '0' + p; c[1] = 0; }
+            enum_print(c);
+            enum_print("@");
+            c[0] = '0' + (sp % 10); c[1] = 0;
+            enum_print(c);
+        }
+        enum_print("\n");
+    }
+
+    for (int oi = 0; oi < port_order_n && !found_pointer; oi++) {
+        int port = port_order[oi];
         if (host_controller_faulted()) {
+            /*
+             * Soft EP0 failures no longer poison xHCI. A hard fault (HSE /
+             * repeated soft fails) still stops the scan — continuing on a
+             * dead controller just burns the budget.
+             */
             enum_print("USB enum: controller faulted, abandoning scan.\n");
             break;
         }
@@ -487,47 +652,77 @@ void usb_enumerate_devices(void) {
           enum_print("USB enum: enumerating port "); enum_print(c); enum_print("\n"); }
 
         /*
-         * Per-port reset + enumerate with a few retries, then mark this port
-         * dead and continue. Each attempt gets a fresh per-port budget; the
-         * controller/scan budgets bound the total number of retries.
-         *
-         * Every attempt logs a canonical "USB enum: port=N reset-retry
-         * attempt=M/T" line so a human can tell "this port is flaky" (1 or 2
-         * retries before success) from "this port is dead" (T retries all
-         * failed).
+         * Per-port reset + enumerate. Base is one attempt; on xHCI allow one
+         * extra attempt only after EP0 timeout/cc=4 (abandon_slot, never Disable).
          */
         int enum_result = 0;
         int attempts_used = 0;
-        for (int attempt = 1; attempt <= ENUM_PORT_RETRIES; attempt++) {
+        int max_retries = ENUM_PORT_RETRIES;
+        for (int attempt = 1; ; attempt++) {
             if (host_controller_faulted() ||
                 timer_deadline_expired(scan_deadline) ||
                 timer_deadline_expired(ctrl_deadline)) {
                 break;
             }
             attempts_used = attempt;
-            enum_print_retry(port, attempt, ENUM_PORT_RETRIES, ": resetting\n");
+            enum_print_retry(port, attempt, max_retries, ": resetting\n");
             uint64_t port_deadline = timer_deadline_ms(ENUM_PORT_BUDGET_MS);
 
             int low_speed = host_port_low_speed(port);
-            host_port_reset(port);
-            if (host_controller_faulted()) break;
-            if (host_port_companion_owned(port)) {
-                enum_print("USB enum: port requires companion controller.\n");
-                break;
+            host_clear_ep0_soft_fail();
+            /* Single-slot: detach MSC before resetting a different port for mouse. */
+            if (usb_msc_is_attached() && usb_msc_attached_port() != port)
+                usb_msc_detach(usb_msc_attached_port());
+            if (host_port_reset(port) != 0) {
+                enum_print("USB enum: port reset/slot activate failed.\n");
+                enum_result = 0;
+            } else if (!host_has_active_slot()) {
+                enum_print("USB enum: no active slot after reset.\n");
+                enum_result = 0;
+            } else {
+                if (host_port_companion_owned(port)) {
+                    enum_print("USB enum: port requires companion controller.\n");
+                    break;
+                }
+                enum_result = enumerate_device(port, low_speed, port_deadline);
             }
-
-            enum_result = enumerate_device(port, low_speed, port_deadline);
             if (enum_result > 0) {
-                enum_print_retry(port, attempt, ENUM_PORT_RETRIES,
-                                 ": SUCCESS\n");
+                enum_print_retry(port, attempt, max_retries, ": SUCCESS\n");
                 break;
             }
-            enum_print_retry(port, attempt, ENUM_PORT_RETRIES,
+            /* One safe xHCI retry after soft EP0 failure only. */
+            if (attempt == 1 && host_ep0_soft_fail_pending() &&
+                usb_host_controller_type() == 0x30 &&
+                max_retries < ENUM_PORT_RETRIES_XHCI) {
+                max_retries = ENUM_PORT_RETRIES_XHCI;
+                enum_print_retry(port, attempt, max_retries,
+                                 ": soft EP0 fail, one safe retry\n");
+                host_abandon_slot();
+                continue;
+            }
+            enum_print_retry(port, attempt, max_retries,
                              ": FAILED, will retry if budget allows\n");
+            break;
         }
-        if (enum_result <= 0 && attempts_used >= ENUM_PORT_RETRIES) {
-            enum_print_retry(port, attempts_used, ENUM_PORT_RETRIES,
-                             ": dead port (all retries exhausted)\n");
+        if (enum_result <= 0 && attempts_used >= max_retries) {
+            enum_print_retry(port, attempts_used, max_retries,
+                             ": dead port, continuing to next\n");
+        }
+
+        if (port == 0 && enum_result <= 0 && host_ep0_soft_fail_pending() &&
+            !prefer_later && port_order_n > 1) {
+            prefer_later = 1;
+            /* Reorder remaining connected ports high→low, skip already tried 0. */
+            int n = 0;
+            int tmp[32];
+            for (int p = ports - 1; p >= 1 && n < 32; p--) {
+                if (host_port_connected(p)) tmp[n++] = p;
+            }
+            port_order_n = n;
+            for (int i = 0; i < n; i++) port_order[i] = tmp[i];
+            oi = -1; /* restart loop over rebuilt order */
+            enum_print("USB enum: port 0 soft-failed; preferring later ports.\n");
+            continue;
         }
 
         if (enum_result == USB_HID_PROTOCOL_MOUSE) {
@@ -541,14 +736,17 @@ void usb_enumerate_devices(void) {
         } else if (enum_result == USB_HID_PROTOCOL_KEYBOARD) {
             found_keyboard = 1;
             /*
-             * Current host drivers track one active interrupt endpoint and
-             * one active device slot. Stop here so a later failed probe does
-             * not reset/overwrite the working USB keyboard state. Full
-             * simultaneous keyboard+mouse support needs a multi-endpoint host
-             * scheduler, which is the next layer after this compatibility
-             * pass.
+             * Keep scanning for a boot mouse. On laptops it is common for a
+             * keyboard-like HID interface/controller path to enumerate before
+             * the external mouse, and stopping here leaves the GUI pointer
+             * stuck even though a mouse is present. If no mouse is found by the
+             * end of the scan, this keyboard remains the fallback HID device.
              */
-            enum_print("USB enum: boot keyboard found, stopping scan.\n");
+            enum_print("USB enum: boot keyboard found, continuing scan for mouse.\n");
+        } else if (enum_result == USB_ENUM_PROTOCOL_MSC) {
+            enum_print("USB enum: MSC attached; continuing scan for mouse.\n");
+            /* Single-slot: MSC holds the slot; further ports will replace it
+             * if a mouse is found. Documented limitation until multi-device. */
         } else {
             /* Port exhausted its retries: mark dead and move on. */
             enum_print("USB enum: port gave up, marking dead and continuing.\n");
@@ -556,7 +754,8 @@ void usb_enumerate_devices(void) {
     }
 
     if (found_pointer) {
-        usb_hid_register_boot_pointer(1, 0);
+        /* enumerate_device() already registered the pointer with endpoint
+         * details and touchpad classification. Do not clobber that state here. */
         enum_print("USB enum: pointer device ready.\n");
     } else if (found_keyboard) {
         usb_hid_register_boot_pointer(0, 0);
@@ -613,30 +812,42 @@ int usb_enumerate_port_hotplug(int port, uint8_t* out_addr) {
     uint64_t scan_deadline = timer_deadline_ms(ENUM_SCAN_BUDGET_MS);
 
     int enum_result = 0;
-    for (int attempt = 1; attempt <= ENUM_PORT_RETRIES; attempt++) {
+    for (int attempt = 1; ; attempt++) {
         if (host_controller_faulted() ||
             timer_deadline_expired(scan_deadline)) break;
 
-        enum_print_retry(port, attempt, ENUM_PORT_RETRIES,
+        int max_retries = ENUM_PORT_RETRIES;
+        enum_print_retry(port, attempt, max_retries,
                          ": hotplug resetting\n");
         uint64_t port_deadline = timer_deadline_ms(ENUM_PORT_BUDGET_MS);
 
         int low_speed = host_port_low_speed(port);
-        host_port_reset(port);
-        if (host_controller_faulted()) return -1;
-        if (host_port_companion_owned(port)) {
+        host_clear_ep0_soft_fail();
+        if (host_port_reset(port) != 0 || !host_has_active_slot()) {
+            enum_print("USB hotplug-enum: reset/slot failed.\n");
+            enum_result = 0;
+        } else if (host_port_companion_owned(port)) {
             enum_print("USB hotplug-enum: port now routed to companion.\n");
             return 0;
+        } else {
+            enum_result = enumerate_device(port, low_speed, port_deadline);
         }
-
-        enum_result = enumerate_device(port, low_speed, port_deadline);
         if (enum_result > 0) {
-            enum_print_retry(port, attempt, ENUM_PORT_RETRIES,
+            enum_print_retry(port, attempt, max_retries,
                              ": hotplug SUCCESS\n");
             break;
         }
-        enum_print_retry(port, attempt, ENUM_PORT_RETRIES,
+        if (attempt == 1 && host_ep0_soft_fail_pending() &&
+            usb_host_controller_type() == 0x30) {
+            max_retries = ENUM_PORT_RETRIES_XHCI;
+            enum_print_retry(port, attempt, max_retries,
+                             ": hotplug soft EP0, one safe retry\n");
+            host_abandon_slot();
+            continue;
+        }
+        enum_print_retry(port, attempt, max_retries,
                          ": hotplug FAILED, retrying if budget allows\n");
+        break;
     }
 
     if (enum_result == USB_HID_PROTOCOL_MOUSE) {
@@ -646,6 +857,10 @@ int usb_enumerate_port_hotplug(int port, uint8_t* out_addr) {
     if (enum_result == USB_HID_PROTOCOL_KEYBOARD) {
         if (out_addr && device_count > 0) *out_addr = devices[device_count - 1].address;
         return USB_HID_PROTOCOL_KEYBOARD;
+    }
+    if (enum_result == USB_ENUM_PROTOCOL_MSC) {
+        if (out_addr && device_count > 0) *out_addr = devices[device_count - 1].address;
+        return USB_ENUM_PROTOCOL_MSC;
     }
     return 0;
 }
@@ -658,8 +873,13 @@ void usb_enumeration_release_active(void) {
      * separately by the caller (usb.c) via usb_hid_register_*.
      */
     host_remove_interrupt();
+    host_abandon_slot();
+    usb_msc_detach_all();
     device_count = 0;
     current_address = 1;
+    hid_control_next_poll = 0;
+    hid_control_logged = 0;
+    hid_interrupt_logged = 0;
 }
 
 int usb_get_device_count(void) {
@@ -675,6 +895,10 @@ void usb_process_hid_reports(void) {
     int ready;
     uint8_t* report = host_get_report(&ready);
     if (ready > 0) {
+        if (!hid_interrupt_logged) {
+            enum_print("USB HID: interrupt report path is live.\n");
+            hid_interrupt_logged = 1;
+        }
         /*
          * The host drivers expose data-ready as a flag, not a byte count, so
          * pass the boot-protocol report length for the active device class:
@@ -689,5 +913,54 @@ void usb_process_hid_reports(void) {
     } else if (ready < 0) {
         /* Re-arm on stall/error */
         host_ack_report();
+    }
+
+    /*
+     * Real-hardware fallback: some controller paths enumerate a boot mouse but
+     * never deliver periodic interrupt completions. Poll HID GET_REPORT over
+     * endpoint 0 at a low rate. This is slower than interrupts, but endpoint 0
+     * is the path that already worked for descriptors/configuration, so it is a
+     * good rescue path for cheap mice and a useful diagnostic on bare metal.
+     */
+    if (!hid_interrupt_logged && usb_hid_has_pointer_device() && device_count > 0) {
+        usb_device_t* dev = NULL;
+        for (int i = 0; i < device_count; i++) {
+            if (devices[i].protocol == USB_HID_PROTOCOL_MOUSE) {
+                dev = &devices[i];
+                break;
+            }
+        }
+        if (dev) {
+            uint32_t now = timer_ticks();
+            if ((int32_t)(now - hid_control_next_poll) >= 0) {
+                uint8_t ctrl_report[8];
+                uint8_t len = dev->ep_in_max_pkt;
+                if (len < 3) len = 3;
+                if (len > sizeof(ctrl_report)) len = sizeof(ctrl_report);
+                for (uint8_t i = 0; i < sizeof(ctrl_report); i++) ctrl_report[i] = 0;
+                int ret = do_ctrl(dev->address,
+                                  USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                                  USB_HID_REQ_GET_REPORT,
+                                  0x0100,
+                                  dev->interface_number,
+                                  len,
+                                  ctrl_report,
+                                  1);
+                if (ret == 0) {
+                    if (!hid_control_logged) {
+                        enum_print("USB HID: control GET_REPORT fallback is live.\n");
+                        hid_control_logged = 1;
+                    }
+                    usb_hid_handle_boot_report(ctrl_report, len);
+                    hid_control_next_poll = now + 2; /* ~50 Hz on 100 Hz PIT */
+                } else {
+                    if (!hid_control_logged) {
+                        enum_print("USB HID: control GET_REPORT fallback failed once.\n");
+                        hid_control_logged = 1;
+                    }
+                    hid_control_next_poll = now + 25;
+                }
+            }
+        }
     }
 }

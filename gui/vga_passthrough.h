@@ -75,6 +75,9 @@ void vga_passthrough_readcell(int x, int y, char* c, unsigned char* attr);
  */
 void vga_passthrough_present_into_window(int cx, int cy, int cw, int ch);
 
+/* Copy textcon's 80x25 cell grid into the passthrough buffer (VGA-compat WM). */
+void vga_passthrough_sync_from_textcon(void);
+
 /* Pump the active passthrough app for one frame. The wrapper window's
  * render() callback installs a buffer-redirect, calls the per-app
  * render function (passed as `body`), then disarms the redirect so the

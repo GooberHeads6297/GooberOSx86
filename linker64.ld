@@ -25,11 +25,20 @@ SECTIONS {
 
     .rodata : ALIGN(4K) { *(.rodata*) }
     .data   : ALIGN(4K) { *(.data*)   }
-    .bss    : ALIGN(4K) {
-        *(COMMON)
-        *(.bss*)
+
+    /* IDT before .bss so the 8 MiB heap arena cannot overrun it.
+     * (Heap-before-IDT caused Acer #GP when kmalloc smashed g_idt.) */
+    .idt : ALIGN(4K) {
+        *(.idt)
     }
 
+    .bss    : ALIGN(4K) {
+        *(COMMON)
+        *(.bss)
+        *(.bss.*)
+    }
+
+    . = ALIGN(4K);
     _kernel_end = .;
 
     /DISCARD/ : {
@@ -38,3 +47,4 @@ SECTIONS {
         *(.comment*)
     }
 }
+
