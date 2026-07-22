@@ -46,4 +46,13 @@ int input_get_pointer_y(void);
 uint8_t input_get_pointer_buttons(void);
 input_device_t input_get_active_pointer(void);
 
+/*
+ * Hot-plug helper: drop every queued event whose `device` field matches
+ * `device`, and (if the active pointer was that device) revert to PS/2.
+ * Called by the USB hot-plug path when a previously-attached device
+ * vanishes so a stale movement/button event doesn't pop out of the queue
+ * after the new mouse is plugged back in.
+ */
+void input_remove_device(input_device_t device);
+
 #endif

@@ -7,6 +7,7 @@ void keyboard_init(void);
 void keyboard_interrupt_handler(void);
 char keyboard_read_char(void);
 int keyboard_has_char(void);
+void keyboard_inject_char(char c);
 
 /* Key codes produced by the keyboard driver */
 #define KEY_ESC     0x1B

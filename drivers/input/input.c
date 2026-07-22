@@ -16,6 +16,21 @@ static input_device_t active_pointer = INPUT_DEVICE_PS2_MOUSE;
 
 static uint32_t irq_save_disable(void) {
     uint32_t flags;
+#ifdef __x86_64__
+    /* In long mode the flags register is 64-bit (RFLAGS), but we only ever
+     * inspect bit 9 (IF) so keeping the storage at 32 bits is safe and
+     * avoids touching every caller. pushfq/popfq are required because the
+     * 32-bit pushf/popf forms are illegal in 64-bit mode. */
+    uint64_t flags64;
+    __asm__ volatile(
+        "pushfq\n"
+        "popq %0\n"
+        "cli\n"
+        : "=rm"(flags64)
+        :
+        : "memory");
+    flags = (uint32_t)flags64;
+#else
     __asm__ volatile(
         "pushf\n"
         "pop %0\n"
@@ -23,6 +38,7 @@ static uint32_t irq_save_disable(void) {
         : "=rm"(flags)
         :
         : "memory");
+#endif
     return flags;
 }
 
@@ -188,4 +204,34 @@ uint8_t input_get_pointer_buttons(void) {
 
 input_device_t input_get_active_pointer(void) {
     return active_pointer;
+}
+
+void input_remove_device(input_device_t device) {
+    uint32_t flags = irq_save_disable();
+
+    /*
+     * Compact the queue in place: copy the events we keep to a fresh tail,
+     * dropping any whose .device matches. This runs with IRQs disabled but
+     * the queue is bounded at 128 entries, so the linear scan is cheap.
+     */
+    uint32_t read = queue_tail;
+    uint32_t write = queue_tail;
+    while (read != queue_head) {
+        input_event_t ev = queue[read];
+        read = (read + 1) % INPUT_QUEUE_SIZE;
+        if (ev.device == device) continue;
+        queue[write] = ev;
+        write = (write + 1) % INPUT_QUEUE_SIZE;
+    }
+    queue_head = write;
+
+    /* If the removed device was the active pointer, revert to PS/2 +
+     * disarm USB-pointer-active so PS/2 events flow again. */
+    if (active_pointer == device) {
+        usb_pointer_active = 0;
+        active_pointer = INPUT_DEVICE_PS2_MOUSE;
+        pointer_buttons = 0;
+    }
+
+    irq_restore(flags);
 }

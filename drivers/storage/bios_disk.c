@@ -1,5 +1,16 @@
 #include "bios_disk.h"
 
+/*
+ * Phase 3 of the UEFI/GOP/x64 migration plan: this whole TU is BIOS-only.
+ * Its sibling drivers/storage/bios_int13.s is real-mode code that cannot
+ * be linked into a long-mode kernel, and the placeholder INT 13h reader
+ * here fundamentally requires a real-mode thunk to be ever useful. Compile
+ * the entire body OUT under __x86_64__ so the x64 link does not see these
+ * symbols; nothing in the x64 driver stack calls into them. The x86 build
+ * sees the body unchanged.
+ */
+#ifdef __i386__
+
 static bios_drive_info_t drives[BIOS_MAX_DRIVES];
 static int drive_count = 0;
 
@@ -39,3 +50,5 @@ int bios_write_lba(uint8_t drive, uint64_t lba, uint16_t count, const void* in) 
     (void)drive; (void)lba; (void)count; (void)in;
     return -1;
 }
+
+#endif /* __i386__ */

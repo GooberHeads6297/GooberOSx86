@@ -52,6 +52,15 @@ void keyboard_init(void) {
     for (int i = 0; i < 256; i++) key_states[i] = false;
 }
 
+void keyboard_inject_char(char c) {
+    if (!c) return;
+    int next = (head + 1) % BUFFER_SIZE;
+    if (next != tail) {
+        buffer[head] = c;
+        head = next;
+    }
+}
+
 void keyboard_interrupt_handler(void) {
     uint8_t scancode = inb(0x60);
 
@@ -108,11 +117,7 @@ void keyboard_interrupt_handler(void) {
         }
 
         if (c) {
-            int next = (head + 1) % BUFFER_SIZE;
-            if (next != tail) {
-                buffer[head] = c;
-                head = next;
-            }
+            keyboard_inject_char(c);
         }
     }
 

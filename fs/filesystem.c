@@ -43,6 +43,14 @@ static int dir_name_equal(const char* a, const char* b) {
     return strcmp(a, b) == 0;
 }
 
+/* The seed directories own statically-allocated file arrays that must never be
+ * passed to kfree(). Any array we grow on the heap is safe to free. */
+static int is_static_files(const FileEntry* files) {
+    return files == root_files_static ||
+           files == docs_files_static ||
+           files == etc_files_static;
+}
+
 void fs_init() {
     for (size_t i = 0; i < MAX_OPEN_FILES; i++) {
         handles[i].used = 0;
@@ -63,14 +71,14 @@ void fs_init() {
     current_dir = &root_dir[0];
 }
 
-FileHandle* fs_open(const char* filename) {
-    if (!current_dir || !filename) return 0;
-    for (size_t i = 0; i < current_dir->file_count; i++) {
-        if (dir_name_equal(filename, current_dir->files[i].name)) {
+FileHandle* fs_dir_open(Directory* dir, const char* filename) {
+    if (!dir || !filename) return 0;
+    for (size_t i = 0; i < dir->file_count; i++) {
+        if (dir_name_equal(filename, dir->files[i].name)) {
             for (size_t h = 0; h < MAX_OPEN_FILES; h++) {
                 if (!handles[h].used) {
                     handles[h].used = 1;
-                    handles[h].entry = &current_dir->files[i];
+                    handles[h].entry = &dir->files[i];
                     handles[h].offset = 0;
                     return &handles[h];
                 }
@@ -79,6 +87,10 @@ FileHandle* fs_open(const char* filename) {
         }
     }
     return 0;
+}
+
+FileHandle* fs_open(const char* filename) {
+    return fs_dir_open(current_dir, filename);
 }
 
 size_t fs_read(FileHandle* fh, uint8_t* buffer, size_t bytes) {
@@ -159,22 +171,22 @@ int fs_cd_up() {
     return -1;
 }
 
-int fs_create(const char* filename) {
-    if (!filename || filename[0] == '\0') return -1;
-    for (size_t i = 0; i < current_dir->file_count; i++) {
-        if (dir_name_equal(filename, current_dir->files[i].name)) {
+int fs_dir_create(Directory* dir, const char* filename) {
+    if (!dir || !filename || filename[0] == '\0') return -1;
+    for (size_t i = 0; i < dir->file_count; i++) {
+        if (dir_name_equal(filename, dir->files[i].name)) {
             print("fs_create: File already exists\n");
             return -1;
         }
     }
-    size_t new_count = current_dir->file_count + 1;
+    size_t new_count = dir->file_count + 1;
     FileEntry* new_files = (FileEntry*)kmalloc(new_count * sizeof(FileEntry));
     if (!new_files) {
         print("fs_create: Memory allocation failed\n");
         return -1;
     }
-    for (size_t i = 0; i < current_dir->file_count; i++) {
-        new_files[i] = current_dir->files[i];
+    for (size_t i = 0; i < dir->file_count; i++) {
+        new_files[i] = dir->files[i];
     }
     for (size_t j = 0; j < MAX_NAME_LEN; j++) new_files[new_count - 1].name[j] = 0;
     strncpy(new_files[new_count - 1].name, filename, MAX_NAME_LEN);
@@ -182,28 +194,30 @@ int fs_create(const char* filename) {
     new_files[new_count - 1].data = 0;
     new_files[new_count - 1].size = 0;
     new_files[new_count - 1].owned = 0;
-    if (current_dir->files != root_files_static &&
-        current_dir->files != docs_files_static &&
-        current_dir->files != etc_files_static) {
-        kfree(current_dir->files);
+    if (!is_static_files(dir->files)) {
+        kfree(dir->files);
     }
-    current_dir->files = new_files;
-    current_dir->file_count = new_count;
+    dir->files = new_files;
+    dir->file_count = new_count;
     return 0;
 }
 
-int fs_write(const char* filename, const uint8_t* data, size_t size) {
-    if (!filename) return -1;
+int fs_create(const char* filename) {
+    return fs_dir_create(current_dir, filename);
+}
+
+int fs_dir_write(Directory* dir, const char* filename, const uint8_t* data, size_t size) {
+    if (!dir || !filename) return -1;
     FileEntry* target = NULL;
-    for (size_t i = 0; i < current_dir->file_count; i++) {
-        if (dir_name_equal(filename, current_dir->files[i].name)) {
-            target = &current_dir->files[i];
+    for (size_t i = 0; i < dir->file_count; i++) {
+        if (dir_name_equal(filename, dir->files[i].name)) {
+            target = &dir->files[i];
             break;
         }
     }
     if (!target) {
-        if (fs_create(filename) != 0) return -1;
-        target = &current_dir->files[current_dir->file_count - 1];
+        if (fs_dir_create(dir, filename) != 0) return -1;
+        target = &dir->files[dir->file_count - 1];
     }
     if (target->owned && target->data) {
         kfree(target->data);
@@ -224,6 +238,10 @@ int fs_write(const char* filename, const uint8_t* data, size_t size) {
         target->owned = 1;
     }
     return 0;
+}
+
+int fs_write(const char* filename, const uint8_t* data, size_t size) {
+    return fs_dir_write(current_dir, filename, data, size);
 }
 
 int fs_delete(const char* filename) {
@@ -273,34 +291,38 @@ int fs_delete(const char* filename) {
     return 0;
 }
 
-int fs_create_dir(const char* dirname) {
-    if (!dirname || dirname[0] == '\0') return -1;
-    for (size_t i = 0; i < current_dir->child_count; i++) {
-        if (dir_name_equal(dirname, current_dir->children[i].name)) {
+int fs_dir_create_dir(Directory* dir, const char* dirname) {
+    if (!dir || !dirname || dirname[0] == '\0') return -1;
+    for (size_t i = 0; i < dir->child_count; i++) {
+        if (dir_name_equal(dirname, dir->children[i].name)) {
             print("fs_create_dir: Directory already exists\n");
             return -1;
         }
     }
-    Directory* new_children = (Directory*)kmalloc((current_dir->child_count + 1) * sizeof(Directory));
+    Directory* new_children = (Directory*)kmalloc((dir->child_count + 1) * sizeof(Directory));
     if (!new_children) {
         print("fs_create_dir: Memory allocation failed\n");
         return -1;
     }
-    for (size_t i = 0; i < current_dir->child_count; i++) {
-        new_children[i] = current_dir->children[i];
+    for (size_t i = 0; i < dir->child_count; i++) {
+        new_children[i] = dir->children[i];
     }
-    for (size_t j = 0; j < MAX_NAME_LEN; j++) new_children[current_dir->child_count].name[j] = 0;
-    strncpy(new_children[current_dir->child_count].name, dirname, MAX_NAME_LEN);
-    new_children[current_dir->child_count].name[MAX_NAME_LEN - 1] = '\0';
-    new_children[current_dir->child_count].files = 0;
-    new_children[current_dir->child_count].file_count = 0;
-    new_children[current_dir->child_count].parent = current_dir;
-    new_children[current_dir->child_count].children = NULL;
-    new_children[current_dir->child_count].child_count = 0;
-    if (current_dir->children) kfree(current_dir->children);
-    current_dir->children = new_children;
-    current_dir->child_count++;
+    for (size_t j = 0; j < MAX_NAME_LEN; j++) new_children[dir->child_count].name[j] = 0;
+    strncpy(new_children[dir->child_count].name, dirname, MAX_NAME_LEN);
+    new_children[dir->child_count].name[MAX_NAME_LEN - 1] = '\0';
+    new_children[dir->child_count].files = 0;
+    new_children[dir->child_count].file_count = 0;
+    new_children[dir->child_count].parent = dir;
+    new_children[dir->child_count].children = NULL;
+    new_children[dir->child_count].child_count = 0;
+    if (dir->children) kfree(dir->children);
+    dir->children = new_children;
+    dir->child_count++;
     return 0;
+}
+
+int fs_create_dir(const char* dirname) {
+    return fs_dir_create_dir(current_dir, dirname);
 }
 
 int fs_delete_dir(const char* dirname) {
@@ -366,4 +388,32 @@ const char* fs_get_cwd(void) {
 
 const Directory* fs_get_current_dir(void) {
     return current_dir;
+}
+
+Directory* fs_get_cwd_dir(void) {
+    return current_dir;
+}
+
+Directory* fs_dir_find_child(Directory* dir, const char* name) {
+    return find_child_dir(dir, name);
+}
+
+void fs_set_current_dir(Directory* dir) {
+    if (dir) current_dir = dir;
+}
+
+/*
+ * Locate-or-create a fixed "/Desktop" directory under the root and return its
+ * handle. Resolved fresh on every call (rather than cached) because growing the
+ * root's child array can relocate sibling Directory records; re-finding is cheap
+ * and always yields the currently-valid pointer.
+ */
+Directory* fs_get_desktop_dir(void) {
+    Directory* root = &root_dir[0];
+    Directory* found = find_child_dir(root, "Desktop");
+    if (!found) {
+        if (fs_dir_create_dir(root, "Desktop") != 0) return NULL;
+        found = find_child_dir(root, "Desktop");
+    }
+    return found;
 }

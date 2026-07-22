@@ -81,10 +81,45 @@ int pci_find_usb_controllers(usb_pci_controller_t* out, int max_out) {
                             out[found].vendor_id = (uint16_t)(id & 0xFFFF);
                             out[found].device_id = (uint16_t)((id >> 16) & 0xFFFF);
                             out[found].bar0 = pci_read_config_dword(bus, slot, func, 0x10);
+                            out[found].bar1 = pci_read_config_dword(bus, slot, func, 0x14);
                         }
                         found++;
                     }
                 }
+            }
+        }
+    }
+    return found;
+}
+
+int pci_find_display_controllers(pci_display_device_t* out, int max_out) {
+    int found = 0;
+
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t vendor_id = pci_read_config_dword(bus, slot, func, 0) & 0xFFFF;
+                if (vendor_id == 0xFFFF) continue;
+
+                uint32_t class_code = pci_read_config_dword(bus, slot, func, 0x08);
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                if (base_class != 0x03) continue; /* display controller */
+
+                if (out && found < max_out) {
+                    uint32_t id = pci_read_config_dword(bus, slot, func, 0x00);
+                    out[found].bus = (uint8_t)bus;
+                    out[found].slot = slot;
+                    out[found].func = func;
+                    out[found].sub_class = (class_code >> 16) & 0xFF;
+                    out[found].prog_if = (class_code >> 8) & 0xFF;
+                    out[found].vendor_id = (uint16_t)(id & 0xFFFF);
+                    out[found].device_id = (uint16_t)((id >> 16) & 0xFFFF);
+                    for (int b = 0; b < 6; b++) {
+                        out[found].bar[b] =
+                            pci_read_config_dword(bus, slot, func, 0x10 + (uint8_t)(b * 4));
+                    }
+                }
+                found++;
             }
         }
     }
@@ -116,5 +151,15 @@ static void pci_check_usb(void) {
 }
 
 void pci_init(void) {
+    /*
+     * NON-DESTRUCTIVE PCI scan.
+     *
+     * The previous implementation wrote 0xFFFFFFFF to BAR0 of every USB
+     * controller to size the BAR. On real hardware that share USB controllers
+     * with BIOS legacy USB SMI emulation (most pre-UEFI laptops, including
+     * Lenovo 2013-era), poking the BAR while SMM still owns the controller
+     * triggers an SMI storm or freezes the chipset. We rely on the BIOS to
+     * have already assigned BARs and just enumerate the bus passively here.
+     */
     pci_check_usb();
 }
