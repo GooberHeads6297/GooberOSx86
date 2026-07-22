@@ -111,13 +111,7 @@ EHCI cannot speak FS without UHCI, which Bay Trail usually lacks).
 Expect `USB HID pointer ready.` and later movement reports. `devices` should
 show `HID pointer: yes` and `I2C touchpad: no`.
 
-**Lenovo hardware checks (touchpad — deferred after USB mouse works):**
-
-1. Boot the x64 ISO; confirm serial/`driverlog` lines:
-   - `[touchpad] I2C HID touchpad ready`
-   - `USB2ROUTE:` (Bay Trail USB2 ownership)
-2. Move / click / two-finger scroll on the built-in pad.
-3. Shell `devices` shows `I2C touchpad: yes ... decoder=...`.
+Mouse and Touchpad are currently stubs in the drivers since they aren't currently implemented properly
 
 Disable probes if needed: `gooberos.touchpad=off` or `gooberos.i2c=off`.
 
