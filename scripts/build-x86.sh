@@ -144,6 +144,7 @@ build_kernel() {
   compile_c -I. -Idrivers/diagnostics -c drivers/video/edid.c -o "${BUILD_DIR}/edid.o"
   compile_c -I. -Idrivers/diagnostics -Idrivers/video -Idrivers/io -c drivers/video/connector.c -o "${BUILD_DIR}/connector.o"
   compile_c -I. -Idrivers/diagnostics -c drivers/video/fb_cache.c -o "${BUILD_DIR}/fb_cache.o"
+  compile_c -I. -Idrivers/diagnostics -c drivers/video/fb_pat.c -o "${BUILD_DIR}/fb_pat.o"
   compile_c -I. -Idrivers/io -c drivers/video/display.c -o "${BUILD_DIR}/display.o"
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/bios -c drivers/video/bios_vbe.c -o "${BUILD_DIR}/bios_vbe.o"
   compile_c -I. -Idrivers/io -Idrivers/video -Idrivers/bios -Idrivers/pci -Idrivers/diagnostics -c drivers/video/basic_display.c -o "${BUILD_DIR}/basic_display.o"
@@ -244,6 +245,7 @@ build_kernel() {
     "${BUILD_DIR}/edid.o" \
     "${BUILD_DIR}/connector.o" \
     "${BUILD_DIR}/fb_cache.o" \
+    "${BUILD_DIR}/fb_pat.o" \
     "${BUILD_DIR}/display.o" \
     "${BUILD_DIR}/bios_vbe.o" \
     "${BUILD_DIR}/basic_display.o" \

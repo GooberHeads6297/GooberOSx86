@@ -11,6 +11,8 @@
 #include "fb_pat.h"
 #include "../diagnostics/driver_log.h"
 
+#ifdef __x86_64__
+
 #define MSR_IA32_PAT  0x00000277U
 
 /* Memory types in PAT entries (Intel SDM Vol. 3A). */
@@ -202,3 +204,19 @@ int fb_pat_set_wc(uintptr_t fb_phys, uint32_t fb_bytes) {
     driver_log_line(".");
     return 1;
 }
+
+#else /* !__x86_64__ */
+
+/*
+ * The PAT write-combining path is implemented against the x64 long-mode page
+ * tables (boot64.s pd0..pd3) and 64-bit MSR/CR handling, so it does not apply to
+ * the 32-bit build. Report "not applied" and let the caller fall back to
+ * uncached scanout (kernel.c treats a 0 return that way).
+ */
+int fb_pat_set_wc(uintptr_t fb_phys, uint32_t fb_bytes) {
+    (void)fb_phys;
+    (void)fb_bytes;
+    return 0;
+}
+
+#endif /* __x86_64__ */
