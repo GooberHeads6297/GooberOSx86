@@ -300,6 +300,10 @@ int usb_hid_has_keyboard_device(void) {
     return keyboard_present;
 }
 
+int usb_hid_keyboard_active(void) {
+    return keyboard_present && keyboard_report_count > 0;
+}
+
 void usb_hid_attach(int port, uint8_t address, int protocol) {
     if (protocol == USB_HID_PROTOCOL_MOUSE) {
         /* enumerate_device() already registered endpoint/address details. */

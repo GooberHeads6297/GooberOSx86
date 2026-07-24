@@ -17,6 +17,10 @@ void usb_hid_handle_boot_report(const uint8_t* report, uint8_t length);
 int usb_hid_has_pointer_device(void);
 int usb_hid_has_touchpad_device(void);
 int usb_hid_has_keyboard_device(void);
+/* 1 only after at least one USB keyboard interrupt report was received.
+ * Use this (not has_keyboard_device) before suppressing PS/2 input, so a
+ * bound-but-silent USB keyboard cannot mute a working laptop PS/2 keyboard. */
+int usb_hid_keyboard_active(void);
 
 /*
  * Canonical hot-plug attach/detach hooks.

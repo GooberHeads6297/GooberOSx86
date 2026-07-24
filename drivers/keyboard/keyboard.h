@@ -14,6 +14,8 @@ void keyboard_inject_char(char c);
 bool keyboard_is_shift_active(void);
 bool keyboard_is_ctrl_active(void);
 bool keyboard_is_alt_active(void);
+/* '1' = set-1 / AT-translated, '2' = raw set-2 (auto-detected), 'v' = VBox forced set-1. */
+char keyboard_scancode_mode(void);
 /* Copy ISR breadcrumb trail for on-screen HUD (survives pump freeze). */
 void keyboard_debug_snapshot(char* out, int out_max,
                              uint8_t* last_status, uint8_t* last_sc,

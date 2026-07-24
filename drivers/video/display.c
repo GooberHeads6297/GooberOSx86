@@ -363,18 +363,48 @@ int display_present_rect(int x, int y, int w, int h) {
             max_rows = (int)(budget / row_bytes);
             if (max_rows < 1) max_rows = 1;
             if (max_rows > h) max_rows = h;
+            /*
+             * Keep partial presents on glyph-row boundaries (8x16 font). Cutting
+             * mid-glyph leaves half-drawn characters that look like "cutoff"
+             * terminal text until a later pending chunk arrives -- and if that
+             * chunk is cancelled, the corruption sticks.
+             */
+            if (max_rows >= 16 && max_rows < h)
+                max_rows -= (max_rows % 16);
+            if (max_rows < 1) max_rows = 1;
         }
         copied = vesa_swap_rect_rows(x, y, w, h, max_rows);
         display_record_present(waited ? DISPLAY_PRESENT_VBLANK_COPY_RECT
                                       : DISPLAY_PRESENT_COPY_RECT,
                                x, y, w, copied);
         if (copied < h) {
+            /* This blit was truncated: defer the remainder (replaces any
+             * previous pending -- caller should drain pending first). */
             pending_present_x = x;
             pending_present_y = y + copied;
             pending_present_w = w;
             pending_present_h = h - copied;
         } else {
-            pending_present_h = 0;
+            /*
+             * This blit finished. Do NOT clear an unrelated pending region.
+             * The alive-beacon (and other small oneshots) used to complete here
+             * and zero pending_present_h, cancelling the rest of a tall shell
+             * present -- the terminal then showed cut-off / stale glyphs on
+             * both VirtualBox and real hardware.
+             */
+            if (pending_present_h > 0 &&
+                pending_present_x == x &&
+                pending_present_w == w &&
+                y <= pending_present_y &&
+                (y + copied) >= pending_present_y) {
+                int pend_end = pending_present_y + pending_present_h;
+                if ((y + copied) >= pend_end) {
+                    pending_present_h = 0;
+                } else {
+                    pending_present_y = y + copied;
+                    pending_present_h = pend_end - pending_present_y;
+                }
+            }
         }
         return 1;
     }

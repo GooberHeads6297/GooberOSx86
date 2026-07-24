@@ -219,11 +219,13 @@ static int vdesk_any_drag_active(void) {
 }
 
 /* Desktop freeze diagnostics: last breadcrumb trail stays visible on-screen
- * when the event pump stalls (VirtualBox has no easy serial). F10 toggles. */
+ * when the event pump stalls (VirtualBox has no easy serial). Enabled only by
+ * gooberos.debug=1 on the cmdline -- F10 no longer toggles this strip. */
 #define VDESK_BC_TRAIL 48
 static char g_vdesk_bc_trail[VDESK_BC_TRAIL + 1];
 static int g_vdesk_bc_len = 0;
-static int g_vdesk_debug_hud = 0; /* off by default; F10 or gooberos.debug=desk */
+static int g_vdesk_debug_hud = 0; /* cmdline gooberos.debug= only */
+static int g_vdesk_alive_beacon = 1; /* top-right idle tick; F10 toggles */
 static char g_vdesk_last_key = 0;
 static int g_vdesk_last_dirty_w = 0;
 static int g_vdesk_last_dirty_h = 0;
@@ -350,6 +352,97 @@ static void vdesk_render_debug_hud(void) {
     x = 4;
     vesa_fill_rect(x, y, desktop.screen_w - 8, 16, 0x000000);
     vesa_draw_string(x, y + 1, line, 0x00FF00, 0x000000);
+}
+
+/*
+ * Top-right idle tick / freeze oracle. F10 toggles this on and off.
+ * When enabled it updates every frame WITHOUT needing keyboard, mouse, or
+ * touchpad -- so you can tell "desktop loop alive, input dead" from a freeze.
+ *
+ *   [##] f=NNNN i=NNNN m=N
+ *    ^^ blinks green/dark while the pump runs
+ *    f= frame counter (must keep climbing)
+ *    i= keyboard IRQ1 count
+ *    m= scancode mode (1=AT, 2=VM set-2)
+ */
+static int g_beacon_last_x = 0, g_beacon_last_y = 0;
+static int g_beacon_last_w = 0, g_beacon_last_h = 0;
+
+static void vdesk_erase_alive_beacon(void) {
+    int x = g_beacon_last_x;
+    int y = g_beacon_last_y;
+    int w = g_beacon_last_w;
+    int h = g_beacon_last_h;
+    if (w <= 0 || h <= 0) {
+        /* Generous fallback if we never drew yet. */
+        w = 160;
+        h = 16;
+        y = 2;
+        x = desktop.screen_w - w - 4;
+        if (x < 0) x = 0;
+    }
+    /* Mark dirty so the next composite redraws taskbar/desktop under the strip. */
+    vdesk_mark_dirty(x - 2, y, w + 4, h + 2);
+    g_beacon_last_w = 0;
+    g_beacon_last_h = 0;
+}
+
+static void vdesk_render_alive_beacon(void) {
+    char line[40];
+    uint8_t st = 0, sc = 0;
+    uint32_t irqn = 0;
+    uint32_t n;
+    int i = 0;
+    int x, y, w, h;
+    int blink;
+    uint32_t pulse_color;
+    char rev[12];
+    int r;
+
+    if (!g_vdesk_alive_beacon) return;
+
+    keyboard_debug_snapshot((char*)0, 0, &st, &sc, &irqn);
+
+    /* Blink at ~2 Hz using PIT ticks (100 Hz). */
+    blink = ((timer_ticks() / 25u) & 1u) != 0;
+    pulse_color = blink ? 0x00FF00u : 0x003300u;
+
+    line[i++] = 'f'; line[i++] = '=';
+    n = desktop.metrics.frame_count;
+    r = 0;
+    if (n == 0) rev[r++] = '0';
+    else while (n > 0 && r < 10) { rev[r++] = (char)('0' + (n % 10)); n /= 10; }
+    while (r > 0 && i < 18) line[i++] = rev[--r];
+    line[i++] = ' ';
+    line[i++] = 'i'; line[i++] = '=';
+    n = irqn;
+    r = 0;
+    if (n == 0) rev[r++] = '0';
+    else while (n > 0 && r < 10) { rev[r++] = (char)('0' + (n % 10)); n /= 10; }
+    while (r > 0 && i < 28) line[i++] = rev[--r];
+    line[i++] = ' ';
+    line[i++] = 'm'; line[i++] = '=';
+    line[i++] = keyboard_scancode_mode();
+    line[i] = '\0';
+
+    w = 8 + (i * 8) + 16; /* pulse box + gap + text */
+    h = 14;
+    y = 2;
+    x = desktop.screen_w - w - 4;
+    if (x < 0) x = 0;
+
+    g_beacon_last_x = x;
+    g_beacon_last_y = y;
+    g_beacon_last_w = w;
+    g_beacon_last_h = h;
+
+    vesa_fill_rect(x, y, w, h, 0x000000);
+    vesa_fill_rect(x + 2, y + 2, 10, 10, pulse_color);
+    vesa_draw_string(x + 16, y + 2, line, 0x00FF00, 0x000000);
+
+    display_present_set_oneshot(1);
+    display_present_rect(x, y, w, h);
+    display_present_set_oneshot(0);
 }
 
 static void update_metrics_pointer(void) {
@@ -1769,11 +1862,11 @@ static void handle_keyboard(void) {
             continue;
         }
         if ((unsigned char)c == KEY_F10) {
-            g_vdesk_debug_hud = !g_vdesk_debug_hud;
-            if (g_vdesk_debug_hud) kernel_serial_com1_enable(1);
-            print(g_vdesk_debug_hud ? "[desktop] debug HUD on (F10)\n"
-                                    : "[desktop] debug HUD off (F10)\n");
-            vdesk_mark_full_dirty();
+            g_vdesk_alive_beacon = !g_vdesk_alive_beacon;
+            if (!g_vdesk_alive_beacon)
+                vdesk_erase_alive_beacon();
+            print(g_vdesk_alive_beacon ? "[desktop] idle tick on (F10)\n"
+                                       : "[desktop] idle tick off (F10)\n");
             continue;
         }
 
@@ -2144,7 +2237,7 @@ void vdesk_run(void) {
                      * the kserial_note freeze oracle to a raw file, so enable it
                      * here when the operator explicitly asked for debug. */
                     kernel_serial_com1_enable(1);
-                    print("[desktop] debug HUD on (cmdline). F10 toggles.\n");
+                    print("[desktop] debug HUD on (cmdline). F10 toggles idle tick.\n");
                     kserial_note("[desktop] debug HUD armed; COM1 TX enabled\n");
                 }
             }
@@ -2157,12 +2250,18 @@ void vdesk_run(void) {
         int had_dirty;
         int drag_active;
 
-        if (display_present_has_pending()) {
-            int px, py, pw, ph;
-            display_present_consume_pending(&px, &py, &pw, &ph);
-            vdesk_bc('P');
-            display_present_rect(px, py, pw, ph);
-            vdesk_bc('p');
+        /* Drain ALL deferred present bands before input/render. One chunk per
+         * frame left the shell half-updated when the alive-beacon oneshot used
+         * to cancel the remainder; draining here keeps tall updates complete. */
+        {
+            int guard = 0;
+            while (display_present_has_pending() && guard++ < 64) {
+                int px, py, pw, ph;
+                display_present_consume_pending(&px, &py, &pw, &ph);
+                vdesk_bc('P');
+                display_present_rect(px, py, pw, ph);
+                vdesk_bc('p');
+            }
         }
 
         usb_poll();
@@ -2271,6 +2370,16 @@ void vdesk_run(void) {
                 display_present_frame();
             } else {
                 display_present_rect(dirty_x, dirty_y, dirty_w, dirty_h);
+                /* Finish budgeted shell/window presents this frame so help
+                 * output and scrollback are not left half-drawn on screen. */
+                {
+                    int guard = 0;
+                    while (display_present_has_pending() && guard++ < 64) {
+                        int px, py, pw, ph;
+                        display_present_consume_pending(&px, &py, &pw, &ph);
+                        display_present_rect(px, py, pw, ph);
+                    }
+                }
             }
             /* HUD is drawn outside the dirty clip — publish its strip too. */
             if (g_vdesk_debug_hud) {
@@ -2317,6 +2426,9 @@ void vdesk_run(void) {
         desktop.metrics.window_count = desktop.window_count;
         desktop.metrics.icon_count = desktop.icon_count;
         desktop.metrics.theme_mode = desktop.theme_mode;
+
+        /* Top-right idle tick (F10 toggles). Runs even when dirty==0. */
+        vdesk_render_alive_beacon();
         {
             const display_present_stats_t* ps = display_get_present_stats();
             desktop.metrics.present_count = ps->present_count;
