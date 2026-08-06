@@ -232,6 +232,8 @@ static int pci_is_intel_lpss_i2c(uint16_t vendor_id, uint16_t device_id,
     if (vendor_id == 0x8086) {
         /* Bay Trail LPSS I2C controller IDs are commonly 0x0F41..0x0F45. */
         if (device_id >= 0x0F41 && device_id <= 0x0F45) return 1;
+        /* Braswell / Cherry Trail LPSS I2C: 0x22C1..0x22C7. */
+        if (device_id >= 0x22C1 && device_id <= 0x22C7) return 1;
         /* Many Intel LPSS I2C devices report as "serial bus, other". */
         if (base_class == 0x0C && sub_class == 0x80) return 1;
     }

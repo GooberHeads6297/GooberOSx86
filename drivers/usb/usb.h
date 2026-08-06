@@ -8,6 +8,7 @@ void usb_init(void);
 void usb_poll(void);
 int usb_has_pointer_device(void);
 int usb_has_touchpad_device(void);
+int usb_has_keyboard_device(void);
 
 /* USB standard request codes */
 #define USB_REQ_GET_STATUS         0x00

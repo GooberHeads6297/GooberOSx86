@@ -1,0 +1,8 @@
+# Minimal goober.auto sample — sleep stub + console print
+use goober.auto
+app auto
+
+print "Hello from goober.auto"
+sleep 200
+print "Still here after sleep"
+exit

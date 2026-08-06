@@ -5,11 +5,14 @@
 | Form | Meaning |
 |------|---------|
 | `use goober.console` / `use goober.gui` | Import module (documentation + kind hint) |
-| `app console` / `app gui` | App kind |
+| `use goober.auto` / `use goober.gfx3d` | Automation / 3D stub modules (kind hints) |
+| `app console` / `app gui` / `app auto` / `app gfx3d` | App kind |
 | `print "..."` | Console write |
 | `window "Title" WxH` | Create GUI window |
 | `text "..."` | Add text line to current window |
 | `wait` | Wait until window dismissed |
+| `sleep N` | Yield for ~N ms (`goober.auto` stub) |
+| `clear 0xRRGGBBAA` | Clear 3D canvas (`goober.gfx3d` stub / no-op) |
 | `exit` | Terminate |
 | `# comment` | Comment |
 
@@ -22,7 +25,7 @@ offset  size  field
 0       4     magic = 'GOB\0' (0x00424F47 LE)
 4       2     version = 1
 6       1     arch (1=i386, 2=x86_64)
-7       1     kind (1=console, 2=gui)
+7       1     kind (1=console, 2=gui, 3=auto, 4=gfx3d)
 8       4     flags (bit0 = bytecode)
 12      4     entry (bytecode IP / native RVA)
 16      4     code_size
@@ -44,6 +47,8 @@ offset  size  field
 | 5 GUI_TEXT | u32 slot, u16 x, u16 y, u32 str_off | Add text |
 | 6 GUI_WAIT | u32 slot | Wait for dismiss |
 | 7 GUI_CLOSE | u32 slot | Close window |
+| 8 SLEEP_MS | u32 ms | Stub sleep (frame yields) |
+| 9 GFX3D_CLEAR | u32 rgba | Stub clear (reserved) |
 
 ## Syscall ABI (`int 0x80`)
 

@@ -908,7 +908,10 @@ void usb_process_hid_reports(void) {
          */
         uint8_t length = (usb_hid_has_keyboard_device() && !usb_hid_has_pointer_device())
                              ? 8 : 4;
-        usb_hid_handle_boot_report(report, length);
+        int proto = usb_hid_has_pointer_device()
+                        ? USB_HID_PROTOCOL_MOUSE
+                        : USB_HID_PROTOCOL_KEYBOARD;
+        usb_hid_handle_boot_report_ex(proto, report, length);
         host_ack_report();
     } else if (ready < 0) {
         /* Re-arm on stall/error */
@@ -951,7 +954,8 @@ void usb_process_hid_reports(void) {
                         enum_print("USB HID: control GET_REPORT fallback is live.\n");
                         hid_control_logged = 1;
                     }
-                    usb_hid_handle_boot_report(ctrl_report, len);
+                    usb_hid_handle_boot_report_ex(USB_HID_PROTOCOL_MOUSE,
+                                                  ctrl_report, len);
                     hid_control_next_poll = now + 2; /* ~50 Hz on 100 Hz PIT */
                 } else {
                     if (!hid_control_logged) {

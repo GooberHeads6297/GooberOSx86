@@ -16,6 +16,7 @@ typedef struct {
 int i2c_init(void);
 int i2c_init_controller(int index);
 int i2c_controller_count(void);
+uint16_t i2c_controller_device_id(int index);
 const i2c_bus_t* i2c_get_bus(void);
 int i2c_read_reg16(uint8_t addr, uint16_t reg, uint8_t* data, uint16_t len);
 int i2c_write_cmd(uint8_t addr, uint16_t reg, const uint8_t* data, uint16_t len);

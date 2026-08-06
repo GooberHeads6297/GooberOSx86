@@ -1,0 +1,7 @@
+# goober.gfx3d stub — clear opcode reserved (no visible 3D yet)
+use goober.gfx3d
+app gfx3d
+
+print "gfx3d stub: clear is a no-op for now"
+clear 0xFF224466
+exit

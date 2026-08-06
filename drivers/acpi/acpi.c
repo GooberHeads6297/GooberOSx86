@@ -1,6 +1,7 @@
 #include "acpi.h"
 #include <stddef.h>
 #include "../../lib/string.h"
+#include "../diagnostics/driver_log.h"
 
 extern void print(const char* str);
 
@@ -109,6 +110,13 @@ static int table_valid(const acpi_sdt_header_t* h) {
     return acpi_checksum((const uint8_t*)h, h->length) == 0;
 }
 
+/* Length-only check: some OEM DSDTs fail checksum but are still usable. */
+static int table_header_ok(const acpi_sdt_header_t* h) {
+    if (!h) return 0;
+    if (h->length < sizeof(acpi_sdt_header_t) || h->length > 0x200000) return 0;
+    return 1;
+}
+
 static int table_contains(const acpi_sdt_header_t* h, const char* needle) {
     const uint8_t* p = (const uint8_t*)h;
     uint32_t len = h->length;
@@ -175,8 +183,11 @@ static void extract_emmc_mmio_near_hid(const acpi_sdt_header_t* h) {
 }
 
 static void scan_aml_table(const acpi_sdt_header_t* h) {
-    if (!table_valid(h)) return;
-    if (table_contains(h, "ELAN0") || table_contains(h, "ELAN1")) {
+    if (!table_header_ok(h)) return;
+    /* Acer R3-131T: ELAN0501; Lenovo 80M4: ELAN0601; also generic ELAN*. */
+    if (table_contains(h, "ELAN0501") || table_contains(h, "ELAN0601") ||
+        table_contains(h, "ELAN0") || table_contains(h, "ELAN1") ||
+        table_contains(h, "ELAN")) {
         g_touchpad_info.elan0601_found = 1;
     }
     if (table_contains(h, "PNP0C50")) g_touchpad_info.pnp0c50_found = 1;
@@ -184,20 +195,75 @@ static void scan_aml_table(const acpi_sdt_header_t* h) {
         g_touchpad_info.pnp0c50_found = 1;
     }
     if (table_contains(h, "80860F41")) g_touchpad_info.baytrail_i2c_found = 1;
+    /* Braswell / Cherry Trail LPSS I2C ACPI HIDs (808622C1..808622C7). */
+    if (table_contains(h, "808622C1") || table_contains(h, "808622C2") ||
+        table_contains(h, "808622C3") || table_contains(h, "808622C4") ||
+        table_contains(h, "808622C5") || table_contains(h, "808622C6") ||
+        table_contains(h, "808622C7") || table_contains(h, "808622C")) {
+        g_touchpad_info.braswell_i2c_found = 1;
+    }
     if (table_contains(h, "80860F14")) {
         g_touchpad_info.baytrail_emmc_acpi = 1;
         extract_emmc_mmio_near_hid(h);
     }
 }
 
-static void scan_table_pointer(uintptr_t addr);
+static void scan_table_pointer(uintptr_t addr) {
+    if (!addr) return;
+    acpi_sdt_header_t* h = (acpi_sdt_header_t*)addr;
+    /* DSDT/SSDT: accept despite bad OEM checksums (common on Insyde). */
+    if (!table_header_ok(h)) return;
+    if (memeq(h->signature, "DSDT", 4) || memeq(h->signature, "SSDT", 4)) {
+        scan_aml_table(h);
+    }
+}
+
+/*
+ * FADT holds the DSDT pointer (Dsdt / X_Dsdt). Many firmwares list FACP in
+ * RSDT/XSDT but never list DSDT as a top-level entry — Acer R3-131T is one.
+ * Without following FACP we never see ELAN0501 / PNP0C50 in AML.
+ */
+static void scan_fadt_dsdt(const acpi_sdt_header_t* fadt) {
+    const uint8_t* p;
+    uint32_t dsdt32 = 0;
+    uint64_t dsdt64 = 0;
+
+    if (!table_valid(fadt) || !memeq(fadt->signature, "FACP", 4)) return;
+    p = (const uint8_t*)fadt;
+
+    /* DSDT at offset 40 (after 36-byte header + FirmwareCtrl). */
+    if (fadt->length >= 44) {
+        dsdt32 = (uint32_t)p[40] | ((uint32_t)p[41] << 8) |
+                 ((uint32_t)p[42] << 16) | ((uint32_t)p[43] << 24);
+        if (dsdt32) scan_table_pointer((uintptr_t)dsdt32);
+    }
+
+    /* X_DSDT at offset 140 for ACPI 2.0+ FADTs. */
+    if (fadt->length >= 148) {
+        dsdt64 = (uint64_t)p[140] | ((uint64_t)p[141] << 8) |
+                 ((uint64_t)p[142] << 16) | ((uint64_t)p[143] << 24) |
+                 ((uint64_t)p[144] << 32) | ((uint64_t)p[145] << 40) |
+                 ((uint64_t)p[146] << 48) | ((uint64_t)p[147] << 56);
+        if (dsdt64 && dsdt64 != (uint64_t)dsdt32) {
+            if (sizeof(uintptr_t) == sizeof(uint64_t) || (dsdt64 >> 32) == 0)
+                scan_table_pointer((uintptr_t)dsdt64);
+        }
+    }
+}
 
 static void scan_rsdt(const acpi_sdt_header_t* rsdt) {
     if (!table_valid(rsdt)) return;
     uint32_t entries = (rsdt->length - sizeof(acpi_sdt_header_t)) / 4;
     const uint32_t* p = (const uint32_t*)((const uint8_t*)rsdt + sizeof(acpi_sdt_header_t));
     for (uint32_t i = 0; i < entries && i < 64; i++) {
-        scan_table_pointer((uintptr_t)p[i]);
+        uintptr_t addr = (uintptr_t)p[i];
+        acpi_sdt_header_t* h;
+        if (!addr) continue;
+        h = (acpi_sdt_header_t*)addr;
+        if (!table_valid(h)) continue;
+        if (memeq(h->signature, "FACP", 4))
+            scan_fadt_dsdt(h);
+        scan_table_pointer(addr);
     }
 }
 
@@ -206,23 +272,24 @@ static void scan_xsdt(const acpi_sdt_header_t* xsdt) {
     uint32_t entries = (xsdt->length - sizeof(acpi_sdt_header_t)) / 8;
     const uint64_t* p = (const uint64_t*)((const uint8_t*)xsdt + sizeof(acpi_sdt_header_t));
     for (uint32_t i = 0; i < entries && i < 64; i++) {
+        uintptr_t addr;
+        acpi_sdt_header_t* h;
         if (sizeof(uintptr_t) < sizeof(uint64_t) && (p[i] >> 32) != 0) continue;
-        scan_table_pointer((uintptr_t)p[i]);
-    }
-}
-
-static void scan_table_pointer(uintptr_t addr) {
-    if (!addr) return;
-    acpi_sdt_header_t* h = (acpi_sdt_header_t*)addr;
-    if (!table_valid(h)) return;
-    if (memeq(h->signature, "DSDT", 4) || memeq(h->signature, "SSDT", 4)) {
-        scan_aml_table(h);
+        addr = (uintptr_t)p[i];
+        if (!addr) continue;
+        h = (acpi_sdt_header_t*)addr;
+        if (!table_valid(h)) continue;
+        if (memeq(h->signature, "FACP", 4))
+            scan_fadt_dsdt(h);
+        scan_table_pointer(addr);
     }
 }
 
 static void print_bool(const char* label, int v) {
     print(label);
     print(v ? "yes\n" : "no\n");
+    driver_log(label);
+    driver_log_line(v ? "yes" : "no");
 }
 
 void acpi_init(void) {
@@ -230,6 +297,7 @@ void acpi_init(void) {
     g_touchpad_info.elan0601_found = 0;
     g_touchpad_info.pnp0c50_found = 0;
     g_touchpad_info.baytrail_i2c_found = 0;
+    g_touchpad_info.braswell_i2c_found = 0;
     g_touchpad_info.baytrail_emmc_acpi = 0;
     g_touchpad_info.touchpad_i2c_addr = 0;
     g_touchpad_info.hid_desc_reg = 0x0001;
@@ -239,10 +307,12 @@ void acpi_init(void) {
     acpi_rsdp_t* rsdp = find_rsdp();
     if (!rsdp) {
         print("[acpi] RSDP not found; I2C touchpad discovery disabled.\n");
+        driver_log_line("[acpi] RSDP not found; I2C touchpad discovery disabled.");
         return;
     }
 
     g_touchpad_info.acpi_found = 1;
+    driver_log_line("[acpi] RSDP ok; scanning FADT/DSDT/SSDT for touchpad HIDs.");
 
     if (rsdp->revision >= 2 && rsdp->length >= sizeof(acpi_rsdp_t) &&
         acpi_checksum((const uint8_t*)rsdp, rsdp->length) == 0 &&
@@ -256,14 +326,16 @@ void acpi_init(void) {
     }
 
     if (g_touchpad_info.elan0601_found || g_touchpad_info.pnp0c50_found) {
-        /* Lenovo S21e-20 Type 80M4 / ELAN0601 common HID-I2C address. */
+        /* ELAN0501 (Acer) / ELAN0601 (Lenovo 80M4) common HID-I2C address. */
         g_touchpad_info.touchpad_i2c_addr = 0x15;
     }
 
     print("[acpi] touchpad discovery:\n");
-    print_bool("  ELAN0601: ", g_touchpad_info.elan0601_found);
+    driver_log_line("[acpi] touchpad discovery:");
+    print_bool("  ELAN*: ", g_touchpad_info.elan0601_found);
     print_bool("  PNP0C50: ", g_touchpad_info.pnp0c50_found);
     print_bool("  80860F41 I2C: ", g_touchpad_info.baytrail_i2c_found);
+    print_bool("  808622Cx I2C: ", g_touchpad_info.braswell_i2c_found);
     print_bool("  80860F14 eMMC: ", g_touchpad_info.baytrail_emmc_acpi);
     if (g_touchpad_info.emmc_mmio_count > 0) {
         char buf[16];

@@ -3,6 +3,7 @@
 #include "../acpi/acpi.h"
 #include "../hid/i2c_hid.h"
 #include "../i2c/i2c.h"
+#include "../timer/timer.h"
 #include "../diagnostics/driver_log.h"
 #include "../../lib/string.h"
 
@@ -68,6 +69,15 @@ typedef struct {
     int tracking;
     int last_contacts;
     int scroll_accum;
+    /* Double-tap → right-click: first tap recorded on finger-up. */
+    int tap_armed;
+    int tap_x;
+    int tap_y;
+    uint32_t tap_tick;
+    int contact_start_x;
+    int contact_start_y;
+    int contact_moved;
+    int synth_right_down;
     uint32_t report_count;
     uint32_t move_events;
     uint32_t button_events;
@@ -81,7 +91,12 @@ typedef struct {
     uint16_t ctrl_device_id;
 } touchpad_state_t;
 
+#define TP_DOUBLETAP_TICKS 40  /* ~400 ms at 100 Hz */
+#define TP_DOUBLETAP_SLACK 40  /* raw pad units */
+
 static touchpad_state_t g_tp;
+/* Why touchpad is not ready (for devices / diagnostics). */
+static const char* g_tp_skip_reason = "not probed";
 
 static void print_dec(int n) {
     char buf[16];
@@ -426,6 +441,7 @@ static void emit_pointer(int x, int y, uint8_t buttons, int contacts, int8_t whe
     int8_t scroll = wheel;
     int dx = 0;
     int dy = 0;
+    int phys_right = (buttons & (1U << INPUT_BUTTON_RIGHT)) != 0;
 
     /* Explicit wheel field wins; else two-finger vertical motion scrolls. */
     if (scroll == 0 && contacts >= 2 && g_tp.tracking) {
@@ -442,6 +458,8 @@ static void emit_pointer(int x, int y, uint8_t buttons, int contacts, int8_t whe
         }
         g_tp.last_raw_x = x;
         g_tp.last_raw_y = y;
+        g_tp.tap_armed = 0;
+        g_tp.synth_right_down = 0;
         if (scroll != 0) {
             g_tp.scroll_events++;
             if (g_tp.scroll_events == 1) {
@@ -458,10 +476,31 @@ static void emit_pointer(int x, int y, uint8_t buttons, int contacts, int8_t whe
 
     if (contacts >= 1) {
         if (!g_tp.tracking) {
+            int dx_tap, dy_tap;
             g_tp.tracking = 1;
             g_tp.last_raw_x = x;
             g_tp.last_raw_y = y;
+            g_tp.contact_start_x = x;
+            g_tp.contact_start_y = y;
+            g_tp.contact_moved = 0;
             g_tp.scroll_accum = 0;
+
+            /* Second tap of a double-tap → synthesize right-click. */
+            dx_tap = x - g_tp.tap_x;
+            dy_tap = y - g_tp.tap_y;
+            if (!phys_right && g_tp.tap_armed &&
+                (int32_t)(timer_ticks() - g_tp.tap_tick) <= TP_DOUBLETAP_TICKS &&
+                dx_tap > -TP_DOUBLETAP_SLACK && dx_tap < TP_DOUBLETAP_SLACK &&
+                dy_tap > -TP_DOUBLETAP_SLACK && dy_tap < TP_DOUBLETAP_SLACK) {
+                g_tp.synth_right_down = 1;
+                g_tp.tap_armed = 0;
+                buttons |= (1U << INPUT_BUTTON_RIGHT);
+                if (g_tp.button_events == 0)
+                    driver_log_line("[touchpad] double-tap right-click.");
+            } else {
+                g_tp.synth_right_down = 0;
+            }
+
             /* First contact: apply buttons only (no jump). */
             input_report_pointer_delta(INPUT_DEVICE_I2C_TOUCHPAD, 0, 0, buttons, 0);
             return;
@@ -470,14 +509,36 @@ static void emit_pointer(int x, int y, uint8_t buttons, int contacts, int8_t whe
         dy = y - g_tp.last_raw_y;
         g_tp.last_raw_x = x;
         g_tp.last_raw_y = y;
+        {
+            int adx = x - g_tp.contact_start_x;
+            int ady = y - g_tp.contact_start_y;
+            if (adx < 0) adx = -adx;
+            if (ady < 0) ady = -ady;
+            if (adx + ady > TP_DOUBLETAP_SLACK) g_tp.contact_moved = 1;
+        }
 
         /* Scale pad deltas toward a comfortable desktop speed. */
         if (g_tp.max_x > 0) dx = (dx * 80) / (g_tp.max_x > 80 ? g_tp.max_x / 16 : 16);
         if (g_tp.max_y > 0) dy = (dy * 80) / (g_tp.max_y > 80 ? g_tp.max_y / 16 : 16);
         /* Screen Y grows downward; HID digitizer Y usually grows downward already. */
+        if (g_tp.synth_right_down && !phys_right)
+            buttons |= (1U << INPUT_BUTTON_RIGHT);
     } else {
+        /* Finger up: arm first tap if it was a short stationary contact. */
+        if (g_tp.tracking && !g_tp.contact_moved && !phys_right &&
+            !g_tp.synth_right_down) {
+            g_tp.tap_armed = 1;
+            g_tp.tap_x = g_tp.last_raw_x;
+            g_tp.tap_y = g_tp.last_raw_y;
+            g_tp.tap_tick = timer_ticks();
+        } else if (g_tp.synth_right_down) {
+            /* Complete synthetic right click release. */
+            buttons &= (uint8_t)~(1U << INPUT_BUTTON_RIGHT);
+        }
         g_tp.tracking = 0;
         g_tp.scroll_accum = 0;
+        g_tp.synth_right_down = 0;
+        g_tp.contact_moved = 0;
         dx = 0;
         dy = 0;
     }
@@ -522,21 +583,44 @@ static void decode_report(const uint8_t* r, uint16_t len) {
     emit_pointer(x, y, buttons, contacts, wheel);
 }
 
-static int prefer_controller_index(int index) {
-    /* Probe low-numbered LPSS functions first; 80M4 touchpad is commonly on
-     * one of the earlier DesignWare instances discovered by PCI scan. */
-    return index;
+static int prefer_controller_index(int pass) {
+    /*
+     * Acer R3-131T ELAN0501 sits on 8086:22C1 (Linux: 808622C1:05). Probe
+     * that device ID first, then remaining LPSS I2C controllers.
+     */
+    int n = i2c_controller_count();
+    int i;
+    int seen_preferred = 0;
+    int seen_other = 0;
+    if (pass < 0 || n <= 0) return pass;
+
+    for (i = 0; i < n; i++) {
+        if (i2c_controller_device_id(i) == 0x22C1U) {
+            if (seen_preferred == pass) return i;
+            seen_preferred++;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (i2c_controller_device_id(i) == 0x22C1U) continue;
+        if (seen_preferred + seen_other == pass) return i;
+        seen_other++;
+    }
+    return pass < n ? pass : 0;
 }
 
 void touchpad_init(void) {
     const i2c_hid_device_t* hid;
     const i2c_bus_t* bus;
     memset(&g_tp, 0, sizeof(g_tp));
+    g_tp_skip_reason = "probing";
 
     const acpi_touchpad_info_t* info = acpi_get_touchpad_info();
     int acpi_match = info && (info->elan0601_found || info->pnp0c50_found);
-    int baytrail_probe = info && info->baytrail_i2c_found;
+    int baytrail_probe = info && (info->baytrail_i2c_found ||
+                                  info->braswell_i2c_found);
     int controllers = i2c_controller_count();
+    /* Narrow: prefer 22C1 then a few more LPSS I2C instances. */
+    int max_controllers = 4;
 
     if (!acpi_match && !baytrail_probe && controllers > 0) {
 #ifdef __x86_64__
@@ -547,6 +631,7 @@ void touchpad_init(void) {
          */
         print("[touchpad] no ACPI HID match; skipping PCI I2C MMIO probe (x64 UEFI).\n");
         driver_log_line("[touchpad] skipping PCI I2C probe without ACPI HID on x64.");
+        g_tp_skip_reason = "no ACPI HID match (x64)";
         return;
 #else
         print("[touchpad] no ACPI HID match; probing PCI I2C controllers anyway.\n");
@@ -558,31 +643,36 @@ void touchpad_init(void) {
     if (!acpi_match && !baytrail_probe) {
         print("[touchpad] no ACPI HID-over-I2C touchpad found.\n");
         driver_log_line("[touchpad] no ACPI HID-over-I2C touchpad found.");
+        g_tp_skip_reason = "no ACPI HID-over-I2C";
         return;
     }
     if (!acpi_match && baytrail_probe) {
-        print("[touchpad] no exact ACPI match; probing Bay Trail I2C for touchpad.\n");
-        driver_log_line("[touchpad] no exact ACPI match; probing Bay Trail I2C for touchpad.");
+        print("[touchpad] no exact ACPI match; probing Bay Trail/Braswell I2C.\n");
+        driver_log_line("[touchpad] no exact ACPI match; probing Bay Trail/Braswell I2C.");
     }
 
     if (controllers <= 0) {
         print("[touchpad] no I2C controllers available.\n");
         driver_log_line("[touchpad] no I2C controllers available.");
+        g_tp_skip_reason = "no I2C controllers";
         return;
     }
 
     uint8_t addrs[5];
     int addr_count = 0;
-    /* Lenovo 80M4 ELAN0601 defaults to 0x15 — try it first. */
-    if (!addr_already_tried(addrs, addr_count, 0x15)) addrs[addr_count++] = 0x15;
+    /* Prefer ACPI-provided address when known. */
     if (info && info->touchpad_i2c_addr &&
         !addr_already_tried(addrs, addr_count, info->touchpad_i2c_addr))
         addrs[addr_count++] = info->touchpad_i2c_addr;
+    /* Lenovo 80M4 ELAN0601 defaults to 0x15. */
+    if (!addr_already_tried(addrs, addr_count, 0x15)) addrs[addr_count++] = 0x15;
     if (!addr_already_tried(addrs, addr_count, 0x2C)) addrs[addr_count++] = 0x2C;
     if (!addr_already_tried(addrs, addr_count, 0x10)) addrs[addr_count++] = 0x10;
     if (!addr_already_tried(addrs, addr_count, 0x20)) addrs[addr_count++] = 0x20;
 
-    for (int i = 0; i < controllers; i++) {
+    if (controllers < max_controllers) max_controllers = controllers;
+
+    for (int i = 0; i < max_controllers; i++) {
         int idx = prefer_controller_index(i);
         print("[touchpad] probing I2C controller ");
         print_dec(idx);
@@ -613,6 +703,7 @@ void touchpad_init(void) {
     if (!hid->ready) {
         print("[touchpad] HID-over-I2C init failed on all controllers.\n");
         driver_log_line("[touchpad] HID-over-I2C init failed on all controllers.");
+        g_tp_skip_reason = "HID-over-I2C init failed";
         return;
     }
 
@@ -629,6 +720,7 @@ void touchpad_init(void) {
     parse_report_descriptor();
     input_set_i2c_touchpad_active(1);
     g_tp.ready = 1;
+    g_tp_skip_reason = "ready";
 
     print("[touchpad] I2C HID touchpad ready, range ");
     print_dec(g_tp.max_x);
@@ -671,7 +763,9 @@ void touchpad_print_status(void (*write)(const char*)) {
     if (!write) return;
     write("I2C touchpad: ");
     if (!g_tp.ready) {
-        write("no\n");
+        write("no (");
+        write(g_tp_skip_reason ? g_tp_skip_reason : "unknown");
+        write(")\n");
         return;
     }
     write("yes addr=0x");

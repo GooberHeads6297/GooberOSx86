@@ -136,9 +136,14 @@ void mouse_init(void) {
     }
 
     /* Restore sane defaults (100 samples/s, 4 cnt/mm, 1:1 scaling). */
-    mouse_command(0xF6);
+    if (mouse_command(0xF6) != 0) {
+        /* No AUX device (I2C-only Advanced mode) — leave IRQ12 masked. */
+        return;
+    }
     /* Enable data reporting (streaming mode). */
-    mouse_command(0xF4);
+    if (mouse_command(0xF4) != 0) {
+        return;
+    }
 
     /* Discard any packets queued before IRQ12 is live so we start aligned. */
     mouse_flush();

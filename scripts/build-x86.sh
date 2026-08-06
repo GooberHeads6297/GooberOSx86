@@ -139,6 +139,7 @@ build_kernel() {
   compile_c -I. -Idrivers/io -c drivers/keyboard/keyboard.c -o "${BUILD_DIR}/keyboard.o"
   compile_c -I. -Idrivers/io -c drivers/mouse/mouse.c -o "${BUILD_DIR}/mouse.o"
   compile_c -I. -Idrivers/io -c drivers/timer/timer.c -o "${BUILD_DIR}/timer.o"
+  compile_c -I. -Idrivers/io -Idrivers/timer -c drivers/timer/softclock.c -o "${BUILD_DIR}/softclock.o"
   compile_c -I. -Idrivers/io -c drivers/video/vga.c -o "${BUILD_DIR}/vga.o"
   compile_c -I. -Ifs -c drivers/diagnostics/driver_log.c -o "${BUILD_DIR}/driver_log.o"
   compile_c -I. -Idrivers/diagnostics -c drivers/video/edid.c -o "${BUILD_DIR}/edid.o"
@@ -240,6 +241,7 @@ build_kernel() {
     "${BUILD_DIR}/keyboard.o" \
     "${BUILD_DIR}/mouse.o" \
     "${BUILD_DIR}/timer.o" \
+    "${BUILD_DIR}/softclock.o" \
     "${BUILD_DIR}/vga.o" \
     "${BUILD_DIR}/driver_log.o" \
     "${BUILD_DIR}/edid.o" \

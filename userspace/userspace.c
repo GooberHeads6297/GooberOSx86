@@ -202,6 +202,27 @@ static int gob_run_bytecode(const uint8_t* code, uint32_t code_size,
             }
             continue;
         }
+        if (op == GBC_SLEEP_MS) {
+            uint32_t ms;
+            uint32_t frames;
+            uint32_t f;
+            if (ip + 4 > code_size) break;
+            ms = rd32(code + ip); ip += 4;
+            /* Stub: approximate delay by pumping desktop frames (~16ms). */
+            frames = ms / 16u;
+            if (frames == 0) frames = 1;
+            if (frames > 120u) frames = 120u;
+            process_set_state(pid, PROC_STATE_READY);
+            for (f = 0; f < frames; f++)
+                vdesk_pump_one_frame();
+            process_set_state(pid, PROC_STATE_RUNNING);
+            continue;
+        }
+        if (op == GBC_GFX3D_CLEAR) {
+            if (ip + 4 > code_size) break;
+            ip += 4; /* rgba reserved; no-op until 3D module lands */
+            continue;
+        }
         break; /* unknown opcode */
     }
 
@@ -262,9 +283,12 @@ int gob_exec(const char* path) {
     int pid;
     const uint8_t* code;
     const uint8_t* rodata;
+    Directory* restore_dir;
 
     if (!path || !path[0]) return -1;
     if (!g_userspace_ready) userspace_init();
+
+    restore_dir = fs_get_cwd_dir();
 
     /* Support Apps/Welcome.gob style paths via cd */
     {
@@ -294,6 +318,7 @@ int gob_exec(const char* path) {
                 while (fs_cd_up() == 0) { }
                 if (fs_change_dir(dir) != 0) {
                     print("gob: cannot open directory\n");
+                    if (restore_dir) fs_set_current_dir(restore_dir);
                     return -1;
                 }
             }
@@ -307,6 +332,7 @@ int gob_exec(const char* path) {
         print("gob: file not found: ");
         print(path);
         print("\n");
+        if (restore_dir) fs_set_current_dir(restore_dir);
         return -1;
     }
 
@@ -324,6 +350,7 @@ int gob_exec(const char* path) {
     if (total < sizeof(gob_header_t)) {
         print("gob: truncated header\n");
         kfree(file);
+        if (restore_dir) fs_set_current_dir(restore_dir);
         return -1;
     }
 
@@ -331,16 +358,19 @@ int gob_exec(const char* path) {
     if (hdr->magic != GOB_MAGIC || hdr->version != GOB_VERSION) {
         print("gob: bad magic/version\n");
         kfree(file);
+        if (restore_dir) fs_set_current_dir(restore_dir);
         return -1;
     }
     if (!(hdr->flags & GOB_FLAG_BYTECODE)) {
         print("gob: only bytecode .gob supported in v1\n");
         kfree(file);
+        if (restore_dir) fs_set_current_dir(restore_dir);
         return -1;
     }
     if (sizeof(gob_header_t) + hdr->code_size + hdr->rodata_size > total) {
         print("gob: size mismatch\n");
         kfree(file);
+        if (restore_dir) fs_set_current_dir(restore_dir);
         return -1;
     }
 
@@ -348,6 +378,7 @@ int gob_exec(const char* path) {
     pid = create_process_ex(name, (total + 1023) / 1024, PROC_KIND_GOB);
     if (pid < 0) {
         kfree(file);
+        if (restore_dir) fs_set_current_dir(restore_dir);
         return -1;
     }
 
@@ -359,7 +390,7 @@ int gob_exec(const char* path) {
     gob_run_bytecode(code, hdr->code_size, rodata, hdr->rodata_size, hdr->entry, pid);
     terminate_process(pid);
     kfree(file);
-    /* Return to volume root after Apps/… exec */
-    while (fs_cd_up() == 0) { }
+    /* Restore caller's cwd (do not walk to volume root). */
+    if (restore_dir) fs_set_current_dir(restore_dir);
     return 0;
 }

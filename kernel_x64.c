@@ -632,14 +632,14 @@ void x64_arch_pic_remap(void) {
     /* master: enable IRQ0,1,2 -> mask = 0xF8 */
     outb(0x21, 0xF8);
     /*
-     * Keep the entire slave PIC masked (including IRQ12). Acer R3-131T has
-     * no PS/2 aux mouse; unmasking IRQ12 before mouse_init() lets spurious
-     * slave IRQs preempt boot. USB HID enables its own path later; PS/2
-     * mouse_init() will clear the IRQ12 mask if ever called.
+     * Keep the entire slave PIC masked (including IRQ12) until mouse_init().
+     * Acer BIOS "Basic" touchpad mode uses PS/2 AUX; mouse_init unmasks IRQ12
+     * only after a successful AUX enable. Spurious slave IRQs before that can
+     * preempt boot. USB HID remains a separate path.
      */
     outb(0xA1, 0xFF);
     x64_out("[phase3b] PIC remapped: master=0x20..0x27 (IRQ0/1/2 unmasked), "
-            "slave=0x28..0x2F (all masked; IRQ12 deferred).\n");
+            "slave=0x28..0x2F (all masked; IRQ12 deferred to mouse_init).\n");
 }
 
 /* ========================================================================

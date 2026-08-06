@@ -183,7 +183,8 @@ static void hid_poll(usb_dev_t* dev, usb_interface_t* iface) {
         return;
     if (got == 0) return;
 
-    usb_hid_handle_boot_report(buf, (uint8_t)(got > 255 ? 255 : got));
+    usb_hid_handle_boot_report_ex(priv->protocol, buf,
+                                  (uint8_t)(got > 255 ? 255 : got));
 }
 
 static const usb_class_driver_t hid_driver = {

@@ -3403,12 +3403,13 @@ static void stage_x64_usb(void) {
     /* Tick already painted by runner; keep this stage silent on Braswell. */
     usb_init();
     /*
-     * VirtualBox and legacy BIOS x64 boots expose a PS/2 aux mouse. Acer
-     * Braswell has no PS/2 pointer — skip mouse_init there to avoid 8042
-     * stalls and spurious IRQ12; USB HID is deferred on that SoC anyway.
+     * Acer R3-131T BIOS "Basic" touchpad mode exposes the pad as a PS/2 AUX
+     * mouse on the 8042. "Advanced" uses I2C HID (ELAN0501) instead.
+     * Always attempt a bounded mouse_init(); mouse_command timeouts keep a
+     * missing AUX from hanging. IRQ12 stays masked until mouse_init unmasks.
      */
-    if (!intel_gfx_is_bay_trail_class())
-        mouse_init();
+    mouse_init();
+    driver_log_line("[input] PS/2 AUX mouse probe attempted (BIOS Basic pad mode).");
 }
 
 /*
@@ -3424,29 +3425,46 @@ static void stage_x64_usb(void) {
 extern void storage_init(void);
 static void stage_x64_storage(void)    { storage_init(); }
 static void stage_x64_acpi(void) {
-    if (!kcmdline_contains("gooberos.hwsummary=1") &&
-        !kcmdline_contains("gooberos.acpi=1"))
-        return;
+    /*
+     * Safe path only: RSDP (multiboot tag) + DSDT/SSDT string scan for
+     * touchpad / eMMC hints. No PCI SMM-heavy walks. Always run so the
+     * I2C HID stage can gate on ACPI matches without gooberos.acpi=1.
+     */
     fbdbg_block(17, 0x0000FF);
     acpi_init();
 }
 static void stage_x64_touchpad(void) {
     /*
-     * Acer R3-131T: I2C HID / LPSS MMIO can bus-stall. Only probe when the
-     * user explicitly asks (gooberos.touchpad=on|poll|irq). Default and
-     * "off" skip so boot reaches the desktop.
+     * Acer R3-131T: LPSS I2C MMIO can bus-stall without an ACPI HID node.
+     * Default/auto: probe only when ACPI already matched a pad / LPSS I2C.
+     * Explicit on|poll|irq: force probe (still refuses blind x64 MMIO inside
+     * touchpad_init without ACPI/Bay Trail hints).
      */
     if (kstr_eq(g_boot_config.i2c, "off") ||
-        kstr_eq(g_boot_config.touchpad, "off") ||
-        g_boot_config.touchpad[0] == '\0' ||
-        kstr_eq(g_boot_config.touchpad, "auto")) {
-        /* Keep silent on the default path; fbdbg ticks already show progress. */
+        kstr_eq(g_boot_config.touchpad, "off")) {
+        print("[touchpad] disabled by cmdline.\n");
+        driver_log_line("[touchpad] disabled by cmdline.");
         return;
     }
-    if (!(kstr_eq(g_boot_config.touchpad, "on") ||
-          kstr_eq(g_boot_config.touchpad, "poll") ||
-          kstr_eq(g_boot_config.touchpad, "irq"))) {
-        return;
+
+    {
+        int force = kstr_eq(g_boot_config.touchpad, "on") ||
+                    kstr_eq(g_boot_config.touchpad, "poll") ||
+                    kstr_eq(g_boot_config.touchpad, "irq");
+        const acpi_touchpad_info_t* info = acpi_get_touchpad_info();
+        int acpi_ok = info &&
+                      (info->elan0601_found || info->pnp0c50_found ||
+                       info->baytrail_i2c_found || info->braswell_i2c_found);
+        if (!force && !acpi_ok) {
+            print("[touchpad] skip: no ACPI HID/I2C match "
+                  "(BIOS Basic mode uses PS/2; Advanced needs I2C HID).\n");
+            driver_log_line("[touchpad] skip: no ACPI HID/I2C match.");
+            return;
+        }
+        if (force)
+            driver_log_line("[touchpad] forced probe via cmdline.");
+        else
+            driver_log_line("[touchpad] ACPI match — starting I2C HID probe.");
     }
     touchpad_init();
 }
@@ -3631,14 +3649,14 @@ static const boot_stage_def_t k_boot_stages_x64[] = {
     { "PS/2 keyboard (no aux mouse)", stage_x64_input,    0, 1, NULL, 0, 0 },
     /*
      * Acer R3-131T (Braswell) desktop-first order:
-     *   - Adopt GOP FB immediately after the floor (no PCI/ACPI before it).
-     *   - Defer hardware summary + ACPI until after the desktop is up so a
-     *     wedged PCI/SMM path cannot strand the panel on a black boot screen.
-     * Bay Trail (Lenovo 80M4) still needs USB before Storage for eMMC; USB
-     * is a no-op skip on Braswell 8086:22B5.
+     *   - Adopt GOP FB immediately after the floor (no PCI before it).
+     *   - Safe ACPI string-scan before touchpad (RSDP + DSDT only).
+     * Bay Trail (Lenovo 80M4) still needs USB before Storage for eMMC;
+     * Braswell USB stays cmdline opt-in (gooberos.usb=on) until validated.
      */
     { "Display / framebuffer",       stage_x64_display,   0, 0, NULL, 1, WD_DISPLAY },
     { "Kernel heap",                 stage_x64_heap,      0, 0, NULL, 0, 0 },
+    { "ACPI tables (string scan)",   stage_x64_acpi,      1, 0, NULL, 0, WD_HWSUMMARY },
     { "USB host stack",              stage_x64_usb,       1, 0, NULL, 0, WD_USB },
     { "I2C HID touchpad",            stage_x64_touchpad,  1, 0, NULL, 0, WD_TOUCHPAD },
     { "Storage",                     stage_x64_storage,   1, 0, NULL, 0, WD_STORAGE_X64 },

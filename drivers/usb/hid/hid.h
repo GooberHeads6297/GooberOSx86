@@ -13,6 +13,9 @@ void usb_hid_register_boot_keyboard(uint8_t present);
 void usb_hid_register_boot_keyboard_detail(uint8_t present, uint8_t port,
                                            uint8_t address, uint8_t endpoint,
                                            uint16_t max_packet, uint8_t interval);
+/* protocol: USB_HID_PROTOCOL_MOUSE / KEYBOARD, or 0 = auto from presence flags */
+void usb_hid_handle_boot_report_ex(int protocol, const uint8_t* report,
+                                   uint8_t length);
 void usb_hid_handle_boot_report(const uint8_t* report, uint8_t length);
 int usb_hid_has_pointer_device(void);
 int usb_hid_has_touchpad_device(void);

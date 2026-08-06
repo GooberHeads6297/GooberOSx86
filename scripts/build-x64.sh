@@ -374,6 +374,7 @@ build_kernel() {
 
   echo "[x64] Compiling Phase 3a drivers/timer (PIT + rdtsc deadline clock)..."
   compile_c -I. -Idrivers/io -c drivers/timer/timer.c -o "${BUILD_DIR}/timer.o"
+  compile_c -I. -Idrivers/io -Idrivers/timer -c drivers/timer/softclock.c -o "${BUILD_DIR}/softclock.o"
 
   echo "[x64] Compiling Phase 3b.0 boot_safety.c (real boot fault guard)..."
   compile_c -I. -Idrivers/io -Idrivers/pci -Ilib \
@@ -642,6 +643,7 @@ build_kernel() {
       "${BUILD_DIR}/string.o" \
       "${BUILD_DIR}/memory.o" \
       "${BUILD_DIR}/timer.o" \
+      "${BUILD_DIR}/softclock.o" \
       "${BUILD_DIR}/boot_safety.o" \
       "${BUILD_DIR}/vga.o" \
       "${BUILD_DIR}/driver_log.o" \

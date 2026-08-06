@@ -1,5 +1,6 @@
 #include "i2c_hid.h"
 #include "../i2c/i2c.h"
+#include "../acpi/acpi.h"
 #include "../timer/timer.h"
 #include "../diagnostics/driver_log.h"
 #include "../../lib/string.h"
@@ -32,9 +33,17 @@ static int i2c_hid_command(uint16_t command) {
     return i2c_write_cmd(g_dev.addr, g_dev.command_reg, cmd, sizeof(cmd));
 }
 
+static uint16_t hid_desc_reg_from_acpi(void) {
+    const acpi_touchpad_info_t* info = acpi_get_touchpad_info();
+    if (info && info->hid_desc_reg != 0)
+        return info->hid_desc_reg;
+    return 0x0001;
+}
+
 static int read_hid_descriptor(uint8_t addr) {
     uint8_t d[30];
-    if (i2c_read_reg16(addr, 0x0001, d, sizeof(d)) != 0) {
+    uint16_t desc_reg = hid_desc_reg_from_acpi();
+    if (i2c_read_reg16(addr, desc_reg, d, sizeof(d)) != 0) {
         print("[i2c-hid] HID descriptor read failed.\n");
         return -1;
     }

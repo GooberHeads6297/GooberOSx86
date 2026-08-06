@@ -198,18 +198,23 @@ static void usb_hid_handle_keyboard_report(const uint8_t* report, uint8_t length
     for (int i = 0; i < 6; i++) last_keys[i] = report[2 + i];
 }
 
-void usb_hid_handle_boot_report(const uint8_t* report, uint8_t length) {
+void usb_hid_handle_boot_report_ex(int protocol, const uint8_t* report,
+                                   uint8_t length) {
     if (!report) return;
 
-    if (keyboard_present && !pointer_present) {
-        usb_hid_handle_keyboard_report(report, length);
+    if (protocol == USB_HID_PROTOCOL_KEYBOARD) {
+        if (keyboard_present)
+            usb_hid_handle_keyboard_report(report, length);
         return;
     }
+
+    /* Mouse / generic pointer (protocol mouse or 0 treated as pointer). */
     if (length < 3 || !pointer_present) return;
 
     /*
      * Absolute HID tablets (VirtualBox USB Tablet, many USB 2/3 pointers)
-     * send 16-bit X/Y. Prefer that when the report is long enough.
+     * send 16-bit X/Y. Only consider absolute when the report is longer than
+     * a boot relative mouse packet (3–4 bytes) so real boot mice stay relative.
      */
     if (length >= 5) {
         int off = 0;
@@ -286,6 +291,18 @@ void usb_hid_handle_boot_report(const uint8_t* report, uint8_t length) {
         dy,
         buttons,
         wheel);
+}
+
+void usb_hid_handle_boot_report(const uint8_t* report, uint8_t length) {
+    /*
+     * Legacy auto path (single active interrupt pipe): prefer pointer when
+     * both are registered so a bound keyboard does not steal mouse packets.
+     * Prefer callers that know the source protocol via _ex().
+     */
+    if (pointer_present)
+        usb_hid_handle_boot_report_ex(USB_HID_PROTOCOL_MOUSE, report, length);
+    else if (keyboard_present)
+        usb_hid_handle_boot_report_ex(USB_HID_PROTOCOL_KEYBOARD, report, length);
 }
 
 int usb_hid_has_pointer_device(void) {

@@ -21,6 +21,8 @@
 #define GOB_ARCH_I386         1
 #define GOB_KIND_CONSOLE      1
 #define GOB_KIND_GUI          2
+#define GOB_KIND_AUTO         3
+#define GOB_KIND_GFX3D        4
 #define GOB_FLAG_BYTECODE     1u
 
 /* Compact bytecode opcodes (v1 IR; maps to syscalls). */
@@ -32,6 +34,8 @@
 #define GBC_GUI_TEXT          5   /* u32 win_slot, u16 x, u16 y, u32 str_off */
 #define GBC_GUI_WAIT          6   /* u32 win_slot */
 #define GBC_GUI_CLOSE         7   /* u32 win_slot */
+#define GBC_SLEEP_MS          8   /* u32 ms — stub: yield frames */
+#define GBC_GFX3D_CLEAR       9   /* u32 rgba — stub: no-op / reserved */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;

@@ -1006,7 +1006,12 @@ int fat32_list(void) {
 static Directory* fat_find_child(Directory* dir, const char* name) {
     fat_refresh_dir(dir);
     for (size_t i = 0; i < dir->child_count; i++) {
-        if (fat_name_equal(name, dir->children[i].name)) return &dir->children[i];
+        if (fat_name_equal(name, dir->children[i].name)) {
+            /* Child stubs from the parent scan have empty listings until
+             * refreshed — shell `ls` did this; GUI browsers must too. */
+            fat_refresh_dir(&dir->children[i]);
+            return &dir->children[i];
+        }
     }
     return NULL;
 }
@@ -1019,6 +1024,7 @@ int fat32_change_dir(const char* path) {
     if (!path || path[0] == '\0') return -1;
     if (path[0] == '/' && path[1] == '\0') {
         current_dir = &g_root_dir;
+        fat_refresh_dir(current_dir);
         return 0;
     }
 
@@ -1051,12 +1057,14 @@ int fat32_change_dir(const char* path) {
 
         seg = (*next == '/') ? next + 1 : next;
     }
+    fat_refresh_dir(current_dir);
     return 0;
 }
 
 int fat32_cd_up(void) {
     if (!current_dir || !current_dir->parent) return -1;
     current_dir = current_dir->parent;
+    fat_refresh_dir(current_dir);
     return 0;
 }
 
@@ -1309,7 +1317,9 @@ Directory* fat32_dir_find_child(Directory* dir, const char* name) {
 }
 
 void fat32_set_current_dir(Directory* dir) {
-    if (dir) current_dir = dir;
+    if (!dir) return;
+    current_dir = dir;
+    fat_refresh_dir(current_dir);
 }
 
 void fat32_dir_refresh(Directory* dir) {

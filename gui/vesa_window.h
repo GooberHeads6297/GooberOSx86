@@ -47,15 +47,7 @@ typedef enum {
     VDESK_APP_SYSTEM_SETTINGS,
     VDESK_APP_PAINT,
     VDESK_APP_WELCOME,
-    /*
-     * Phase 4 (display polish, item 5): generic launcher for an app that
-     * historically painted to the legacy 0xB8000 80x25 plane. The window
-     * class arms the VGA-passthrough shim (gui/vga_passthrough.c) before
-     * the body runs, so its writes land in a virtual cell grid that the
-     * renderer composites through the 8x16 font into the VESA window's
-     * client area.
-     */
-    VDESK_APP_VGA_CONSOLE
+    VDESK_APP_IDE
 } VDeskAppId;
 
 typedef struct {
@@ -130,8 +122,21 @@ typedef enum {
     VICON_APP = 0,
     VICON_FOLDER,
     VICON_TEXT,
-    VICON_BITMAP
+    VICON_BITMAP,
+    VICON_CODE,
+    VICON_GOB
 } VIconKind;
+
+#define VDESK_TOAST_MAX 3
+#define VDESK_TOAST_TITLE_MAX 28
+#define VDESK_TOAST_BODY_MAX 48
+
+typedef struct {
+    int used;
+    char title[VDESK_TOAST_TITLE_MAX];
+    char body[VDESK_TOAST_BODY_MAX];
+    uint32_t expire_tick;
+} VDeskToast;
 
 typedef struct {
     int id;
@@ -163,6 +168,12 @@ typedef struct VWindow {
 
     int drag_active;
     int drag_off_x, drag_off_y;
+
+    /* Interactive border/corner resize (VESA). Edges: N=1 S=2 E=4 W=8. */
+    int resize_active;
+    int resize_edges;
+    int resize_start_mx, resize_start_my;
+    int resize_orig_x, resize_orig_y, resize_orig_w, resize_orig_h;
 
     color_t title_bg;
     color_t title_fg;
@@ -226,6 +237,8 @@ typedef struct {
     int running;
     char status_msg[64];
     uint32_t status_until_tick;
+    VDeskToast toasts[VDESK_TOAST_MAX];
+    int clock_tray_stamp;
 } VDesktop;
 
 /* Desktop functions */
@@ -242,6 +255,7 @@ void vdesk_set_file_opener(void (*opener)(const char* name, int kind));
 void vdesk_add_icon(const char* label, VDeskAppId app_id, int x, int y);
 void vdesk_refresh_desktop_items(int force);
 void vdesk_set_status(const char* msg);
+void vdesk_notify(const char* title, const char* body);
 void vdesk_mark_dirty(int x, int y, int w, int h);
 void vdesk_mark_full_dirty(void);
 /* One paint+present while a long sync command (e.g. install) holds the event loop. */
@@ -252,6 +266,8 @@ void vdesk_set_primary_shell(VWindow* win);
 void vdesk_focus_primary_shell(void);
 int vdesk_has_active_app_focus(void);
 void vdesk_toggle_desktop_experience(void);
+/* show_desktop=1 minimizes primary shell (desktop icons visible). */
+void vdesk_set_desktop_experience(int show_desktop);
 int vdesk_desktop_experience_visible(void);
 void vdesk_tile_window(VWindow* win);
 color_t vdesk_shell_bg_color(void);

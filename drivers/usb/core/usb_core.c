@@ -491,16 +491,26 @@ void usb_core_init(void) {
 
     /*
      * Braswell (Acer R3-131T): first xHCI capability MMIO read can hard-stall
-     * the CPU bus when the controller power well is down. Defer full HCD
-     * probe/enum so the boot can reach the desktop; USB HID can be re-enabled
-     * later with a hardened probe. Bay Trail (0x0F3x) keeps the full path.
+     * when the controller power well is down. Default defers probe so boot
+     * reaches the desktop. gooberos.usb=on|full opts into watchdog-gated
+     * bring-up (still skips BYT PMC/PHY route in xhci/baytrail_usb).
      */
     if (baytrail_usb_is_braswell()) {
-        core_log("USB-CORE: Braswell xHCI -- deferring MMIO probe/enum "
-                 "(desktop-first; use gooberos.usb after harden).\n");
-        input_set_usb_pointer_active(0);
-        g_core_up = 1;
-        return;
+        int opt_in = 0;
+        if (cfg && cfg->usb[0]) {
+            const char* u = cfg->usb;
+            opt_in = (u[0] == 'o' && u[1] == 'n' && u[2] == '\0') ||
+                     (u[0] == 'f' && u[1] == 'u' && u[2] == 'l' &&
+                      u[3] == 'l' && u[4] == '\0');
+        }
+        if (!opt_in) {
+            core_log("USB-CORE: Braswell xHCI -- deferred "
+                     "(set gooberos.usb=on to probe).\n");
+            input_set_usb_pointer_active(0);
+            g_core_up = 1;
+            return;
+        }
+        core_log("USB-CORE: Braswell xHCI -- cmdline opt-in probe.\n");
     }
 
     if (baytrail_usb_is_soc() && !baytrail_usb_usb2_on_xhci()) {

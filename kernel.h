@@ -80,9 +80,11 @@ typedef struct {
     char boot[24];      /* gooberos.boot=    (default "default") */
     char display[24];   /* gooberos.display= (default "auto"; "safe" = adopt
                          * firmware FB only, arm probe + on-panel auto-revert) */
-    char usb[16];       /* gooberos.usb=     ("" if unset) */
+    char usb[16];       /* gooberos.usb=     ("" if unset; "on"|"full" enables
+                         * Braswell xHCI which is skipped by default) */
     char i2c[16];       /* gooberos.i2c=     (""/"full", "off", "safe") */
-    char touchpad[16];  /* gooberos.touchpad=(""/"poll", "off", "irq") */
+    char touchpad[16];  /* gooberos.touchpad=(""|"auto" probe if ACPI match;
+                         * "on"|"poll"|"irq" force; "off" disable) */
     char theme[16];     /* gooberos.theme=   ("" if unset) */
     char native[16];    /* gooberos.native=WxH (preferred native panel mode;
                          * "" if unset). Diagnostics warn when committed != native */

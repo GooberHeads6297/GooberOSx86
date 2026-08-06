@@ -9,6 +9,8 @@ GOB_VERSION = 1
 GOB_ARCH_X86_64 = 2
 GOB_KIND_CONSOLE = 1
 GOB_KIND_GUI = 2
+GOB_KIND_AUTO = 3
+GOB_KIND_GFX3D = 4
 GOB_FLAG_BYTECODE = 1
 
 GBC_EXIT = 1
@@ -16,6 +18,8 @@ GBC_WRITE = 2
 GBC_GUI_CREATE = 4
 GBC_GUI_TEXT = 5
 GBC_GUI_WAIT = 6
+GBC_SLEEP_MS = 8
+GBC_GFX3D_CLEAR = 9
 
 
 def compile_gc(src: str) -> bytes:
@@ -32,10 +36,22 @@ def compile_gc(src: str) -> bytes:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("use ") and "gui" in line:
-            kind = GOB_KIND_GUI
+        if line.startswith("use "):
+            if "gfx3d" in line:
+                kind = GOB_KIND_GFX3D
+            elif "auto" in line:
+                kind = GOB_KIND_AUTO
+            elif "gui" in line:
+                kind = GOB_KIND_GUI
         elif line.startswith("app "):
-            kind = GOB_KIND_GUI if "gui" in line else GOB_KIND_CONSOLE
+            if "gfx3d" in line:
+                kind = GOB_KIND_GFX3D
+            elif "auto" in line:
+                kind = GOB_KIND_AUTO
+            elif "gui" in line:
+                kind = GOB_KIND_GUI
+            else:
+                kind = GOB_KIND_CONSOLE
         elif line.startswith("print "):
             q = line.split('"', 2)
             if len(q) >= 3:
@@ -69,6 +85,32 @@ def compile_gc(src: str) -> bytes:
         elif line.startswith("wait"):
             code.append(GBC_GUI_WAIT)
             code += struct.pack("<I", 0)
+        elif line.startswith("sleep"):
+            parts = line.split()
+            ms = 0
+            if len(parts) >= 2:
+                try:
+                    ms = int(parts[1])
+                except ValueError:
+                    ms = 0
+            code.append(GBC_SLEEP_MS)
+            code += struct.pack("<I", ms)
+            if kind == GOB_KIND_CONSOLE:
+                kind = GOB_KIND_AUTO
+        elif line.startswith("clear"):
+            parts = line.split()
+            rgba = 0
+            if len(parts) >= 2:
+                tok = parts[1]
+                if tok.lower().startswith("0x"):
+                    tok = tok[2:]
+                try:
+                    rgba = int(tok, 16)
+                except ValueError:
+                    rgba = 0
+            code.append(GBC_GFX3D_CLEAR)
+            code += struct.pack("<I", rgba)
+            kind = GOB_KIND_GFX3D
         elif line.startswith("exit"):
             code.append(GBC_EXIT)
             code += struct.pack("<I", 0)

@@ -598,6 +598,9 @@ static void list_devices() {
         print(usb_has_pointer_device() ? "yes" : "no");
         print(usb_has_touchpad_device() ? " (touchpad)" : "");
         print("\n");
+        print("  HID keyboard: ");
+        print(usb_has_keyboard_device() ? "yes" : "no");
+        print("\n");
         print("  MSC stick: ");
         if (usb_msc_is_attached()) {
             print("yes port=");

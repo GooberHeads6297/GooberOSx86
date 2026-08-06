@@ -101,6 +101,12 @@ int i2c_controller_count(void) {
     return g_ctrl_count;
 }
 
+uint16_t i2c_controller_device_id(int index) {
+    i2c_discover_controllers();
+    if (index < 0 || index >= g_ctrl_count) return 0;
+    return g_ctrls[index].device_id;
+}
+
 int i2c_init_controller(int index) {
     i2c_discover_controllers();
     memset(&g_bus, 0, sizeof(g_bus));

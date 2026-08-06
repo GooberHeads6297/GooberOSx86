@@ -10,6 +10,7 @@ typedef struct {
     int elan0601_found;
     int pnp0c50_found;
     int baytrail_i2c_found;
+    int braswell_i2c_found;
     int baytrail_emmc_acpi;
     uint8_t touchpad_i2c_addr;
     uint16_t hid_desc_reg;

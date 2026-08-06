@@ -44,6 +44,21 @@ wait
 exit
 ```
 
+## Auto / gfx3d stubs
+
+```gooberc
+use goober.auto
+sleep 100
+```
+
+```gooberc
+use goober.gfx3d
+clear 0xFF000000
+```
+
+See [`libs/auto.md`](libs/auto.md), [`libs/gfx3d.md`](libs/gfx3d.md), and
+examples `HelloAuto.gc` / `Gfx3dStub.gc`. Real 3D rendering is a later milestone.
+
 ## Layout on installed disk
 
 | Path | Purpose |

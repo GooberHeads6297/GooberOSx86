@@ -39,6 +39,7 @@ static int usb_safety_from_config(void) {
         if (usb_str_eq(u, "minimal")) return 2;
         if (usb_str_eq(u, "safe"))    return 1;
         if (usb_str_eq(u, "full"))    return 0;
+        if (usb_str_eq(u, "on"))      return 0; /* Braswell opt-in alias for full */
         return 0;
     }
 
@@ -97,9 +98,8 @@ static int usb_poll_disabled = 0;
 
 /*
  * Acer R3-131T / Braswell: detect 8086:22B5 via the safe PCI walk only.
- * Any further USB init (print sink mid-line, xHCI MMIO, BYT companion) has
- * hard-stalled this board; skip the whole stage so desktop boot can finish.
- * Opt back in later with a hardened probe path.
+ * Default desktop boot skips host bring-up (xHCI MMIO has hard-stalled this
+ * board). Opt in with gooberos.usb=on|full under the USB stage watchdog.
  */
 static int usb_pci_is_braswell_xhci(void) {
     usb_pci_controller_t ctrls[8];
@@ -113,6 +113,12 @@ static int usb_pci_is_braswell_xhci(void) {
     return 0;
 }
 
+static int usb_braswell_opt_in(void) {
+    const boot_config_t* cfg = boot_get_config();
+    if (!cfg || !cfg->usb[0]) return 0;
+    return usb_str_eq(cfg->usb, "on") || usb_str_eq(cfg->usb, "full");
+}
+
 static int usb_stack_new_from_config(void) {
     const boot_config_t* cfg = boot_get_config();
     if (!cfg || !cfg->usb_stack[0]) return 1; /* default: new */
@@ -123,13 +129,18 @@ static int usb_stack_new_from_config(void) {
 void usb_init(void) {
     if (usb_initialized) return;
 
-    if (usb_pci_is_braswell_xhci()) {
-        driver_log_line("USB: Braswell 8086:22B5 -- stage skipped (desktop-first)");
+    if (usb_pci_is_braswell_xhci() && !usb_braswell_opt_in()) {
+        driver_log_line("USB: Braswell 8086:22B5 -- skipped (use gooberos.usb=on)");
+        usb_print("USB: Braswell xHCI deferred; set gooberos.usb=on to probe.\n");
         input_set_usb_pointer_active(0);
         usb_initialized = 1;
         usb_poll_disabled = 1;
         usb_stack_is_new = 0;
         return;
+    }
+    if (usb_pci_is_braswell_xhci()) {
+        driver_log_line("USB: Braswell 8086:22B5 -- cmdline opt-in bring-up");
+        usb_print("USB: Braswell opt-in bring-up (watchdog-gated).\n");
     }
 
     usb_print("USB: init...\n");
@@ -499,4 +510,9 @@ int usb_has_pointer_device(void) {
 
 int usb_has_touchpad_device(void) {
     return usb_hid_has_touchpad_device();
+}
+
+int usb_has_keyboard_device(void) {
+    if (usb_stack_is_new) return usb_core_has_keyboard();
+    return usb_hid_has_keyboard_device();
 }

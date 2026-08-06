@@ -9,12 +9,14 @@ extern void print(const char*);
 /*
  * Minimal GooberC compiler (v0): line-oriented subset → bytecode .gob
  *
- *   use goober.console | use goober.gui
- *   app gui | app console
+ *   use goober.console | use goober.gui | use goober.auto | use goober.gfx3d
+ *   app gui | app console | app auto | app gfx3d
  *   print "..."
  *   window "Title" WxH
  *   text "..."
  *   wait
+ *   sleep N
+ *   clear 0xRRGGBBAA   (gfx3d stub)
  *   exit
  */
 
@@ -104,9 +106,13 @@ int gooberc_compile(const char* src_path, const char* out_path) {
         }
 
         if (line[0] == 'u' && line[1] == 's' && line[2] == 'e') {
-            if (line_has(line, "gui")) kind = GOB_KIND_GUI;
+            if (line_has(line, "gfx3d")) kind = GOB_KIND_GFX3D;
+            else if (line_has(line, "auto")) kind = GOB_KIND_AUTO;
+            else if (line_has(line, "gui")) kind = GOB_KIND_GUI;
         } else if (line[0] == 'a' && line[1] == 'p' && line[2] == 'p') {
-            if (line_has(line, "gui")) kind = GOB_KIND_GUI;
+            if (line_has(line, "gfx3d")) kind = GOB_KIND_GFX3D;
+            else if (line_has(line, "auto")) kind = GOB_KIND_AUTO;
+            else if (line_has(line, "gui")) kind = GOB_KIND_GUI;
             else kind = GOB_KIND_CONSOLE;
         } else if (line[0] == 'p' && line[1] == 'r' && line[2] == 'i' &&
                    line[3] == 'n' && line[4] == 't') {
@@ -178,6 +184,40 @@ int gooberc_compile(const char* src_path, const char* out_path) {
             if (code_len + 5 < sizeof(code)) {
                 code[code_len++] = GBC_GUI_WAIT;
                 wr32(code + code_len, 0); code_len += 4;
+            }
+        } else if (line[0] == 's' && line[1] == 'l' && line[2] == 'e' &&
+                   line[3] == 'e' && line[4] == 'p') {
+            const char* q = gc_skip_ws(line + 5);
+            uint16_t ms16 = 0;
+            uint32_t ms = 0;
+            if (gc_parse_u16(q, &ms16) == 0) {
+                ms = ms16;
+                if (code_len + 5 < sizeof(code)) {
+                    code[code_len++] = GBC_SLEEP_MS;
+                    wr32(code + code_len, ms); code_len += 4;
+                    if (kind == GOB_KIND_CONSOLE) kind = GOB_KIND_AUTO;
+                }
+            }
+        } else if (line[0] == 'c' && line[1] == 'l' && line[2] == 'e' &&
+                   line[3] == 'a' && line[4] == 'r') {
+            /* clear [0x]RRGGBBAA — gfx3d stub opcode */
+            const char* q = gc_skip_ws(line + 5);
+            uint32_t rgba = 0;
+            if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) q += 2;
+            while ((*q >= '0' && *q <= '9') ||
+                   (*q >= 'a' && *q <= 'f') ||
+                   (*q >= 'A' && *q <= 'F')) {
+                uint32_t dig;
+                if (*q <= '9') dig = (uint32_t)(*q - '0');
+                else if (*q <= 'F') dig = (uint32_t)(*q - 'A') + 10u;
+                else dig = (uint32_t)(*q - 'a') + 10u;
+                rgba = (rgba << 4) | dig;
+                q++;
+            }
+            if (code_len + 5 < sizeof(code)) {
+                code[code_len++] = GBC_GFX3D_CLEAR;
+                wr32(code + code_len, rgba); code_len += 4;
+                kind = GOB_KIND_GFX3D;
             }
         } else if (line[0] == 'e' && line[1] == 'x' && line[2] == 'i' &&
                    line[3] == 't') {
