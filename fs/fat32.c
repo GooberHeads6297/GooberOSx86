@@ -643,13 +643,65 @@ static void fat_to_short_name(const char* name, char out11[11]) {
     }
 }
 
+static int fat_sfn_eq11(const char* a, const char* b) {
+    int i;
+    for (i = 0; i < 11; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+/* True if any directory entry already uses this 8.3 name. */
+static int fat_sfn_taken(Directory* dir, const char sn[11]) {
+    uint8_t* cluster_buf;
+    uint32_t cluster;
+    if (!dir) return 0;
+    cluster_buf = fat_io_buf();
+    if (!cluster_buf) return 0;
+    cluster = dir->fat_cluster;
+    while (cluster >= 2 && cluster < g_vol.total_clusters + 2) {
+        if (fat_read_cluster(cluster, cluster_buf) != 0) return 0;
+        for (uint32_t off = 0; off < g_vol.sectors_per_cluster * 512; off += 32) {
+            uint8_t* e = cluster_buf + off;
+            if (e[0] == 0x00) return 0;
+            if (e[0] == 0xE5) continue;
+            if (e[11] == 0x0F) continue; /* LFN */
+            if (e[11] & 0x08) continue;  /* volume label */
+            if (fat_sfn_eq11((const char*)e, sn)) return 1;
+        }
+        {
+            uint32_t next = fat_get_entry(cluster);
+            if (next >= FAT32_CLUSTER_EOF) break;
+            cluster = next;
+        }
+    }
+    return 0;
+}
+
+/* Avoid NewFolder1/NewFolder2 both mapping to NEWFOLDE — emit NEWFOL~1 etc. */
+static void fat_unique_short_name(Directory* dir, const char* name, char out11[11]) {
+    char base[11];
+    int n;
+    fat_to_short_name(name, out11);
+    if (!fat_sfn_taken(dir, out11)) return;
+    for (n = 0; n < 11; n++) base[n] = out11[n];
+    for (n = 1; n <= 9; n++) {
+        int i;
+        for (i = 0; i < 11; i++) out11[i] = base[i];
+        /* Keep up to 6 chars of the name stem, then ~N */
+        out11[6] = '~';
+        out11[7] = (char)('0' + n);
+        if (!fat_sfn_taken(dir, out11)) return;
+    }
+}
+
 static int fat_add_dir_entry(Directory* dir, const char* name, uint8_t attr,
                              uint32_t cluster, uint32_t size) {
     uint8_t* cluster_buf;
     uint32_t dir_cluster = dir->fat_cluster;
     char short_name[11];
 
-    fat_to_short_name(name, short_name);
+    fat_unique_short_name(dir, name, short_name);
     cluster_buf = fat_io_buf();
     if (!cluster_buf) return -1;
 

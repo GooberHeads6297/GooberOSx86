@@ -35,6 +35,25 @@ int strncmp(const char* s1, const char* s2, size_t n) {
     return 0;
 }
 
+static unsigned char ascii_tolower(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return (unsigned char)(c + ('a' - 'A'));
+    return c;
+}
+
+int str_has_suffix_ci(const char* name, const char* suffix) {
+    size_t nl, sl, i;
+    if (!name || !suffix) return 0;
+    nl = strlen(name);
+    sl = strlen(suffix);
+    if (sl > nl) return 0;
+    for (i = 0; i < sl; i++) {
+        unsigned char a = (unsigned char)name[nl - sl + i];
+        unsigned char b = (unsigned char)suffix[i];
+        if (ascii_tolower(a) != ascii_tolower(b)) return 0;
+    }
+    return 1;
+}
+
 char* strcat(char* dest, const char* src) {
     char* ptr = dest + strlen(dest);
     while (*src != '\0') *ptr++ = *src++;

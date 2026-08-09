@@ -2908,7 +2908,8 @@ static void stage_display(void)  { framebuffer_bringup(); fbdbg(8, 0xFFFFFF, "8 
 static void stage_pci(void)      { pci_init(); }
 static void stage_storage(void)  { storage_init(); }
 static void stage_usb(void)      { usb_init(); }
-static void stage_fs(void)       { fs_init(); }
+extern void dos_seed_share(void);
+static void stage_fs(void)       { fs_init(); dos_seed_share(); }
 static void stage_acpi(void)     { acpi_init(); }
 static void stage_touchpad(void) {
     if (kstr_eq(g_boot_config.i2c, "off") ||
@@ -3528,7 +3529,8 @@ extern void vesa_desktop_main_loop(void);
  * linker64.ld so a heap overrun can no longer smash interrupt gates
  * (Acer #GP vec=0x0D with rip in timer_busy_wait_ms).
  */
-#define X64_KERNEL_HEAP_SIZE (8u * 1024u * 1024u)
+/* 16 MiB: desktop + GooberDOS 8 MiB guest arena (DOS/4GW Doom path) */
+#define X64_KERNEL_HEAP_SIZE (16u * 1024u * 1024u)
 static uint8_t g_x64_kernel_heap[X64_KERNEL_HEAP_SIZE];
 static void stage_x64_heap(void) {
     memory_init(g_x64_kernel_heap, X64_KERNEL_HEAP_SIZE);
@@ -3544,8 +3546,10 @@ static void stage_x64_heap(void) {
     itoa((int)memory_free_bytes(), buf, 10); serial_out(buf);
     serial_out("\n");
 }
+extern void dos_seed_share(void);
 static void stage_x64_fs(void) {
     fs_init();
+    dos_seed_share();
 }
 
 extern void userspace_init(void);

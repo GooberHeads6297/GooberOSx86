@@ -1,0 +1,27 @@
+# GooberC v2 smoke test — fn args, for/break, strings, lists
+use goober.console
+app console
+
+fn show_sum a b
+  print a + b
+end
+
+call show_sum 2 3
+
+for i = 1 to 5
+  if i == 3
+    continue
+  end
+  if i == 5
+    break
+  end
+  print i
+end
+
+var msg = "hi" + " there"
+print msg
+
+var xs = [1, 2, 3]
+push xs 4
+print len xs
+exit

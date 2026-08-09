@@ -503,10 +503,35 @@ build_kernel() {
     -c fs/config_boot.c -o "${BUILD_DIR}/config_boot.o"
 
   echo "[x64] Compiling userspace (.gob / GooberC / syscalls) under -m64..."
+  python3 scripts/embed-gob-games.py
   compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Iuserspace \
     -c userspace/userspace.c -o "${BUILD_DIR}/userspace.o"
   compile_c -I. -Idrivers/io -Ilib -Ifs -Iuserspace \
     -c userspace/gooberc.c -o "${BUILD_DIR}/gooberc.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Iuserspace \
+    -c userspace/gob_games_embed.c -o "${BUILD_DIR}/gob_games_embed.o"
+
+  echo "[x64] Compiling GooberDOS soft MS-DOS emulator under -m64..."
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/memory.c -o "${BUILD_DIR}/dosemu_memory.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/cpu8086.c -o "${BUILD_DIR}/dosemu_cpu.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/cpu386.c -o "${BUILD_DIR}/dosemu_cpu386.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/pm_mode.c -o "${BUILD_DIR}/dosemu_pm.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/dpmi.c -o "${BUILD_DIR}/dosemu_dpmi.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/video_text.c -o "${BUILD_DIR}/dosemu_video.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/bios.c -o "${BUILD_DIR}/dosemu_bios.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/int21.c -o "${BUILD_DIR}/dosemu_int21.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/dos_shell.c -o "${BUILD_DIR}/dosemu_shell.o"
+  compile_c -I. -Idrivers/io -Ilib -Ifs -Itaskmgr -Igui -Idosemu \
+    -c dosemu/dosemu.c -o "${BUILD_DIR}/dosemu.o"
 
   echo "[x64] Compiling install payload + FAT32 deploy module under -m64..."
   compile_c -I. -Idrivers/io -Idrivers/pci -Idrivers/storage -Iinstall -Ilib -Ifs \
@@ -691,6 +716,17 @@ build_kernel() {
       "${BUILD_DIR}/config_boot.o" \
       "${BUILD_DIR}/userspace.o" \
       "${BUILD_DIR}/gooberc.o" \
+      "${BUILD_DIR}/gob_games_embed.o" \
+      "${BUILD_DIR}/dosemu_memory.o" \
+      "${BUILD_DIR}/dosemu_cpu.o" \
+      "${BUILD_DIR}/dosemu_cpu386.o" \
+      "${BUILD_DIR}/dosemu_pm.o" \
+      "${BUILD_DIR}/dosemu_dpmi.o" \
+      "${BUILD_DIR}/dosemu_video.o" \
+      "${BUILD_DIR}/dosemu_bios.o" \
+      "${BUILD_DIR}/dosemu_int21.o" \
+      "${BUILD_DIR}/dosemu_shell.o" \
+      "${BUILD_DIR}/dosemu.o" \
       "${BUILD_DIR}/install_payload.o" \
       "${BUILD_DIR}/iso9660.o" \
       "${BUILD_DIR}/install_grub_bios_embed.o" \

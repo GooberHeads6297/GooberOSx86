@@ -1,0 +1,19 @@
+use goober.console
+
+var s = "GooberOS"
+print slice s 0 6
+print find s "OS"
+print find s "xyz"
+
+var m = map
+set m "a" 10
+set m "b" 20
+print get m "a"
+print get m "b"
+print len m
+print typeof m
+
+var xs = [1, 2, 3]
+set xs 1 99
+print get xs 1
+exit

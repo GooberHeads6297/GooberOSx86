@@ -1,0 +1,19 @@
+use goober.console
+use goober.fs
+
+var p = path_join "Apps" "src"
+print p
+print dirname p
+print basename p
+
+var names = listdir "Apps"
+if names
+  print "Apps entries:"
+  print len names
+  var i = 0
+  while i < len names
+    print get names i
+    i = i + 1
+  end
+end
+exit

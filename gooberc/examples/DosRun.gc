@@ -1,0 +1,6 @@
+use goober.console
+use goober.fs
+
+print "Launching GooberDOS HELLO.COM"
+dos_run "Dos/Apps/HELLO.COM"
+exit

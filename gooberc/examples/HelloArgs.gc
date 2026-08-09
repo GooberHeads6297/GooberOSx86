@@ -1,0 +1,13 @@
+use goober.console
+
+fn greet name
+  print "hi "
+  print name
+end
+
+call greet "Goober"
+var n = 3
+for i = 1 to n
+  print i
+end
+exit

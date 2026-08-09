@@ -9,6 +9,7 @@ char* strcpy(char* dest, const char* src);
 char* strncpy(char* dest, const char* src, size_t n);
 int strcmp(const char* s1, const char* s2);
 int strncmp(const char* s1, const char* s2, size_t n);
+int str_has_suffix_ci(const char* name, const char* suffix);
 char* strcat(char* dest, const char* src);
 
 void print_colored(const char* str, uint8_t fg, uint8_t bg);

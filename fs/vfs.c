@@ -147,6 +147,19 @@ int fs_delete_dir(const char* dirname) {
     return use_fat32() ? fat32_delete_dir(dirname) : memfs_delete_dir(dirname);
 }
 
+int fs_dir_delete(Directory* dir, const char* name) {
+    Directory* saved;
+    int rc;
+    if (!dir || !name || !name[0]) return -1;
+    saved = fs_get_cwd_dir();
+    fs_set_current_dir(dir);
+    rc = fs_delete(name);
+    if (rc != 0)
+        rc = fs_delete_dir(name);
+    if (saved) fs_set_current_dir(saved);
+    return rc;
+}
+
 const char* fs_get_cwd(void) {
     return use_fat32() ? fat32_get_cwd() : memfs_get_cwd();
 }

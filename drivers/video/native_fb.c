@@ -1,6 +1,7 @@
 #include "native_fb.h"
 #include "display.h"
 #include "intel_gfx.h"
+#include "vesa.h"
 #include "../io/io.h"
 #include "../pci/pci.h"
 #include <stddef.h>
@@ -327,4 +328,39 @@ void native_fb_register_drivers(void) {
     display_register_driver(&basicfb_ops);
     display_register_driver(&simplefb_ops);
     display_register_driver(&bochs_ops);
+}
+
+static const uint16_t k_supported_modes[] = {
+    640, 480,
+    800, 600,
+    1024, 768,
+    1280, 720,
+    1280, 800,
+    1366, 768,
+    1600, 900,
+    1920, 1080,
+    0, 0
+};
+
+const uint16_t* native_fb_supported_modes(int* count) {
+    int n = 0;
+    while (k_supported_modes[n * 2] != 0) n++;
+    if (count) *count = n;
+    return k_supported_modes;
+}
+
+int native_fb_modeset_available(void) {
+    return bochs_detect();
+}
+
+int native_fb_try_modeset(uint32_t width, uint32_t height, uint8_t bpp) {
+    display_framebuffer_t fb;
+    if (!bochs_detect()) return 0;
+    if (!bpp) bpp = 32;
+    if (!bochs_init(width, height, bpp, &fb)) return 0;
+    display_register_framebuffer(DISPLAY_DRIVER_NATIVE_GENERIC, fb.format,
+                                 fb.framebuffer_addr, fb.width, fb.height,
+                                 fb.pitch, fb.bpp);
+    vesa_init((uint64_t)fb.framebuffer_addr, fb.width, fb.height, fb.pitch, fb.bpp);
+    return 1;
 }

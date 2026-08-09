@@ -1,0 +1,319 @@
+# Minesweeper — colorful tile board
+use goober.gui
+app gui
+
+var W = 8
+var H = 8
+var MINES = 10
+var CS = 28
+var OX = 24
+var OY = 44
+var FLAGKEY = 102
+
+# Tile accents beyond the named palette
+var C_COVER = 0x4A6FA5
+var C_COVER2 = 0x3D5A86
+var C_OPEN = 0xDCE6F0
+
+var seed = 7777
+var cells
+var cx
+var cy
+var alive
+var won
+var left
+
+fn mod a b
+  return a - (a / b) * b
+end
+
+fn rnd n
+  seed = seed * 1103515 + 12345
+  if seed < 0
+    seed = 0 - seed
+  end
+  return mod seed n
+end
+
+fn getc x y
+  return get cells y * W + x
+end
+
+fn setc x y v
+  set cells y * W + x v
+end
+
+fn inb x y
+  if x < 0
+    return 0
+  end
+  if y < 0
+    return 0
+  end
+  if x >= W
+    return 0
+  end
+  if y >= H
+    return 0
+  end
+  return 1
+end
+
+fn count_near x y
+  var n = 0
+  var oy = 0 - 1
+  while oy <= 1
+    var ox = 0 - 1
+    while ox <= 1
+      if ox != 0
+        if inb x + ox y + oy
+          if mod getc x + ox y + oy 10 == 9
+            n = n + 1
+          end
+        end
+      else
+        if oy != 0
+          if inb x + ox y + oy
+            if mod getc x + ox y + oy 10 == 9
+              n = n + 1
+            end
+          end
+        end
+      end
+      ox = ox + 1
+    end
+    oy = oy + 1
+  end
+  return n
+end
+
+fn setup
+  cells = []
+  var i = 0
+  while i < 64
+    push cells 0
+    i = i + 1
+  end
+  var placed = 0
+  var guard = 0
+  while placed < MINES
+    guard = guard + 1
+    if guard > 500
+      break
+    end
+    var x = rnd W
+    var y = rnd H
+    if mod getc x y 10 != 9
+      setc x y 9
+      placed = placed + 1
+    end
+  end
+  var yy = 0
+  while yy < H
+    var xx = 0
+    while xx < W
+      if mod getc xx yy 10 != 9
+        setc xx yy count_near xx yy
+      end
+      xx = xx + 1
+    end
+    yy = yy + 1
+  end
+  cx = 0
+  cy = 0
+  alive = 1
+  won = 0
+  left = W * H - MINES
+end
+
+fn num_color n
+  if n == 1
+    return BLUE
+  end
+  if n == 2
+    return DARKGREEN
+  end
+  if n == 3
+    return RED
+  end
+  return INDIGO
+end
+
+fn draw
+  fill NAVY
+  rect 8 8 404 28 PANEL
+  label 16 16 "Minesweeper  left " + str left INK PANEL
+  var y = 0
+  while y < H
+    var x = 0
+    while x < W
+      var px = OX + x * CS
+      var py = OY + y * CS
+      var v = getc x y
+      var st = v / 10
+      var n = mod v 10
+      var col = C_COVER
+      if mod x + y 2 == 1
+        col = C_COVER2
+      end
+      if st == 1
+        col = C_OPEN
+        if n == 9
+          col = RED
+        end
+      end
+      if st == 2
+        col = ORANGE
+      end
+      rect px py CS - 2 CS - 2 col
+      if x == cx
+        if y == cy
+          rect px - 1 py - 1 CS CS GOLD
+          rect px py CS - 2 CS - 2 col
+        end
+      end
+      if st == 2
+        label px + 8 py + 8 "F" NAVY ORANGE
+      end
+      if st == 1
+        if n == 9
+          label px + 8 py + 8 "*" INK RED
+        else
+          if n > 0
+            label px + 10 py + 8 str n num_color n C_OPEN
+          end
+        end
+      end
+      x = x + 1
+    end
+    y = y + 1
+  end
+  label 16 280 "Arrows  Space/Enter reveal  F flag  ESC" MUTED NAVY
+  if alive == 0
+    if won
+      rect 8 300 404 22 GREEN
+      label 16 306 "CLEARED — you win" NAVY GREEN
+    else
+      rect 8 300 404 22 CORAL
+      label 16 306 "BOOM — game over" INK CORAL
+    end
+  end
+  present
+end
+
+fn enqueue q x y
+  if inb x y == 0
+    return q
+  end
+  push q x * 100 + y
+  return q
+end
+
+fn reveal sx sy
+  var q = []
+  var qh = 0
+  q = enqueue q sx sy
+  while qh < len q
+    var p = get q qh
+    qh = qh + 1
+    var x = p / 100
+    var y = mod p 100
+    if inb x y == 0
+      continue
+    end
+    var v = getc x y
+    var st = v / 10
+    var n = mod v 10
+    if st != 0
+      continue
+    end
+    setc x y 10 + n
+    if n == 9
+      alive = 0
+      return
+    end
+    left = left - 1
+    if left <= 0
+      won = 1
+      alive = 0
+    end
+    if n == 0
+      q = enqueue q x - 1 y - 1
+      q = enqueue q x y - 1
+      q = enqueue q x + 1 y - 1
+      q = enqueue q x - 1 y
+      q = enqueue q x + 1 y
+      q = enqueue q x - 1 y + 1
+      q = enqueue q x y + 1
+      q = enqueue q x + 1 y + 1
+    end
+  end
+end
+
+fn toggle_flag
+  var v = getc cx cy
+  var st = v / 10
+  var n = mod v 10
+  if st == 1
+    return
+  end
+  if st == 2
+    setc cx cy n
+  else
+    setc cx cy 20 + n
+  end
+end
+
+window "Minesweeper" 440x340
+setup
+draw
+
+while 1
+  if winclosed
+    exit
+  end
+  var k = getkey
+  if k == KEY_ESC
+    exit
+  end
+  if alive
+    if k == KEY_UP
+      if cy > 0
+        cy = cy - 1
+        draw
+      end
+    end
+    if k == KEY_DOWN
+      if cy < H - 1
+        cy = cy + 1
+        draw
+      end
+    end
+    if k == KEY_LEFT
+      if cx > 0
+        cx = cx - 1
+        draw
+      end
+    end
+    if k == KEY_RIGHT
+      if cx < W - 1
+        cx = cx + 1
+        draw
+      end
+    end
+    if k == KEY_SPACE
+      reveal cx cy
+      draw
+    end
+    if k == KEY_ENTER
+      reveal cx cy
+      draw
+    end
+    if k == FLAGKEY
+      toggle_flag
+      draw
+    end
+  end
+  sleep 40
+end
+exit

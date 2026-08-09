@@ -1,0 +1,13 @@
+# GooberC v1 — simple function call
+use goober.console
+app console
+
+fn greet
+  print "hello from fn"
+end
+
+call greet
+var a = 2
+var b = 3
+print a + b
+exit

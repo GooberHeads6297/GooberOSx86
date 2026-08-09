@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+typedef struct Directory Directory;
+
 #define MAX_VWINDOWS 12
 #define VWINDOW_TITLE_MAX 48
 #define MAX_VDESKTOP_ICONS 32
@@ -47,7 +49,13 @@ typedef enum {
     VDESK_APP_SYSTEM_SETTINGS,
     VDESK_APP_PAINT,
     VDESK_APP_WELCOME,
-    VDESK_APP_IDE
+    VDESK_APP_IDE,
+    VDESK_APP_INSTALLER,
+    VDESK_APP_DOS,
+    VDESK_APP_DOOM,
+    VDESK_APP_MINESWEEPER,
+    VDESK_APP_CUBEDIP,
+    VDESK_APP_SNAKEGAME
 } VDeskAppId;
 
 typedef struct {
@@ -124,7 +132,8 @@ typedef enum {
     VICON_TEXT,
     VICON_BITMAP,
     VICON_CODE,
-    VICON_GOB
+    VICON_GOB,
+    VICON_DOS
 } VIconKind;
 
 #define VDESK_TOAST_MAX 3
@@ -184,6 +193,8 @@ typedef struct VWindow {
     void (*tick_handler)(struct VWindow* win);
     /* Pointer click inside the client area; coords are client-relative. */
     void (*click_handler)(struct VWindow* win, int client_x, int client_y);
+    /* Right-click / Shift+left in client area (optional). */
+    void (*rclick_handler)(struct VWindow* win, int client_x, int client_y);
     void* user_data;
     /* Ring-0 app framework: process table PID for taskmgr End Task. */
     int process_pid;
@@ -206,15 +217,27 @@ typedef struct {
     int context_target_window_id;
     int rename_open;
     int rename_target_kind;
+    Directory* rename_dir;
     char rename_old_name[VICON_NAME_MAX];
     char rename_input[VICON_NAME_MAX];
     int rename_len;
     int rename_status;
+    /* Cut/copy clipboard for desktop + explorer */
+    int clip_mode; /* 0=none 1=copy 2=cut */
+    Directory* clip_dir;
+    char clip_name[VICON_NAME_MAX];
+    int clip_is_dir;
+    /* FS item context (desktop file icon or explorer row) */
+    Directory* context_fs_dir;
+    char context_fs_name[VICON_NAME_MAX];
+    int context_fs_is_dir;
     int theme_mode;
     int appearance;
     int primary_shell_id;
     int shell_first_mode;
     int desktop_experience_visible;
+    int tile_wm; /* 1 = auto-tile apps opened from shell (default) */
+    int shift_click_rmb; /* 1 = Shift+left-click opens context menu (default) */
     int taskbar_position;
     int target_frame_ms;
     int adaptive_pacing;
@@ -232,6 +255,7 @@ typedef struct {
     VDeskMetrics metrics;
     void (*launch_app)(VDeskAppId app_id);
     void (*open_file)(const char* name, int kind);
+    void (*open_fs_item)(Directory* dir, const char* name, int is_dir);
     int mouse_x, mouse_y;
     int mouse_buttons;
     int running;
@@ -243,6 +267,8 @@ typedef struct {
 
 /* Desktop functions */
 void vdesk_init(int screen_w, int screen_h);
+/* Update desktop metrics after a runtime modeset (keeps windows). */
+void vdesk_set_screen_size(int screen_w, int screen_h);
 void vdesk_run(void);
 VWindow* vdesk_create_window(const char* title, int x, int y, int w, int h);
 void vdesk_close_window(VWindow* win);
@@ -252,6 +278,9 @@ void vdesk_bring_to_front(VWindow* win);
 VWindow* vdesk_window_at(int x, int y);
 void vdesk_set_app_launcher(void (*launcher)(VDeskAppId app_id));
 void vdesk_set_file_opener(void (*opener)(const char* name, int kind));
+/* Open a file/folder from an arbitrary directory (explorer context Open). */
+void vdesk_set_fs_item_opener(void (*opener)(Directory* dir, const char* name,
+                                             int is_dir));
 void vdesk_add_icon(const char* label, VDeskAppId app_id, int x, int y);
 void vdesk_refresh_desktop_items(int force);
 void vdesk_set_status(const char* msg);
@@ -262,6 +291,11 @@ void vdesk_mark_full_dirty(void);
 void vdesk_pump_one_frame(void);
 void vdesk_toggle_theme(void);
 void vdesk_set_appearance(int appearance);
+int vdesk_get_appearance(void);
+void vdesk_set_shift_click_rmb(int enabled);
+int vdesk_shift_click_rmb_enabled(void);
+/* Optional strong hook from desktop_vesa: persist prefs after theme/F9 changes. */
+void vdesk_prefs_persist(void);
 void vdesk_set_primary_shell(VWindow* win);
 void vdesk_focus_primary_shell(void);
 int vdesk_has_active_app_focus(void);
@@ -270,6 +304,8 @@ void vdesk_toggle_desktop_experience(void);
 void vdesk_set_desktop_experience(int show_desktop);
 int vdesk_desktop_experience_visible(void);
 void vdesk_tile_window(VWindow* win);
+void vdesk_set_tile_wm(int enabled);
+int vdesk_tile_wm_enabled(void);
 color_t vdesk_shell_bg_color(void);
 color_t vdesk_shell_output_color(void);
 color_t vdesk_shell_input_color(void);
@@ -286,5 +322,18 @@ const char* vdesk_get_theme_name(void);
 void vdesk_draw_rect(int x, int y, int w, int h, color_t color);
 void vdesk_draw_border(int x, int y, int w, int h, color_t light, color_t dark);
 void vdesk_draw_text(int x, int y, const char* str, color_t fg, color_t bg);
+
+/* In-OS file drag/drop (Explorer → /Dos or folder icons). */
+void vdesk_get_pointer(int* x, int* y, int* buttons);
+void vdesk_file_drag_begin(Directory* src_dir, const char* name);
+void vdesk_file_drag_begin_ex(Directory* src_dir, const char* name, int is_dir);
+int vdesk_file_drag_active(void);
+void vdesk_file_drag_cancel(void);
+/* Returns 1 if a drop was handled. Call on left button release. */
+int vdesk_file_drag_drop(void);
+/* Shared Open/Rename/Delete/Cut/Copy context for a filesystem item. */
+void vdesk_open_fs_context(Directory* dir, const char* name, int is_dir,
+                           int mx, int my);
+void vdesk_clipboard_paste_into(Directory* dst);
 
 #endif

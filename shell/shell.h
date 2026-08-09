@@ -8,6 +8,8 @@ typedef void (*shell_clear_sink_t)(void* ctx);
 
 void run_shell();
 void execute_command(const char* cmd);
+/* Machine reboot (ACPI ResetReg / 8042). Desktop `exit` does not call this. */
+void shell_reboot(void);
 void print(const char* str);
 void print_colored(const char* str, uint8_t fg, uint8_t bg);
 void clear_screen(void);

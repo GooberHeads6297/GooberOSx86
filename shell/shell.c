@@ -343,13 +343,23 @@ typedef struct __attribute__((packed)) {
 
 #define ACPI_FADT_FLAG_RESET_REG_SUP (1u << 10)
 
+/* Multiboot2 ACPI tag RSDP (kernel.c). Preferred on UEFI — BIOS EBDA scan
+ * often finds nothing or hangs on real hardware. */
+extern uintptr_t kernel_acpi_rsdp(void);
+
 static acpi_rsdp_t* acpi_find_rsdp(void) {
-    /* Search the EBDA (low KB at 0x40E pointer*16) and the 1 MB-1 - 0xE0000
-     * BIOS region for the "RSD PTR " 8-byte signature on a 16-byte boundary.
-     * The 0x40E read goes through a uintptr_t-typed pointer to suppress the
-     * gcc -Warray-bounds warning that fires when reading from a numeric
-     * constant address (it sees the cast-through-int as "address zero"). */
     static const char sig[8] = { 'R','S','D',' ','P','T','R',' ' };
+    uintptr_t fw = kernel_acpi_rsdp();
+    if (fw) {
+        acpi_rsdp_t* rsdp = (acpi_rsdp_t*)fw;
+        int match = 1;
+        for (int i = 0; i < 8; i++) {
+            if (rsdp->signature[i] != sig[i]) { match = 0; break; }
+        }
+        if (match) return rsdp;
+    }
+#if defined(__i386__)
+    /* Legacy BIOS EBDA + 0xE0000 scan — x86_64/UEFI must not use this path. */
     volatile uint16_t* ebda_seg_ptr = (volatile uint16_t*)(uintptr_t)0x40Eu;
     uint16_t ebda_seg = *ebda_seg_ptr;
     uintptr_t ebda_base = (uintptr_t)((uint32_t)ebda_seg << 4u);
@@ -366,6 +376,7 @@ static acpi_rsdp_t* acpi_find_rsdp(void) {
             if (match) return (acpi_rsdp_t*)p;
         }
     }
+#endif
     return 0;
 }
 
@@ -454,7 +465,7 @@ static int acpi_reset_attempt(void) {
 }
 #endif /* __x86_64__ */
 
-static void reboot() {
+void shell_reboot(void) {
     __asm__ volatile ("cli");
 #ifdef __i386__
     /* Original 32-bit path: load an invalid IDT then int3 -> triple fault. */
@@ -463,24 +474,32 @@ static void reboot() {
     __asm__ volatile ("int3\nud2\n");
 #else
     /*
-     * Phase 3f x64 reboot path. Try ACPI 5.0 RESET_REG first (spec path on
-     * UEFI systems), then the 8042 keyboard-controller reset (universal
-     * PC chipset path), and finally cli/hlt forever as a last resort.
+     * x64: ACPI 5.0 RESET_REG (via Multiboot2 RSDP), then 8042 pulse,
+     * then cli/hlt with a visible failure line.
      */
     if (!acpi_reset_attempt()) {
         print("[shell] reboot: pulsing 8042 keyboard-controller reset (x64 fallback)\n");
-        /* Drain the 8042 input buffer first so the reset pulse isn't lost. */
         for (int i = 0; i < 16; i++) {
             if ((inb(0x64) & 0x02) == 0) break;
             (void)inb(0x60);
         }
         outb(0x64, 0xFE);
     }
+    print("[shell] reboot: reset did not take effect; halted\n");
 #endif
     while (1) __asm__ volatile ("hlt");
 }
 
-static void list_games() {
+static int shell_is_live(void) {
+    return !fs_is_persistent();
+}
+
+static void list_games(void) {
+    if (shell_is_live()) {
+        print("Start menu -> Games: Minesweeper, CubeDip, SnakeGame (GooberC)\n");
+        print("doom.exe (native GooberDoom)\n");
+        return;
+    }
     print("snakeGame.exe\n");
     print("cubeDip.exe\n");
     print("pong.exe\n");
@@ -1139,12 +1158,24 @@ void execute_command(const char* cmd) {
     }
 
     if (!strcmp_local(cmd, "help")) {
-        print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\ngames\ntaskview\ndevices\nlspci\ndisplay\nboot\nlogs\ndriverlog\ninstall\ndisk\npartitions\nmount\numount\nsync\nedit\nnew\nwrite\nmkdir\nrename\ndel\nrmdir\nread\ngui\ncolor\nrun\ngooberc\n");
+        if (shell_is_live()) {
+            print("Available commands (live memfs):\nhelp\ncls\necho\nls\ncd\nexit\nreboot\ngames\ntaskview\ndevices\nlspci\ndisplay\nboot\nlogs\ndriverlog\ninstall\ndisk\npartitions\nmount\nedit\nnew\nwrite\nmkdir\nrename\ndel\nrmdir\nread\ngui\ncolor\nrun\nrundos\ngooberc\n");
+            print("(umount/sync/install memory/legacy VGA games disabled on live)\n");
+        } else {
+            print("Available commands:\nhelp\ncls\necho\nls\ncd\nexit\nreboot\ngames\ntaskview\ndevices\nlspci\ndisplay\nboot\nlogs\ndriverlog\ninstall\ndisk\npartitions\nmount\numount\nsync\nedit\nnew\nwrite\nmkdir\nrename\ndel\nrmdir\nread\ngui\ncolor\nrun\nrundos\ngooberc\n");
+        }
     } else if (!strncmp_local(cmd, "run ", 4)) {
         const char* path = cmd + 4;
         while (*path == ' ') path++;
         if (!*path) print("run: usage: run <path.gob>\n");
         else if (gob_exec(path) != 0) print("run: failed\n");
+    } else if (!strncmp_local(cmd, "rundos", 6) && (cmd[6] == '\0' || cmd[6] == ' ')) {
+        const char* path = cmd + 6;
+        while (*path == ' ') path++;
+        {
+            extern int dos_exec(const char* path);
+            if (dos_exec(*path ? path : NULL) != 0) print("rundos: failed\n");
+        }
     } else if (!strncmp_local(cmd, "gooberc ", 8)) {
         /* gooberc <src.gc> -o <out.gob> */
         const char* arg = cmd + 8;
@@ -1299,15 +1330,22 @@ void execute_command(const char* cmd) {
     } else if (!strcmp_local(cmd, "mount")) {
         print_mount_status();
     } else if (!strcmp_local(cmd, "umount") || !strcmp_local(cmd, "unmount")) {
-        if (!fat32_is_mounted()) {
+        if (shell_is_live() && !fat32_is_mounted()) {
+            print("umount: not available on live memfs\n");
+        } else if (!fat32_is_mounted()) {
             print("Nothing mounted.\n");
         } else {
             fat32_unmount();
             print("Unmounted.\n");
         }
     } else if (!strcmp_local(cmd, "sync")) {
-        if (fs_sync() == 0) print("Filesystem synced.\n");
-        else print("sync failed.\n");
+        if (shell_is_live() && !fat32_is_mounted()) {
+            print("sync: no persistent filesystem (live memfs)\n");
+        } else if (fs_sync() == 0) {
+            print("Filesystem synced.\n");
+        } else {
+            print("sync failed.\n");
+        }
     } else if (!strcmp_local(cmd, "ls")) {
         fs_list();
     } else if (!strncmp_local(cmd, "cd ", 3)) {
@@ -1585,10 +1623,13 @@ void execute_command(const char* cmd) {
     } else if (!strcmp_local(cmd, "install host")) {
         print_host_install_help();
     } else if (!strcmp_local(cmd, "install memory")) {
-        if (install_memory_only() == 0)
+        if (shell_is_live()) {
+            print("install memory: already running on live memfs\n");
+        } else if (install_memory_only() == 0) {
             print("install memory: done\n");
-        else
+        } else {
             print("install memory: failed\n");
+        }
     } else if (!strncmp_local(cmd, "install info ", 13)) {
         const char* arg = cmd + 13;
         if (*arg == '\0') {
@@ -1658,23 +1699,32 @@ void execute_command(const char* cmd) {
             print("Exited editor\n");
             vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
         }
-    } else if (!strcmp_local(cmd, "exit")) {
+    } else if (!strcmp_local(cmd, "reboot") || !strcmp_local(cmd, "exit")) {
+        /* Text-mode: exit and reboot both reboot. VESA GooberShell overrides
+         * exit to close the window before execute_command is reached. */
         print("Rebooting...\n");
-        reboot();
+        shell_reboot();
     } else if (!strcmp_local(cmd, "games")) {
         list_games();
-    } else if (!strcmp_local(cmd, "snakeGame.exe")) {
-        print("Launching snakeGame.exe... Press ESC to quit.\n");
-        run_snake_game();
-        print("Exited snakeGame.exe\n");
-    } else if (!strcmp_local(cmd, "cubeDip.exe")) {
-        print("Launching cubeDip.exe... Press ESC to quit.\n");
-        run_cubeDip_game();
-        print("Exited cubeDip.exe\n");
-    } else if (!strcmp_local(cmd, "pong.exe")) {
-        print("Launching Pong... Press ESC to quit.\n");
-        run_pong_game();
-        print("Exited Pong\n");
+    } else if (!strcmp_local(cmd, "snakeGame.exe") ||
+               !strcmp_local(cmd, "cubeDip.exe") ||
+               !strcmp_local(cmd, "pong.exe")) {
+        if (shell_is_live()) {
+            print("Legacy VGA games disabled on live ISO.\n");
+            print("Use Start -> Games for GooberC Minesweeper/CubeDip/SnakeGame.\n");
+        } else if (!strcmp_local(cmd, "snakeGame.exe")) {
+            print("Launching snakeGame.exe... Press ESC to quit.\n");
+            run_snake_game();
+            print("Exited snakeGame.exe\n");
+        } else if (!strcmp_local(cmd, "cubeDip.exe")) {
+            print("Launching cubeDip.exe... Press ESC to quit.\n");
+            run_cubeDip_game();
+            print("Exited cubeDip.exe\n");
+        } else {
+            print("Launching Pong... Press ESC to quit.\n");
+            run_pong_game();
+            print("Exited Pong\n");
+        }
     } else if (!strcmp_local(cmd, "doom.exe")) {
         print("Launching Doom prototype... Press ESC to quit.\n");
         run_doom_game();

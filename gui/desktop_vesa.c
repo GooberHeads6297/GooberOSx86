@@ -12,17 +12,15 @@
 #include "../fs/filesystem.h"
 #include "../taskmgr/process.h"
 #include "../userspace/userspace.h"
+#include "../dosemu/dosemu.h"
+#include "../games/doom.h"
 #include "../kernel.h"
 #include "../drivers/usb/host/host.h"
 #include "../drivers/diagnostics/driver_log.h"
 #include "../drivers/video/display.h"
-
-static int has_suffix(const char* name, const char* suffix) {
-    int nl = (int)strlen(name);
-    int sl = (int)strlen(suffix);
-    if (sl > nl) return 0;
-    return strcmp(name + nl - sl, suffix) == 0;
-}
+#include "../drivers/video/native_fb.h"
+#include "../drivers/storage/storage.h"
+#include "../install/install.h"
 
 /* Map a clicked cell (row/col in the visible text area) to a buffer index.
  * Matches the wrap rules used by the text editor / IDE renderers. */
@@ -60,8 +58,15 @@ static int text_pos_at_cell(const char* text, int len, int cols,
     return len;
 }
 
+#ifndef ABS
+#define ABS(x) ((x) < 0 ? -(x) : (x))
+#endif
 #define IN_RECT(px, py, rx, ry, rw, rh) \
     ((px) >= (rx) && (px) < (rx) + (rw) && (py) >= (ry) && (py) < (ry) + (rh))
+
+#ifdef __x86_64__
+static void vesa_desktop_alloc_backbuffer_x64(uint32_t w, uint32_t h);
+#endif
 
 /* Draw a simple raised push-button with a centered label. */
 static void draw_button(int x, int y, int w, int h, const char* label, int active) {
@@ -220,7 +225,7 @@ static int shell_build_prompt_prefix(char* out, int out_max) {
     return n;
 }
 
-static void shell_do_exec(ShellApp* sa) {
+static void shell_do_exec(VWindow* win, ShellApp* sa) {
     char cmd[SHELL_LINE_LEN];
     if (sa->input_len <= 0) return;
 
@@ -236,6 +241,15 @@ static void shell_do_exec(ShellApp* sa) {
             prompt[pi++] = cmd[i];
         prompt[pi] = '\0';
         shell_write_line_kind(sa, prompt, SHELL_LINE_INPUT);
+    }
+
+    if (strcmp(cmd, "exit") == 0) {
+        sa->input_len = 0;
+        sa->input_pos = 0;
+        sa->input[0] = '\0';
+        sa->history_nav_offset = -1;
+        vdesk_close_window(win);
+        return;
     }
 
     if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "cls") == 0) {
@@ -265,11 +279,20 @@ static void shell_do_exec(ShellApp* sa) {
         open_display_settings_window();
         vdesk_tile_window(NULL);
         shell_write_line_kind(sa, "Opened VESA Display Settings.", SHELL_LINE_MUTED);
+    } else if (strcmp(cmd, "doom.exe") == 0 || strcmp(cmd, "doom") == 0) {
+        open_doom_window();
+        shell_write_line_kind(sa, "Opened GooberDoom.", SHELL_LINE_MUTED);
+    } else if (strcmp(cmd, "rundos") == 0 || strcmp(cmd, "dos") == 0) {
+        if (dos_exec(NULL) != 0)
+            shell_write_line_kind(sa, "GooberDOS failed to start.", SHELL_LINE_MUTED);
+        else
+            shell_write_line_kind(sa, "Opened GooberDOS.", SHELL_LINE_MUTED);
     } else if (strcmp(cmd, "snakeGame.exe") == 0 ||
                strcmp(cmd, "cubeDip.exe") == 0 ||
-               strcmp(cmd, "pong.exe") == 0 ||
-               strcmp(cmd, "doom.exe") == 0) {
-        shell_write_line_kind(sa, "Legacy VGA App surface removed; use native VESA apps.", SHELL_LINE_MUTED);
+               strcmp(cmd, "pong.exe") == 0) {
+        shell_write_line_kind(sa,
+            "Legacy VGA games disabled — use Start -> Games (GooberC).",
+            SHELL_LINE_MUTED);
     } else {
         shell_set_redirect(shell_capture_write, NULL, sa);
         execute_command(cmd);
@@ -435,7 +458,7 @@ static void shell_key(VWindow* win, char key) {
         return;
     }
     if (key == '\r' || key == '\n') {
-        shell_do_exec(sa);
+        shell_do_exec(win, sa);
         return;
     }
     if ((unsigned char)key >= 32 && (unsigned char)key <= 126) {
@@ -758,54 +781,177 @@ static void taskmgr_click(VWindow* win, int lx, int ly) {
 }
 
 /* ---- Display Settings app ---- */
-/* Theme-toggle button rect in client coordinates. */
 #define SETTINGS_BTN_X 4
 #define SETTINGS_BTN_W 150
 #define SETTINGS_BTN_H 22
-#define SETTINGS_OUTPUT_BTN_Y 190
-#define SETTINGS_INPUT_BTN_Y 216
+#define SETTINGS_LOOK_BTN_Y 200
+#define SETTINGS_OUTPUT_BTN_Y 268
+#define SETTINGS_INPUT_BTN_Y 294
+#define SETTINGS_RES_DROP_X 4
+#define SETTINGS_RES_DROP_Y 48
+#define SETTINGS_RES_DROP_W 200
+#define SETTINGS_RES_APPLY_X 214
+#define SETTINGS_RES_ROW_H 18
+
+typedef struct {
+    int drop_open;
+    int selected;   /* index into supported modes */
+    int mode_count;
+    int can_modeset;
+    char status[48];
+} DisplaySettingsApp;
+
+static void display_settings_pick_current(DisplaySettingsApp* app) {
+    const uint16_t* modes;
+    int i, n = 0;
+    uint32_t cw = vesa_get_width();
+    uint32_t ch = vesa_get_height();
+    if (!app) return;
+    modes = native_fb_supported_modes(&n);
+    app->mode_count = n;
+    app->selected = 0;
+    for (i = 0; i < n; i++) {
+        if (modes[i * 2] == (uint16_t)cw && modes[i * 2 + 1] == (uint16_t)ch) {
+            app->selected = i;
+            break;
+        }
+    }
+    app->can_modeset = native_fb_modeset_available();
+}
+
+static void display_settings_apply(DisplaySettingsApp* app) {
+    const uint16_t* modes;
+    int n = 0;
+    uint32_t w, h;
+    if (!app) return;
+    if (!app->can_modeset) {
+        strncpy(app->status, "Modeset unavailable (firmware LFB).", sizeof(app->status) - 1);
+        return;
+    }
+    modes = native_fb_supported_modes(&n);
+    if (app->selected < 0 || app->selected >= n) return;
+    w = modes[app->selected * 2];
+    h = modes[app->selected * 2 + 1];
+    if (!native_fb_try_modeset(w, h, 32)) {
+        strncpy(app->status, "Mode rejected by display.", sizeof(app->status) - 1);
+        return;
+    }
+#ifdef __x86_64__
+    vesa_desktop_alloc_backbuffer_x64(w, h);
+#endif
+    input_set_bounds(w, h);
+    vdesk_set_screen_size((int)w, (int)h);
+    app->drop_open = 0;
+    display_settings_pick_current(app);
+    strncpy(app->status, "Resolution applied.", sizeof(app->status) - 1);
+    vdesk_notify("Display", "Resolution changed");
+}
 
 static void display_settings_render(VWindow* win, int cx, int cy, int cw, int ch) {
-    (void)win;
+    DisplaySettingsApp* app = (DisplaySettingsApp*)win->user_data;
     const VTheme* theme = vdesk_get_theme();
     const VDeskMetrics* metrics = vdesk_get_metrics();
+    const uint16_t* modes;
+    int n = 0, i;
+    char label[32];
+    int drop_open = app && app->drop_open;
+    /* Push body content below the tallest dropdown so it never overlaps */
+    int body_y = 78;
+    modes = native_fb_supported_modes(&n);
+    if (drop_open && n > 0) {
+        int list_h = n * SETTINGS_RES_ROW_H + 8;
+        body_y = SETTINGS_RES_DROP_Y + SETTINGS_BTN_H + list_h + 8;
+    }
+
     vdesk_draw_rect(cx, cy, cw, ch, theme->client_bg);
     vdesk_draw_text(cx + 4, cy + 4, "Display Settings", theme->text, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 24, "Appearance:", theme->text, theme->client_bg);
-    vdesk_draw_text(cx + 76, cy + 24, vdesk_get_theme_name(), theme->accent, theme->client_bg);
+    vdesk_draw_text(cx + 4, cy + 24, "Resolution:", theme->text, theme->client_bg);
+
+    if (app && app->selected >= 0 && app->selected < n) {
+        char a[12], b[12];
+        int p = 0;
+        itoa((int)modes[app->selected * 2], a, 10);
+        itoa((int)modes[app->selected * 2 + 1], b, 10);
+        while (a[p] && p < 12) { label[p] = a[p]; p++; }
+        label[p++] = 'x';
+        i = 0;
+        while (b[i] && p < 30) label[p++] = b[i++];
+        label[p++] = ' ';
+        label[p++] = drop_open ? '^' : 'v';
+        label[p] = '\0';
+    } else {
+        label[0] = '?'; label[1] = '\0';
+    }
+    draw_button(cx + SETTINGS_RES_DROP_X, cy + SETTINGS_RES_DROP_Y,
+                SETTINGS_RES_DROP_W, SETTINGS_BTN_H, label, drop_open);
+    draw_button(cx + SETTINGS_RES_APPLY_X, cy + SETTINGS_RES_DROP_Y,
+                100, SETTINGS_BTN_H, "Apply", 0);
+
     {
         char buf[32];
         itoa((int)vesa_get_width(), buf, 10);
-        vdesk_draw_text(cx + 4, cy + 48, "Width:", theme->text, theme->client_bg);
-        vdesk_draw_text(cx + 76, cy + 48, buf, theme->accent, theme->client_bg);
+        vdesk_draw_text(cx + 4, cy + body_y, "Active:", theme->text, theme->client_bg);
+        vdesk_draw_text(cx + 76, cy + body_y, buf, theme->accent, theme->client_bg);
         itoa((int)vesa_get_height(), buf, 10);
-        vdesk_draw_text(cx + 4, cy + 64, "Height:", theme->text, theme->client_bg);
-        vdesk_draw_text(cx + 76, cy + 64, buf, theme->accent, theme->client_bg);
-        itoa((int)vesa_get_pitch(), buf, 10);
-        vdesk_draw_text(cx + 4, cy + 80, "Pitch:", theme->text, theme->client_bg);
-        vdesk_draw_text(cx + 76, cy + 80, buf, theme->accent, theme->client_bg);
+        vdesk_draw_text(cx + 130, cy + body_y, "x", theme->text, theme->client_bg);
+        vdesk_draw_text(cx + 144, cy + body_y, buf, theme->accent, theme->client_bg);
         itoa((int)metrics->fps, buf, 10);
-        vdesk_draw_text(cx + 4, cy + 96, "FPS:", theme->text, theme->client_bg);
-        vdesk_draw_text(cx + 76, cy + 96, buf, theme->accent, theme->client_bg);
+        vdesk_draw_text(cx + 4, cy + body_y + 18, "FPS:", theme->text, theme->client_bg);
+        vdesk_draw_text(cx + 76, cy + body_y + 18, buf, theme->accent, theme->client_bg);
     }
-    draw_button(cx + SETTINGS_BTN_X, cy + 118, SETTINGS_BTN_W, SETTINGS_BTN_H,
+    if (app && app->status[0])
+        vdesk_draw_text(cx + 4, cy + body_y + 36, app->status, theme->text_muted, theme->client_bg);
+    else if (app && !app->can_modeset)
+        vdesk_draw_text(cx + 4, cy + body_y + 36, "Firmware LFB — resolution locked.",
+                        theme->text_muted, theme->client_bg);
+    else
+        vdesk_draw_text(cx + 4, cy + body_y + 36, "Open dropdown, pick a mode, Apply.",
+                        theme->text_muted, theme->client_bg);
+
+    vdesk_draw_text(cx + 4, cy + body_y + 62, "Appearance:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 76, cy + body_y + 62, vdesk_get_theme_name(), theme->accent, theme->client_bg);
+    draw_button(cx + SETTINGS_BTN_X, cy + body_y + 84, SETTINGS_BTN_W, SETTINGS_BTN_H,
                 "Cycle Look", 0);
-    vdesk_draw_text(cx + 4, cy + 150, "Click button, F2, or F9 cycles appearance.",
+    vdesk_draw_text(cx + 4, cy + body_y + 114, "F2/F9 look | F6 output | F7 input color",
                     theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 166, "F1 snaps focus back to GooberShell.",
-                    theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 182, "Original keeps blue input + green output.",
-                    theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 4, cy + 206, "Shell output:", theme->text, theme->client_bg);
-    vdesk_draw_text(cx + 112, cy + 206, "sample", vdesk_shell_output_color(), theme->client_bg);
-    draw_button(cx + 200, cy + SETTINGS_OUTPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H,
+    vdesk_draw_text(cx + 4, cy + body_y + 134, "Shell output:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 112, cy + body_y + 134, "sample", vdesk_shell_output_color(), theme->client_bg);
+    draw_button(cx + 200, cy + body_y + 152, SETTINGS_BTN_W, SETTINGS_BTN_H,
                 "Output Color", 0);
-    vdesk_draw_text(cx + 4, cy + 232, "Shell cursor/input:", theme->text, theme->client_bg);
-    vdesk_draw_text(cx + 144, cy + 232, "> sample_", vdesk_shell_input_color(), theme->client_bg);
-    draw_button(cx + 200, cy + SETTINGS_INPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H,
+    vdesk_draw_text(cx + 4, cy + body_y + 178, "Shell cursor/input:", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 144, cy + body_y + 178, "> sample_", vdesk_shell_input_color(), theme->client_bg);
+    draw_button(cx + 200, cy + body_y + 196, SETTINGS_BTN_W, SETTINGS_BTN_H,
                 "Input Color", 0);
-    vdesk_draw_text(cx + 4, cy + 258, "F6 output color | F7 input/cursor color",
-                    theme->text_muted, theme->client_bg);
+
+    /* Dropdown last so it always paints above the body */
+    if (drop_open) {
+        int list_y = SETTINGS_RES_DROP_Y + SETTINGS_BTN_H;
+        int list_h = n * SETTINGS_RES_ROW_H + 4;
+        if (list_h > ch - list_y - 4) list_h = ch - list_y - 4;
+        vdesk_draw_rect(cx + SETTINGS_RES_DROP_X, cy + list_y,
+                        SETTINGS_RES_DROP_W, list_h, theme->taskbar_bg);
+        vdesk_draw_border(cx + SETTINGS_RES_DROP_X, cy + list_y,
+                          SETTINGS_RES_DROP_W, list_h,
+                          theme->border_light, theme->border_dark);
+        for (i = 0; i < n; i++) {
+            char row[24], aw[12], ah[12];
+            int p = 0, q = 0;
+            int ry = list_y + 2 + i * SETTINGS_RES_ROW_H;
+            uint32_t bg = (app->selected == i) ? theme->accent : theme->taskbar_bg;
+            if (ry + SETTINGS_RES_ROW_H > list_y + list_h) break;
+            itoa((int)modes[i * 2], aw, 10);
+            itoa((int)modes[i * 2 + 1], ah, 10);
+            while (aw[p]) { row[p] = aw[p]; p++; }
+            row[p++] = 'x';
+            while (ah[q]) row[p++] = ah[q++];
+            row[p] = '\0';
+            vdesk_draw_rect(cx + SETTINGS_RES_DROP_X + 1, cy + ry,
+                            SETTINGS_RES_DROP_W - 2, SETTINGS_RES_ROW_H, bg);
+            vdesk_draw_text(cx + SETTINGS_RES_DROP_X + 6, cy + ry + 1, row,
+                            (app->selected == i) ? VCOLOR_WHITE : theme->text, bg);
+        }
+    }
+    (void)cw;
 }
 
 static void display_settings_key(VWindow* win, char key) {
@@ -816,12 +962,43 @@ static void display_settings_key(VWindow* win, char key) {
 }
 
 static void display_settings_click(VWindow* win, int lx, int ly) {
-    (void)win;
-    if (IN_RECT(lx, ly, SETTINGS_BTN_X, 118, SETTINGS_BTN_W, SETTINGS_BTN_H))
+    DisplaySettingsApp* app = (DisplaySettingsApp*)win->user_data;
+    const uint16_t* modes;
+    int n = 0, i;
+    int body_y = 78;
+
+    if (IN_RECT(lx, ly, SETTINGS_RES_DROP_X, SETTINGS_RES_DROP_Y,
+                SETTINGS_RES_DROP_W, SETTINGS_BTN_H)) {
+        if (app) app->drop_open = !app->drop_open;
+        return;
+    }
+    if (IN_RECT(lx, ly, SETTINGS_RES_APPLY_X, SETTINGS_RES_DROP_Y, 100, SETTINGS_BTN_H)) {
+        display_settings_apply(app);
+        return;
+    }
+    if (app && app->drop_open) {
+        modes = native_fb_supported_modes(&n);
+        for (i = 0; i < n; i++) {
+            int ry = SETTINGS_RES_DROP_Y + SETTINGS_BTN_H + 2 + i * SETTINGS_RES_ROW_H;
+            if (IN_RECT(lx, ly, SETTINGS_RES_DROP_X, ry, SETTINGS_RES_DROP_W, SETTINGS_RES_ROW_H)) {
+                app->selected = i;
+                app->drop_open = 0;
+                (void)modes;
+                return;
+            }
+        }
+        /* Click outside list while open — close without other actions */
+        app->drop_open = 0;
+        return;
+    }
+
+    modes = native_fb_supported_modes(&n);
+    (void)modes;
+    if (IN_RECT(lx, ly, SETTINGS_BTN_X, body_y + 84, SETTINGS_BTN_W, SETTINGS_BTN_H))
         vdesk_toggle_theme();
-    else if (IN_RECT(lx, ly, 200, SETTINGS_OUTPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H))
+    else if (IN_RECT(lx, ly, 200, body_y + 152, SETTINGS_BTN_W, SETTINGS_BTN_H))
         vdesk_cycle_shell_output_color();
-    else if (IN_RECT(lx, ly, 200, SETTINGS_INPUT_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H))
+    else if (IN_RECT(lx, ly, 200, body_y + 196, SETTINGS_BTN_W, SETTINGS_BTN_H))
         vdesk_cycle_shell_input_color();
 }
 
@@ -835,10 +1012,15 @@ typedef struct {
     int tab;
     int pointer_speed; /* 1..10 preference (scaling stub) */
     int hide_shell;    /* auto-hide GooberShell on startup */
+    int tile_wm;       /* auto-tile apps from shell (default on) */
+    int shift_click;   /* Shift+left = right-click */
 } SystemSettingsApp;
 
 static int g_pointer_speed_pref = 5;
-static int g_hide_shell_pref = 0;
+static int g_hide_shell_pref = 1; /* default: show desktop on smart boot */
+static int g_tile_wm_pref = 1;
+static int g_shift_click_pref = 1;
+static int g_appearance_pref = VDESK_APPEARANCE_MODERN_DARK;
 
 static int cfg_parse_int(const char* p) {
     int v = 0;
@@ -851,73 +1033,108 @@ static int cfg_parse_int(const char* p) {
     return any ? v : -1;
 }
 
+static void system_settings_append(char* body, int* n, int cap, const char* s) {
+    int i;
+    if (!body || !n || !s) return;
+    for (i = 0; s[i] && *n + 1 < cap; i++)
+        body[(*n)++] = s[i];
+}
+
 static void system_settings_try_save(SystemSettingsApp* app) {
-    char body[128];
+    char body[256];
     softclock_t clk;
     int n = 0;
+    int cap = (int)sizeof(body);
     Directory* prev;
+    Directory* root;
+    Directory* cfg;
+    int ok = 0;
 
     if (app) {
         g_pointer_speed_pref = app->pointer_speed;
         g_hide_shell_pref = app->hide_shell ? 1 : 0;
+        g_tile_wm_pref = app->tile_wm ? 1 : 0;
+        g_shift_click_pref = app->shift_click ? 1 : 0;
+        vdesk_set_tile_wm(g_tile_wm_pref);
+        vdesk_set_shift_click_rmb(g_shift_click_pref);
     }
+    g_appearance_pref = vdesk_get_appearance();
     softclock_get(&clk);
 
-    /* speed=N\nhide_shell=0|1\nclock=YYYY-MM-DD HH:MM:SS\n */
-    body[n++] = 's'; body[n++] = 'p'; body[n++] = 'e'; body[n++] = 'e';
-    body[n++] = 'd'; body[n++] = '=';
+    /* Always write under /Config, not whatever cwd Explorer left us in. */
+    system_settings_append(body, &n, cap, "speed=");
     if (g_pointer_speed_pref >= 10) {
-        body[n++] = '1';
-        body[n++] = '0';
+        system_settings_append(body, &n, cap, "10");
     } else {
-        body[n++] = (char)('0' + g_pointer_speed_pref);
+        char d[2] = { (char)('0' + g_pointer_speed_pref), 0 };
+        system_settings_append(body, &n, cap, d);
     }
-    body[n++] = '\n';
-    body[n++] = 'h'; body[n++] = 'i'; body[n++] = 'd'; body[n++] = 'e';
-    body[n++] = '_'; body[n++] = 's'; body[n++] = 'h'; body[n++] = 'e';
-    body[n++] = 'l'; body[n++] = 'l'; body[n++] = '=';
-    body[n++] = g_hide_shell_pref ? '1' : '0';
-    body[n++] = '\n';
-    body[n++] = 'c'; body[n++] = 'l'; body[n++] = 'o'; body[n++] = 'c';
-    body[n++] = 'k'; body[n++] = '=';
+    system_settings_append(body, &n, cap, "\nhide_shell=");
+    system_settings_append(body, &n, cap, g_hide_shell_pref ? "1" : "0");
+    system_settings_append(body, &n, cap, "\ntile_wm=");
+    system_settings_append(body, &n, cap, g_tile_wm_pref ? "1" : "0");
+    system_settings_append(body, &n, cap, "\nshift_click=");
+    system_settings_append(body, &n, cap, g_shift_click_pref ? "1" : "0");
+    system_settings_append(body, &n, cap, "\nappearance=");
     {
-        char tmp[20];
-        int i;
-        softclock_format(tmp, (int)sizeof(tmp));
-        /* extend with :SS */
-        for (i = 0; tmp[i] && n + 1 < (int)sizeof(body); i++)
-            body[n++] = tmp[i];
-        body[n++] = ':';
-        body[n++] = (char)('0' + (clk.second / 10));
-        body[n++] = (char)('0' + (clk.second % 10));
+        char d[2] = { (char)('0' + (g_appearance_pref % 10)), 0 };
+        system_settings_append(body, &n, cap, d);
     }
-    body[n++] = '\n';
+    system_settings_append(body, &n, cap, "\nclock=");
+    {
+        char tmp[24];
+        softclock_format(tmp, (int)sizeof(tmp));
+        system_settings_append(body, &n, cap, tmp);
+        if (n + 3 < cap) {
+            body[n++] = ':';
+            body[n++] = (char)('0' + (clk.second / 10));
+            body[n++] = (char)('0' + (clk.second % 10));
+        }
+    }
+    system_settings_append(body, &n, cap, "\n");
     body[n] = '\0';
 
     prev = fs_get_cwd_dir();
-    (void)fs_create_dir("Config");
-    if (fs_change_dir("/") == 0 && fs_change_dir("Config") == 0) {
-        (void)fs_write("settings.cfg", (const uint8_t*)body, (size_t)n);
-        while (fs_cd_up() == 0) { }
+    root = NULL;
+    if (fs_change_dir("/") == 0)
+        root = fs_get_cwd_dir();
+    if (root) {
+        (void)fs_dir_create_dir(root, "Config");
+        cfg = fs_dir_find_child(root, "Config");
+        if (cfg && fs_dir_write(cfg, "settings.cfg", (const uint8_t*)body, (size_t)n) == 0) {
+            ok = 1;
+            (void)fs_sync();
+        }
     }
     if (prev) fs_set_current_dir(prev);
+    if (!ok && fs_is_persistent())
+        vdesk_notify("Settings", "Save failed — check Config/");
+}
+
+void vdesk_prefs_persist(void) {
+    system_settings_try_save(NULL);
 }
 
 static void system_settings_load(void) {
     FileHandle* fh;
-    char buf[160];
+    char buf[256];
     size_t n = 0, got;
     Directory* prev = fs_get_cwd_dir();
+    Directory* root;
+    Directory* cfg;
 
-    if (fs_change_dir("/") != 0) return;
-    if (fs_change_dir("Config") != 0) {
+    if (fs_change_dir("/") != 0) {
         if (prev) fs_set_current_dir(prev);
-        else while (fs_cd_up() == 0) { }
         return;
     }
-    fh = fs_open("settings.cfg");
+    root = fs_get_cwd_dir();
+    cfg = root ? fs_dir_find_child(root, "Config") : NULL;
+    if (!cfg) {
+        if (prev) fs_set_current_dir(prev);
+        return;
+    }
+    fh = fs_dir_open(cfg, "settings.cfg");
     if (!fh) {
-        while (fs_cd_up() == 0) { }
         if (prev) fs_set_current_dir(prev);
         return;
     }
@@ -926,7 +1143,6 @@ static void system_settings_load(void) {
         n += got;
     fs_close(fh);
     buf[n] = '\0';
-    while (fs_cd_up() == 0) { }
     if (prev) fs_set_current_dir(prev);
 
     {
@@ -938,8 +1154,15 @@ static void system_settings_load(void) {
                 if (v >= 1 && v <= 10) g_pointer_speed_pref = v;
             } else if (strncmp(p, "hide_shell=", 11) == 0) {
                 g_hide_shell_pref = (p[11] == '1') ? 1 : 0;
+            } else if (strncmp(p, "tile_wm=", 8) == 0) {
+                g_tile_wm_pref = (p[8] == '0') ? 0 : 1;
+            } else if (strncmp(p, "shift_click=", 12) == 0) {
+                g_shift_click_pref = (p[12] == '0') ? 0 : 1;
+            } else if (strncmp(p, "appearance=", 11) == 0) {
+                int v = cfg_parse_int(p + 11);
+                if (v >= 0 && v < VDESK_APPEARANCE_COUNT)
+                    g_appearance_pref = v;
             } else if (strncmp(p, "clock=", 6) == 0) {
-                /* YYYY-MM-DD HH:MM:SS */
                 const char* c = p + 6;
                 softclock_t clk;
                 int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
@@ -961,6 +1184,9 @@ static void system_settings_load(void) {
             if (*p == '\n') p++;
         }
     }
+    vdesk_set_tile_wm(g_tile_wm_pref);
+    vdesk_set_shift_click_rmb(g_shift_click_pref);
+    vdesk_set_appearance(g_appearance_pref);
 }
 
 static void system_settings_render(VWindow* win, int cx, int cy, int cw, int ch) {
@@ -1003,6 +1229,13 @@ static void system_settings_render(VWindow* win, int cx, int cy, int cw, int ch)
         draw_button(content_x, row, 120, SETTINGS_BTN_H,
                     (app && app->hide_shell) ? "Enabled" : "Disabled",
                     app && app->hide_shell);
+        row += 28;
+        vdesk_draw_text(content_x, row, "Tile windows when opening apps:",
+                        theme->text, theme->client_bg);
+        row += 22;
+        draw_button(content_x, row, 120, SETTINGS_BTN_H,
+                    (app && app->tile_wm) ? "Enabled" : "Disabled",
+                    app && app->tile_wm);
         row += 34;
         vdesk_draw_text(content_x, row, "Date / time:", theme->text, theme->client_bg);
         vdesk_draw_text(content_x + 104, row, cbuf, theme->accent, theme->client_bg);
@@ -1033,6 +1266,9 @@ static void system_settings_render(VWindow* win, int cx, int cy, int cw, int ch)
         row += 30;
         draw_button(content_x, row, SETTINGS_BTN_W, SETTINGS_BTN_H, "Shell Input", 0);
         row += 28;
+        vdesk_draw_text(content_x, row, "Look is saved to Config/settings.cfg",
+                        theme->text_muted, theme->client_bg);
+        row += 16;
         vdesk_draw_text(content_x, row, "F2 / F9 cycle look. F6/F7 shell colors.",
                         theme->text_muted, theme->client_bg);
     } else if (tab == 2) {
@@ -1058,6 +1294,16 @@ static void system_settings_render(VWindow* win, int cx, int cy, int cw, int ch)
         draw_button(content_x + 84, row - 2, 36, SETTINGS_BTN_H, "+", 0);
         row += 28;
         vdesk_draw_text(content_x, row, "Scaling stub — preference saved when writable.",
+                        theme->text_muted, theme->client_bg);
+        row += 24;
+        vdesk_draw_text(content_x, row, "Shift+click = right-click:",
+                        theme->text, theme->client_bg);
+        row += 22;
+        draw_button(content_x, row, 120, SETTINGS_BTN_H,
+                    (app && app->shift_click) ? "Enabled" : "Disabled",
+                    app && app->shift_click);
+        row += 28;
+        vdesk_draw_text(content_x, row, "Useful when a mouse has no right button.",
                         theme->text_muted, theme->client_bg);
     } else if (tab == 3) {
         vdesk_draw_text(content_x, row, "Input", theme->text, theme->client_bg);
@@ -1146,6 +1392,12 @@ static void system_settings_click(VWindow* win, int lx, int ly) {
             system_settings_try_save(app);
             return;
         }
+        row += 28 + 22;
+        if (IN_RECT(lx, ly, content_x, row, 120, SETTINGS_BTN_H)) {
+            app->tile_wm = !app->tile_wm;
+            system_settings_try_save(app);
+            return;
+        }
         row += 34 + 22;
         softclock_get(&clk);
         if (IN_RECT(lx, ly, content_x, row, 36, SETTINGS_BTN_H)) {
@@ -1175,9 +1427,10 @@ static void system_settings_click(VWindow* win, int lx, int ly) {
         }
     } else if (app->tab == 1) {
         int row = 12 + 22 + 24;
-        if (IN_RECT(lx, ly, content_x, row, SETTINGS_BTN_W, SETTINGS_BTN_H))
+        if (IN_RECT(lx, ly, content_x, row, SETTINGS_BTN_W, SETTINGS_BTN_H)) {
             vdesk_toggle_theme();
-        else if (IN_RECT(lx, ly, content_x, row + 30, SETTINGS_BTN_W, SETTINGS_BTN_H))
+            system_settings_try_save(app);
+        } else if (IN_RECT(lx, ly, content_x, row + 30, SETTINGS_BTN_W, SETTINGS_BTN_H))
             vdesk_cycle_shell_output_color();
         else if (IN_RECT(lx, ly, content_x, row + 60, SETTINGS_BTN_W, SETTINGS_BTN_H))
             vdesk_cycle_shell_input_color();
@@ -1193,6 +1446,12 @@ static void system_settings_click(VWindow* win, int lx, int ly) {
                 app->pointer_speed++;
                 system_settings_try_save(app);
             }
+        }
+        /* After speed row (+28) and hint (+24) comes shift_click label (+22) then button */
+        row += 28 + 24 + 22;
+        if (IN_RECT(lx, ly, content_x, row, 120, SETTINGS_BTN_H)) {
+            app->shift_click = !app->shift_click;
+            system_settings_try_save(app);
         }
     }
 }
@@ -1215,6 +1474,10 @@ typedef struct {
     int hist_count;
     int last_click_index;
     uint32_t last_click_tick;
+    /* file drag from list */
+    int press_index;
+    int press_x, press_y;
+    int press_active;
 } ExplorerApp;
 
 static int explorer_cwd_is_desktop(void) {
@@ -1242,7 +1505,7 @@ static void explorer_create_folder(ExplorerApp* app) {
     char num[12];
     Directory* dir = fs_get_cwd_dir();
     if (!dir || !app) return;
-    strcpy(name, "NewFolder");
+    strcpy(name, "Folder");
     itoa(app->folder_seq++, num, 10);
     strcat(name, num);
     explorer_after_create(fs_dir_create_dir(dir, name) == 0,
@@ -1254,7 +1517,7 @@ static void explorer_create_text(ExplorerApp* app) {
     char num[12];
     Directory* dir = fs_get_cwd_dir();
     if (!dir || !app) return;
-    strcpy(name, "NewFile");
+    strcpy(name, "File");
     itoa(app->file_seq++, num, 10);
     strcat(name, num);
     strcat(name, ".txt");
@@ -1270,7 +1533,7 @@ static void explorer_create_bitmap(ExplorerApp* app) {
     int i;
     if (!dir || !app) return;
     for (i = 0; i < 32 * 32; i++) pixels[i] = 0;
-    strcpy(name, "Artwork");
+    strcpy(name, "Art");
     itoa(app->bitmap_seq++, num, 10);
     strcat(name, num);
     strcat(name, ".gbm");
@@ -1329,6 +1592,26 @@ static void explorer_goto_root(ExplorerApp* app) {
     app->scroll = 0;
 }
 
+static void explorer_goto_dos(ExplorerApp* app) {
+    Directory* root = fs_get_cwd_dir();
+    Directory* dos;
+    while (root && root->parent) root = root->parent;
+    if (!root) {
+        vdesk_set_status("root not found");
+        return;
+    }
+    dos = fs_dir_find_child(root, "Dos");
+    if (!dos) {
+        dos_seed_share();
+        dos = fs_dir_find_child(root, "Dos");
+    }
+    if (!dos) {
+        vdesk_set_status("Dos folder not found");
+        return;
+    }
+    explorer_goto_dir(app, dos);
+}
+
 static void explorer_goto_docs(ExplorerApp* app) {
     Directory* before;
     if (!app) return;
@@ -1358,13 +1641,14 @@ static void explorer_open_selected(ExplorerApp* app) {
         if (file_idx >= 0 && file_idx < (int)dir->file_count) {
             const char* name = dir->files[file_idx].name;
             Directory* cwd = fs_get_cwd_dir();
-            if (has_suffix(name, ".txt")) {
+            if (str_has_suffix_ci(name, ".txt") || str_has_suffix_ci(name, ".cfg")) {
                 open_editor_file(name, cwd);
-            } else if (has_suffix(name, ".gbm")) {
+            } else if (str_has_suffix_ci(name, ".gbm") ||
+                       str_has_suffix_ci(name, ".bmp")) {
                 open_paint_file(name, cwd);
-            } else if (has_suffix(name, ".gc")) {
+            } else if (str_has_suffix_ci(name, ".gc")) {
                 open_ide_file(name, cwd);
-            } else if (has_suffix(name, ".gob")) {
+            } else if (str_has_suffix_ci(name, ".gob")) {
                 Directory* prev = fs_get_cwd_dir();
                 if (cwd) fs_set_current_dir(cwd);
                 if (gob_exec(name) != 0)
@@ -1372,6 +1656,23 @@ static void explorer_open_selected(ExplorerApp* app) {
                 else
                     vdesk_notify("GooberC", "Finished running .gob");
                 if (prev) fs_set_current_dir(prev);
+            } else if (str_has_suffix_ci(name, ".com") ||
+                       str_has_suffix_ci(name, ".exe")) {
+                char path[96];
+                const char* cwd_name = fs_get_cwd();
+                size_t pi = 0, j = 0;
+                if (cwd_name) {
+                    while (cwd_name[j] == '/') j++;
+                    while (cwd_name[j] && pi + 1 < sizeof(path))
+                        path[pi++] = cwd_name[j++];
+                    if (pi && path[pi - 1] != '/' && pi + 1 < sizeof(path))
+                        path[pi++] = '/';
+                }
+                j = 0;
+                while (name[j] && pi + 1 < sizeof(path)) path[pi++] = name[j++];
+                path[pi] = '\0';
+                if (dos_exec(path) != 0)
+                    vdesk_notify("GooberDOS", "Failed to run DOS app");
             } else {
                 vdesk_notify("File Explorer", "No app for this file type");
             }
@@ -1415,6 +1716,8 @@ static void explorer_render(VWindow* win, int cx, int cy, int cw, int ch) {
         draw_button(cx + 6, sy, side_w - 12, 22, "Desktop", 0);
         sy += 26;
         draw_button(cx + 6, sy, side_w - 12, 22, "docs", 0);
+        sy += 26;
+        draw_button(cx + 6, sy, side_w - 12, 22, "Dos", 0);
     }
 
     /* Toolbar: Back / Up + path */
@@ -1519,6 +1822,11 @@ static void explorer_click(VWindow* win, int client_x, int client_y) {
             explorer_goto_docs(app);
             return;
         }
+        sy += 26;
+        if (IN_RECT(client_x, client_y, 6, sy, side_w - 12, 22)) {
+            explorer_goto_dos(app);
+            return;
+        }
         return;
     }
 
@@ -1541,14 +1849,91 @@ static void explorer_click(VWindow* win, int client_x, int client_y) {
         int row = (client_y - list_top) / EXPLORER_ROW_H;
         int index = scroll + row;
         int total = (int)(dir->child_count + dir->file_count);
+        int mx, my, buttons;
         if (row >= 0 && row < max_rows && index >= 0 && index < total) {
             int dbl = (index == app->last_click_index &&
                        (int32_t)(now - app->last_click_tick) <= EXPLORER_DBLCLICK_TICKS);
             app->selected = index;
             app->last_click_index = index;
             app->last_click_tick = now;
-            if (dbl) explorer_open_selected(app);
+            vdesk_get_pointer(&mx, &my, &buttons);
+            app->press_index = index;
+            app->press_x = mx;
+            app->press_y = my;
+            app->press_active = 1;
+            if (dbl) {
+                app->press_active = 0;
+                explorer_open_selected(app);
+            }
         }
+    }
+}
+
+static void explorer_tick(VWindow* win) {
+    ExplorerApp* app = (ExplorerApp*)win->user_data;
+    const Directory* dir = fs_get_current_dir();
+    int mx, my, buttons;
+    int file_idx;
+    int child_idx;
+    if (!app || !dir || !app->press_active) return;
+    vdesk_get_pointer(&mx, &my, &buttons);
+    if (!(buttons & 1)) {
+        app->press_active = 0;
+        return;
+    }
+    if (ABS(mx - app->press_x) < 6 && ABS(my - app->press_y) < 6)
+        return;
+    child_idx = app->press_index;
+    if (child_idx >= 0 && child_idx < (int)dir->child_count) {
+        if (!vdesk_file_drag_active())
+            vdesk_file_drag_begin_ex(fs_get_cwd_dir(),
+                                     dir->children[child_idx].name, 1);
+        app->press_active = 0;
+        return;
+    }
+    file_idx = app->press_index - (int)dir->child_count;
+    if (file_idx < 0 || file_idx >= (int)dir->file_count) {
+        app->press_active = 0;
+        return;
+    }
+    if (!vdesk_file_drag_active())
+        vdesk_file_drag_begin_ex(fs_get_cwd_dir(), dir->files[file_idx].name, 0);
+    app->press_active = 0;
+}
+
+static void explorer_rclick(VWindow* win, int client_x, int client_y) {
+    ExplorerApp* app = (ExplorerApp*)win->user_data;
+    const Directory* dir = fs_get_current_dir();
+    const int cw = client_width(win);
+    const int ch = win->height - TITLEBAR_HEIGHT - BORDER_SIZE * 2;
+    const int side_w = (cw > EXPLORER_SIDEBAR_W + 160) ? EXPLORER_SIDEBAR_W : 0;
+    const int list_x = side_w + (side_w ? 4 : 0);
+    const int list_top = EXPLORER_TOOLBAR_H + 4;
+    const int list_bottom = ch - EXPLORER_STATUS_H - 4;
+    int max_rows = (list_bottom - list_top) / EXPLORER_ROW_H;
+    int scroll = app ? app->scroll : 0;
+    int mx, my, buttons;
+    if (!app || !dir) return;
+    if (max_rows < 1) max_rows = 1;
+    vdesk_get_pointer(&mx, &my, &buttons);
+    if (client_x >= list_x && client_y >= list_top && client_y < list_bottom) {
+        int row = (client_y - list_top) / EXPLORER_ROW_H;
+        int index = scroll + row;
+        int total = (int)(dir->child_count + dir->file_count);
+        if (row >= 0 && row < max_rows && index >= 0 && index < total) {
+            app->selected = index;
+            if (index < (int)dir->child_count) {
+                vdesk_open_fs_context(fs_get_cwd_dir(),
+                                      dir->children[index].name, 1, mx, my);
+            } else {
+                int fi = index - (int)dir->child_count;
+                vdesk_open_fs_context(fs_get_cwd_dir(),
+                                      dir->files[fi].name, 0, mx, my);
+            }
+            return;
+        }
+        /* Empty list area — paste if clipboard has something */
+        vdesk_clipboard_paste_into(fs_get_cwd_dir());
     }
 }
 
@@ -1576,44 +1961,57 @@ static void editor_render(VWindow* win, int cx, int cy, int cw, int ch) {
 
     vdesk_draw_rect(cx, cy, cw, ch, VCOLOR_WHITE);
 
-    int text_row = 0;
-    int text_col = 0;
-    for (int i = 0; i <= ed->len; i++) {
-        int display_row = text_row - ed->scroll_row;
-        if (i == ed->cursor && display_row >= 0 && display_row < rows) {
+    {
+        int text_row = 0;
+        int text_col = 0;
+        int caret_row = -1, caret_col = 0;
+        int i;
+        /* Pass 1: glyphs (caret drawn after so it is not covered) */
+        for (i = 0; i <= ed->len; i++) {
+            if (i == ed->cursor) {
+                caret_row = text_row - ed->scroll_row;
+                caret_col = text_col;
+            }
+            if (i == ed->len) break;
+            if (ed->text[i] == '\n') {
+                text_row++;
+                text_col = 0;
+                continue;
+            }
+            if (text_col >= cols) {
+                text_row++;
+                text_col = 0;
+            }
+            {
+                int display_row = text_row - ed->scroll_row;
+                if (display_row >= 0 && display_row < rows && text_col < cols) {
+                    char buf[2] = { ed->text[i], '\0' };
+                    vdesk_draw_text(cx + 2 + text_col * char_w,
+                                   cy + display_row * char_h, buf,
+                                   VCOLOR_BLACK, VCOLOR_WHITE);
+                }
+            }
+            text_col++;
+        }
+        /* Pass 2: caret on top */
+        if (caret_row >= 0 && caret_row < rows) {
             char buf[2] = { '_', '\0' };
-            vdesk_draw_text(cx + 2 + text_col * char_w,
-                           cy + display_row * char_h, buf,
-                           VCOLOR_BLACK, VCOLOR_CYAN);
+            vdesk_draw_rect(cx + 2 + caret_col * char_w, cy + caret_row * char_h,
+                            char_w, char_h, VCOLOR_CYAN);
+            vdesk_draw_text(cx + 2 + caret_col * char_w, cy + caret_row * char_h, buf,
+                            VCOLOR_BLACK, VCOLOR_CYAN);
         }
-        if (i == ed->len) break;
-
-        char ch = ed->text[i];
-        if (ch == '\n') {
-            text_row++;
-            text_col = 0;
-            continue;
-        }
-        if (text_col >= cols) {
-            text_row++;
-            text_col = 0;
-        }
-        if (display_row >= 0 && display_row < rows && text_col < cols) {
-            char buf[2] = { ch, '\0' };
-            vdesk_draw_text(cx + 2 + text_col * char_w,
-                           cy + display_row * char_h, buf,
-                           VCOLOR_BLACK, VCOLOR_WHITE);
-        }
-        text_col++;
     }
 
-    char status[32];
-    itoa(ed->len, status, 10);
-    vdesk_draw_text(cx + 2, cy + ch - char_h, "Chars: ", VCOLOR_BLACK, VCOLOR_GRAY);
-    vdesk_draw_text(cx + 56, cy + ch - char_h, status, VCOLOR_BLACK, VCOLOR_GRAY);
-    vdesk_draw_text(cx + 112, cy + ch - char_h, "F2=save", VCOLOR_BLACK, VCOLOR_GRAY);
-    if (ed->saved)
-        vdesk_draw_text(cx + 184, cy + ch - char_h, "saved", VCOLOR_BLACK, VCOLOR_GRAY);
+    {
+        char status[32];
+        itoa(ed->len, status, 10);
+        vdesk_draw_text(cx + 2, cy + ch - char_h, "Chars: ", VCOLOR_BLACK, VCOLOR_GRAY);
+        vdesk_draw_text(cx + 56, cy + ch - char_h, status, VCOLOR_BLACK, VCOLOR_GRAY);
+        vdesk_draw_text(cx + 112, cy + ch - char_h, "F2=save", VCOLOR_BLACK, VCOLOR_GRAY);
+        if (ed->saved)
+            vdesk_draw_text(cx + 184, cy + ch - char_h, "saved", VCOLOR_BLACK, VCOLOR_GRAY);
+    }
 }
 
 static void editor_key(VWindow* win, char key) {
@@ -1685,9 +2083,19 @@ static void editor_click(VWindow* win, int lx, int ly) {
                                   ed->scroll_row, cell_row, cell_col);
 }
 
-/* ---- Paint app ---- */
-#define PAINT_W 32
-#define PAINT_H 32
+/* ---- Paint app (Win95-lite) ---- */
+#define PAINT_W        160
+#define PAINT_H        120
+#define PAINT_SCALE    2
+#define PAINT_TOOLS_W  72
+#define PAINT_PAL_N    16
+#define PAINT_TOOL_PENCIL 0
+#define PAINT_TOOL_ERASER 1
+#define PAINT_TOOL_FILL   2
+#define PAINT_TOOL_LINE   3
+#define PAINT_TOOL_RECT   4
+#define PAINT_TOOL_PICK   5
+
 typedef struct {
     char filename[32];
     Directory* dir;
@@ -1695,39 +2103,419 @@ typedef struct {
     int cursor_x;
     int cursor_y;
     int color;
+    int tool;
     int saved;
+    int drawing;
+    int x0, y0, x1, y1;
+    int last_px, last_py;
 } PaintApp;
 
+static const uint32_t paint_colors[PAINT_PAL_N] = {
+    0x000000, 0xFFFFFF, 0x808080, 0xC0C0C0,
+    0xE53935, 0x43A047, 0x1E88E5, 0xFDD835,
+    0x8E24AA, 0xFB8C00, 0x00ACC1, 0x8D6E63,
+    0xAD1457, 0x558B2F, 0x1565C0, 0xF9A825
+};
+
 static uint32_t paint_palette(int c) {
-    static const uint32_t colors[] = {
-        0x000000, 0xFFFFFF, 0xE53935, 0x43A047,
-        0x1E88E5, 0xFDD835, 0x8E24AA, 0xFB8C00
-    };
-    return colors[c & 7];
+    return paint_colors[c & (PAINT_PAL_N - 1)];
+}
+
+static void paint_put_u16(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void paint_put_u32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static uint16_t paint_get_u16(const uint8_t* p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t paint_get_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int paint_nearest_color(uint32_t rgb) {
+    int best = 0;
+    int best_d = 0x7FFFFFFF;
+    int r = (int)((rgb >> 16) & 0xFF);
+    int g = (int)((rgb >> 8) & 0xFF);
+    int b = (int)(rgb & 0xFF);
+    int i;
+    for (i = 0; i < PAINT_PAL_N; i++) {
+        int pr = (int)((paint_colors[i] >> 16) & 0xFF);
+        int pg = (int)((paint_colors[i] >> 8) & 0xFF);
+        int pb = (int)(paint_colors[i] & 0xFF);
+        int dr = r - pr, dg = g - pg, db = b - pb;
+        int d = dr * dr + dg * dg + db * db;
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void paint_clear(PaintApp* app, uint8_t c) {
+    int i;
+    for (i = 0; i < PAINT_W * PAINT_H; i++)
+        app->pixels[i] = c;
+}
+
+static void paint_plot(PaintApp* app, int x, int y, uint8_t c) {
+    if (x < 0 || y < 0 || x >= PAINT_W || y >= PAINT_H) return;
+    app->pixels[y * PAINT_W + x] = c;
+}
+
+static void paint_line(PaintApp* app, int x0, int y0, int x1, int y1, uint8_t c) {
+    int dx = ABS(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -ABS(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        paint_plot(app, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        {
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    }
+}
+
+static void paint_rect_outline(PaintApp* app, int x0, int y0, int x1, int y1, uint8_t c) {
+    paint_line(app, x0, y0, x1, y0, c);
+    paint_line(app, x0, y1, x1, y1, c);
+    paint_line(app, x0, y0, x0, y1, c);
+    paint_line(app, x1, y0, x1, y1, c);
+}
+
+static void paint_flood(PaintApp* app, int sx, int sy, uint8_t nc) {
+    uint8_t oc;
+    int* stack;
+    int sp = 0;
+    if (sx < 0 || sy < 0 || sx >= PAINT_W || sy >= PAINT_H) return;
+    oc = app->pixels[sy * PAINT_W + sx];
+    if (oc == nc) return;
+    stack = (int*)kmalloc((size_t)(PAINT_W * PAINT_H) * sizeof(int));
+    if (!stack) return;
+    stack[sp++] = sy * PAINT_W + sx;
+    while (sp > 0) {
+        int i = stack[--sp];
+        int x, y;
+        if (app->pixels[i] != oc) continue;
+        app->pixels[i] = nc;
+        x = i % PAINT_W;
+        y = i / PAINT_W;
+        if (x > 0) stack[sp++] = i - 1;
+        if (x + 1 < PAINT_W) stack[sp++] = i + 1;
+        if (y > 0) stack[sp++] = i - PAINT_W;
+        if (y + 1 < PAINT_H) stack[sp++] = i + PAINT_W;
+    }
+    kfree(stack);
+}
+
+static int paint_save_bmp(PaintApp* app) {
+    Directory* dir;
+    int stride = (PAINT_W + 3) & ~3;
+    int pal_bytes = PAINT_PAL_N * 4;
+    int off = 14 + 40 + pal_bytes;
+    int file_size = off + stride * PAINT_H;
+    uint8_t* buf;
+    int y, i;
+    char name[32];
+    if (!app) return -1;
+    dir = app->dir ? app->dir : fs_get_cwd_dir();
+    if (!dir) return -1;
+    strncpy(name, app->filename[0] ? app->filename : "Artwork.bmp", sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+    if (!str_has_suffix_ci(name, ".bmp")) {
+        int n = (int)strlen(name);
+        while (n > 0 && name[n - 1] != '.') n--;
+        if (n <= 0) n = (int)strlen(name);
+        else n--;
+        if (n > (int)sizeof(name) - 5) n = (int)sizeof(name) - 5;
+        name[n] = '\0';
+        strcat(name, ".bmp");
+        strncpy(app->filename, name, sizeof(app->filename) - 1);
+    }
+    buf = (uint8_t*)kmalloc((size_t)file_size);
+    if (!buf) return -1;
+    memset(buf, 0, (size_t)file_size);
+    buf[0] = 'B'; buf[1] = 'M';
+    paint_put_u32(buf + 2, (uint32_t)file_size);
+    paint_put_u32(buf + 10, (uint32_t)off);
+    paint_put_u32(buf + 14, 40);
+    paint_put_u32(buf + 18, (uint32_t)PAINT_W);
+    paint_put_u32(buf + 22, (uint32_t)PAINT_H);
+    paint_put_u16(buf + 26, 1);
+    paint_put_u16(buf + 28, 8);
+    paint_put_u32(buf + 30, 0);
+    paint_put_u32(buf + 34, (uint32_t)(stride * PAINT_H));
+    paint_put_u32(buf + 46, (uint32_t)PAINT_PAL_N);
+    paint_put_u32(buf + 50, (uint32_t)PAINT_PAL_N);
+    for (i = 0; i < PAINT_PAL_N; i++) {
+        uint32_t rgb = paint_colors[i];
+        buf[54 + i * 4 + 0] = (uint8_t)(rgb & 0xFF);
+        buf[54 + i * 4 + 1] = (uint8_t)((rgb >> 8) & 0xFF);
+        buf[54 + i * 4 + 2] = (uint8_t)((rgb >> 16) & 0xFF);
+        buf[54 + i * 4 + 3] = 0;
+    }
+    for (y = 0; y < PAINT_H; y++) {
+        uint8_t* row = buf + off + (PAINT_H - 1 - y) * stride;
+        for (i = 0; i < PAINT_W; i++)
+            row[i] = app->pixels[y * PAINT_W + i] & (PAINT_PAL_N - 1);
+    }
+    i = fs_dir_write(dir, name, buf, (size_t)file_size);
+    kfree(buf);
+    return i;
+}
+
+static int paint_load_bmp(PaintApp* app, const uint8_t* data, size_t size) {
+    uint32_t off, dib, width, height;
+    uint16_t bpp;
+    uint32_t compression;
+    int w, h, stride, y, x, top_down;
+    const uint8_t* pixels;
+    if (!app || !data || size < 54) return -1;
+    if (data[0] != 'B' || data[1] != 'M') return -1;
+    off = paint_get_u32(data + 10);
+    dib = paint_get_u32(data + 14);
+    if (dib < 40 || off >= size) return -1;
+    width = paint_get_u32(data + 18);
+    height = paint_get_u32(data + 22);
+    bpp = paint_get_u16(data + 28);
+    compression = paint_get_u32(data + 30);
+    if (compression != 0) return -1;
+    top_down = 0;
+    if ((int32_t)height < 0) {
+        height = (uint32_t)(-(int32_t)height);
+        top_down = 1;
+    }
+    if (width == 0 || height == 0 || width > 1024 || height > 1024) return -1;
+    w = (int)width;
+    h = (int)height;
+    if (bpp == 8)
+        stride = (w + 3) & ~3;
+    else if (bpp == 24)
+        stride = (w * 3 + 3) & ~3;
+    else
+        return -1;
+    if (off + (size_t)stride * (size_t)h > size) return -1;
+    pixels = data + off;
+    paint_clear(app, 1);
+    for (y = 0; y < PAINT_H && y < h; y++) {
+        int src_y = top_down ? y : (h - 1 - y);
+        const uint8_t* row = pixels + src_y * stride;
+        for (x = 0; x < PAINT_W && x < w; x++) {
+            uint8_t idx;
+            if (bpp == 8) {
+                idx = (uint8_t)(row[x] & (PAINT_PAL_N - 1));
+            } else {
+                uint32_t rgb = ((uint32_t)row[x * 3 + 2] << 16) |
+                               ((uint32_t)row[x * 3 + 1] << 8) |
+                               (uint32_t)row[x * 3 + 0];
+                idx = (uint8_t)paint_nearest_color(rgb);
+            }
+            app->pixels[y * PAINT_W + x] = idx;
+        }
+    }
+    return 0;
+}
+
+static void paint_load_file(PaintApp* app, const char* filename) {
+    FileHandle* fh;
+    uint8_t* buf;
+    size_t n;
+    if (!app) return;
+    paint_clear(app, 1);
+    if (!filename || !filename[0]) return;
+    fh = fs_dir_open(app->dir, filename);
+    if (!fh) return;
+    buf = (uint8_t*)kmalloc(65536);
+    if (!buf) {
+        /* Fallback: small GBM-sized read into a temp */
+        uint8_t small[32 * 32];
+        n = fs_read(fh, small, sizeof(small));
+        fs_close(fh);
+        if (n == sizeof(small)) {
+            int y, x;
+            for (y = 0; y < 32 && y < PAINT_H; y++)
+                for (x = 0; x < 32 && x < PAINT_W; x++)
+                    app->pixels[y * PAINT_W + x] = small[y * 32 + x] & 7;
+        }
+        return;
+    }
+    n = fs_read(fh, buf, 65536);
+    fs_close(fh);
+    if (n >= 54 && buf[0] == 'B' && buf[1] == 'M') {
+        paint_load_bmp(app, buf, n);
+    } else if (n == 32 * 32) {
+        int y, x;
+        for (y = 0; y < 32 && y < PAINT_H; y++)
+            for (x = 0; x < 32 && x < PAINT_W; x++)
+                app->pixels[y * PAINT_W + x] = buf[y * 32 + x] & 7;
+    } else if (n == (size_t)(PAINT_W * PAINT_H)) {
+        size_t i;
+        for (i = 0; i < n; i++)
+            app->pixels[i] = buf[i] & (PAINT_PAL_N - 1);
+    }
+    kfree(buf);
+}
+
+static void paint_canvas_origin(int cx, int cy, int* ox, int* oy) {
+    *ox = cx + PAINT_TOOLS_W + 8;
+    *oy = cy + 28;
+}
+
+static int paint_client_to_pixel(int cx, int cy, int lx, int ly, int* px, int* py) {
+    int ox, oy;
+    paint_canvas_origin(cx, cy, &ox, &oy);
+    if (lx < ox || ly < oy) return 0;
+    *px = (lx - ox) / PAINT_SCALE;
+    *py = (ly - oy) / PAINT_SCALE;
+    if (*px < 0 || *py < 0 || *px >= PAINT_W || *py >= PAINT_H) return 0;
+    return 1;
+}
+
+static void paint_apply_at(PaintApp* app, int px, int py) {
+    uint8_t c;
+    if (!app) return;
+    c = (uint8_t)(app->color & (PAINT_PAL_N - 1));
+    if (app->tool == PAINT_TOOL_PENCIL) {
+        paint_plot(app, px, py, c);
+        if (app->last_px >= 0)
+            paint_line(app, app->last_px, app->last_py, px, py, c);
+        app->last_px = px;
+        app->last_py = py;
+        app->saved = 0;
+    } else if (app->tool == PAINT_TOOL_ERASER) {
+        paint_plot(app, px, py, 1);
+        if (app->last_px >= 0)
+            paint_line(app, app->last_px, app->last_py, px, py, 1);
+        app->last_px = px;
+        app->last_py = py;
+        app->saved = 0;
+    } else if (app->tool == PAINT_TOOL_FILL) {
+        paint_flood(app, px, py, c);
+        app->saved = 0;
+    } else if (app->tool == PAINT_TOOL_PICK) {
+        app->color = app->pixels[py * PAINT_W + px] & (PAINT_PAL_N - 1);
+    } else if (app->tool == PAINT_TOOL_LINE || app->tool == PAINT_TOOL_RECT) {
+        app->x1 = px;
+        app->y1 = py;
+    }
+}
+
+static void paint_commit_shape(PaintApp* app) {
+    uint8_t c;
+    if (!app || !app->drawing) return;
+    c = (uint8_t)(app->color & (PAINT_PAL_N - 1));
+    if (app->tool == PAINT_TOOL_LINE)
+        paint_line(app, app->x0, app->y0, app->x1, app->y1, c);
+    else if (app->tool == PAINT_TOOL_RECT)
+        paint_rect_outline(app, app->x0, app->y0, app->x1, app->y1, c);
+    app->saved = 0;
 }
 
 static void paint_render(VWindow* win, int cx, int cy, int cw, int ch) {
     PaintApp* app = (PaintApp*)win->user_data;
+    const VTheme* theme;
+    int ox, oy, x, y, i;
+    static const char* tool_names[] = {
+        "Pencil", "Eraser", "Fill", "Line", "Rect", "Picker"
+    };
     if (!app) return;
-    const VTheme* theme = vdesk_get_theme();
-    int scale = 6;
-    int ox = cx + 8;
-    int oy = cy + 8;
+    theme = vdesk_get_theme();
+    paint_canvas_origin(cx, cy, &ox, &oy);
     vdesk_draw_rect(cx, cy, cw, ch, theme->client_bg);
-    for (int y = 0; y < PAINT_H; y++) {
-        for (int x = 0; x < PAINT_W; x++)
-            vdesk_draw_rect(ox + x * scale, oy + y * scale, scale, scale,
-                            paint_palette(app->pixels[y * PAINT_W + x]));
+
+    draw_button(cx + 4, cy + 4, 64, 20, "Save", 0);
+    draw_button(cx + 4, cy + 28, 64, 20, "Save As", 0);
+    for (i = 0; i < 6; i++) {
+        int by = cy + 56 + i * 24;
+        draw_button(cx + 4, by, 64, 22, tool_names[i], app->tool == i);
     }
-    vdesk_draw_border(ox + app->cursor_x * scale, oy + app->cursor_y * scale,
-                      scale, scale, theme->accent, theme->border_dark);
-    vdesk_draw_text(cx + 210, cy + 8, "Goober Paint", theme->text, theme->client_bg);
-    vdesk_draw_text(cx + 210, cy + 28, "Arrows move", theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 210, cy + 44, "Space draws", theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 210, cy + 60, "1-8 color", theme->text_muted, theme->client_bg);
-    vdesk_draw_text(cx + 210, cy + 76, "F2 saves", theme->text_muted, theme->client_bg);
-    if (app->saved)
-        vdesk_draw_text(cx + 210, cy + 100, "saved", theme->accent, theme->client_bg);
+
+    vdesk_draw_rect(ox - 1, oy - 1, PAINT_W * PAINT_SCALE + 2,
+                    PAINT_H * PAINT_SCALE + 2, theme->border_dark);
+    for (y = 0; y < PAINT_H; y++) {
+        for (x = 0; x < PAINT_W; x++) {
+            vdesk_draw_rect(ox + x * PAINT_SCALE, oy + y * PAINT_SCALE,
+                            PAINT_SCALE, PAINT_SCALE,
+                            paint_palette(app->pixels[y * PAINT_W + x]));
+        }
+    }
+    if (app->drawing &&
+        (app->tool == PAINT_TOOL_LINE || app->tool == PAINT_TOOL_RECT)) {
+        uint32_t preview = paint_palette(app->color);
+        int x0 = app->x0, y0 = app->y0, x1 = app->x1, y1 = app->y1;
+        if (app->tool == PAINT_TOOL_LINE) {
+            int dx = ABS(x1 - x0), sx = x0 < x1 ? 1 : -1;
+            int dy = -ABS(y1 - y0), sy = y0 < y1 ? 1 : -1;
+            int err = dx + dy;
+            for (;;) {
+                if (x0 >= 0 && x0 < PAINT_W && y0 >= 0 && y0 < PAINT_H)
+                    vdesk_draw_rect(ox + x0 * PAINT_SCALE, oy + y0 * PAINT_SCALE,
+                                    PAINT_SCALE, PAINT_SCALE, preview);
+                if (x0 == x1 && y0 == y1) break;
+                {
+                    int e2 = 2 * err;
+                    if (e2 >= dy) { err += dy; x0 += sx; }
+                    if (e2 <= dx) { err += dx; y0 += sy; }
+                }
+            }
+        } else {
+            int ax = x0 < x1 ? x0 : x1;
+            int bx = x0 < x1 ? x1 : x0;
+            int ay = y0 < y1 ? y0 : y1;
+            int by = y0 < y1 ? y1 : y0;
+            for (x = ax; x <= bx; x++) {
+                if (x >= 0 && x < PAINT_W) {
+                    if (ay >= 0 && ay < PAINT_H)
+                        vdesk_draw_rect(ox + x * PAINT_SCALE, oy + ay * PAINT_SCALE,
+                                        PAINT_SCALE, PAINT_SCALE, preview);
+                    if (by >= 0 && by < PAINT_H)
+                        vdesk_draw_rect(ox + x * PAINT_SCALE, oy + by * PAINT_SCALE,
+                                        PAINT_SCALE, PAINT_SCALE, preview);
+                }
+            }
+            for (y = ay; y <= by; y++) {
+                if (y >= 0 && y < PAINT_H) {
+                    if (ax >= 0 && ax < PAINT_W)
+                        vdesk_draw_rect(ox + ax * PAINT_SCALE, oy + y * PAINT_SCALE,
+                                        PAINT_SCALE, PAINT_SCALE, preview);
+                    if (bx >= 0 && bx < PAINT_W)
+                        vdesk_draw_rect(ox + bx * PAINT_SCALE, oy + y * PAINT_SCALE,
+                                        PAINT_SCALE, PAINT_SCALE, preview);
+                }
+            }
+        }
+    }
+
+    vdesk_draw_border(ox + app->cursor_x * PAINT_SCALE,
+                      oy + app->cursor_y * PAINT_SCALE,
+                      PAINT_SCALE, PAINT_SCALE, theme->accent, theme->border_dark);
+
+    {
+        int pal_y = oy + PAINT_H * PAINT_SCALE + 10;
+        for (i = 0; i < PAINT_PAL_N; i++) {
+            int px = ox + i * 20;
+            vdesk_draw_rect(px, pal_y, 18, 18, paint_palette(i));
+            if (i == app->color)
+                vdesk_draw_border(px, pal_y, 18, 18, theme->accent, theme->border_dark);
+        }
+        vdesk_draw_text(ox, pal_y + 24, app->filename, theme->text_muted, theme->client_bg);
+        if (app->saved)
+            vdesk_draw_text(ox + 160, pal_y + 24, "saved", theme->accent, theme->client_bg);
+    }
+    (void)ch;
 }
 
 static void paint_key(VWindow* win, char key) {
@@ -1737,16 +2525,83 @@ static void paint_key(VWindow* win, char key) {
     else if ((unsigned char)key == KEY_RIGHT && app->cursor_x < PAINT_W - 1) app->cursor_x++;
     else if ((unsigned char)key == KEY_UP && app->cursor_y > 0) app->cursor_y--;
     else if ((unsigned char)key == KEY_DOWN && app->cursor_y < PAINT_H - 1) app->cursor_y++;
-    else if (key >= '1' && key <= '8') app->color = key - '1';
+    else if (key >= '1' && key <= '9') app->color = (key - '1') % PAINT_PAL_N;
+    else if (key == '0') app->color = 9;
     else if (key == ' ') {
-        app->pixels[app->cursor_y * PAINT_W + app->cursor_x] = (uint8_t)app->color;
-        app->saved = 0;
+        paint_apply_at(app, app->cursor_x, app->cursor_y);
+        if (app->tool == PAINT_TOOL_PENCIL || app->tool == PAINT_TOOL_ERASER)
+            app->last_px = -1;
     } else if ((unsigned char)key == KEY_F2) {
-        Directory* dir = app->dir ? app->dir : fs_get_cwd_dir();
-        fs_dir_write(dir, app->filename[0] ? app->filename : "Artwork.gbm",
-                     app->pixels, sizeof(app->pixels));
-        app->saved = 1;
+        if (paint_save_bmp(app) == 0) app->saved = 1;
     }
+}
+
+static void paint_click(VWindow* win, int lx, int ly) {
+    PaintApp* app = (PaintApp*)win->user_data;
+    int px, py, i;
+    int ox, oy;
+    int pal_y;
+    if (!app) return;
+    paint_canvas_origin(0, 0, &ox, &oy);
+    /* Toolbox / Save — client coords, origin at 0,0 for layout helpers */
+    if (IN_RECT(lx, ly, 4, 4, 64, 20)) {
+        if (paint_save_bmp(app) == 0) app->saved = 1;
+        return;
+    }
+    if (IN_RECT(lx, ly, 4, 28, 64, 20)) {
+        strncpy(app->filename, "Artwork.bmp", sizeof(app->filename) - 1);
+        app->filename[sizeof(app->filename) - 1] = '\0';
+        if (paint_save_bmp(app) == 0) app->saved = 1;
+        return;
+    }
+    for (i = 0; i < 6; i++) {
+        if (IN_RECT(lx, ly, 4, 56 + i * 24, 64, 22)) {
+            app->tool = i;
+            return;
+        }
+    }
+    pal_y = oy + PAINT_H * PAINT_SCALE + 10;
+    for (i = 0; i < PAINT_PAL_N; i++) {
+        if (IN_RECT(lx, ly, ox + i * 20, pal_y, 18, 18)) {
+            app->color = i;
+            return;
+        }
+    }
+    if (!paint_client_to_pixel(0, 0, lx, ly, &px, &py)) return;
+    app->cursor_x = px;
+    app->cursor_y = py;
+    app->drawing = 1;
+    app->x0 = app->x1 = px;
+    app->y0 = app->y1 = py;
+    app->last_px = -1;
+    app->last_py = -1;
+    paint_apply_at(app, px, py);
+    if (app->tool == PAINT_TOOL_FILL || app->tool == PAINT_TOOL_PICK)
+        app->drawing = 0;
+}
+
+static void paint_tick(VWindow* win) {
+    PaintApp* app = (PaintApp*)win->user_data;
+    int mx, my, buttons;
+    int client_x, client_y, lx, ly, px, py;
+    if (!app || !app->drawing) return;
+    vdesk_get_pointer(&mx, &my, &buttons);
+    if (!(buttons & 1)) {
+        paint_commit_shape(app);
+        app->drawing = 0;
+        app->last_px = -1;
+        vdesk_mark_dirty(win->x, win->y, win->width, win->height);
+        return;
+    }
+    client_x = win->x + BORDER_SIZE;
+    client_y = win->y + TITLEBAR_HEIGHT + BORDER_SIZE;
+    lx = mx - client_x;
+    ly = my - client_y;
+    if (!paint_client_to_pixel(0, 0, lx, ly, &px, &py)) return;
+    app->cursor_x = px;
+    app->cursor_y = py;
+    paint_apply_at(app, px, py);
+    vdesk_mark_dirty(win->x, win->y, win->width, win->height);
 }
 
 static void open_shell_window(int primary) {
@@ -1816,6 +2671,8 @@ static void open_explorer_window(void) {
         win->render = explorer_render;
         win->key_handler = explorer_key;
         win->click_handler = explorer_click;
+        win->rclick_handler = explorer_rclick;
+        win->tick_handler = explorer_tick;
     }
 }
 
@@ -1855,7 +2712,7 @@ static void open_editor_window(void) {
 }
 
 static void open_paint_file(const char* filename, Directory* dir) {
-    VWindow* win = vdesk_create_window("Bitmap Paint", 150, 110, 470, 260);
+    VWindow* win = vdesk_create_window("Paint", 80, 60, 520, 380);
     if (win) {
         int pid = create_process("vesa-paint", 4);
         if (pid > 0) win->process_pid = pid;
@@ -1863,23 +2720,24 @@ static void open_paint_file(const char* filename, Directory* dir) {
         if (app) {
             memset(app, 0, sizeof(PaintApp));
             app->dir = dir ? dir : fs_get_cwd_dir();
-            strncpy(app->filename, filename ? filename : "Artwork.gbm", sizeof(app->filename) - 1);
+            strncpy(app->filename, filename ? filename : "Artwork.bmp",
+                    sizeof(app->filename) - 1);
             app->filename[sizeof(app->filename) - 1] = '\0';
-            app->color = 1;
-            FileHandle* fh = filename ? fs_dir_open(app->dir, filename) : NULL;
-            if (fh) {
-                fs_read(fh, app->pixels, sizeof(app->pixels));
-                fs_close(fh);
-            }
+            app->color = 0;
+            app->tool = PAINT_TOOL_PENCIL;
+            app->last_px = -1;
+            paint_load_file(app, filename);
             win->user_data = app;
             win->render = paint_render;
             win->key_handler = paint_key;
+            win->click_handler = paint_click;
+            win->tick_handler = paint_tick;
         }
     }
 }
 
 static void open_paint_window(void) {
-    open_paint_file("Artwork.gbm", fs_get_cwd_dir());
+    open_paint_file("Artwork.bmp", fs_get_cwd_dir());
 }
 
 static void open_taskmgr_window(void) {
@@ -1899,10 +2757,17 @@ static void open_taskmgr_window(void) {
 }
 
 static void open_display_settings_window(void) {
-    VWindow* win = vdesk_create_window("Display Settings", 300, 180, 430, 330);
+    VWindow* win = vdesk_create_window("Display Settings", 260, 120, 450, 380);
     if (win) {
         int pid = create_process("vesa-setup", 1);
+        DisplaySettingsApp* app;
         if (pid > 0) win->process_pid = pid;
+        app = (DisplaySettingsApp*)kmalloc(sizeof(DisplaySettingsApp));
+        if (app) {
+            memset(app, 0, sizeof(*app));
+            display_settings_pick_current(app);
+            win->user_data = app;
+        }
         win->render = display_settings_render;
         win->key_handler = display_settings_key;
         win->click_handler = display_settings_click;
@@ -1920,6 +2785,8 @@ static void open_system_settings_window(void) {
             app->tab = 0;
             app->pointer_speed = g_pointer_speed_pref;
             app->hide_shell = g_hide_shell_pref;
+            app->tile_wm = g_tile_wm_pref;
+            app->shift_click = g_shift_click_pref;
             win->user_data = app;
         }
         win->render = system_settings_render;
@@ -2038,7 +2905,7 @@ static void ide_build(IdeApp* app) {
         if (app) ide_out(app, "Open a folder first");
         return;
     }
-    if (!app->filename[0] || !has_suffix(app->filename, ".gc")) {
+    if (!app->filename[0] || !str_has_suffix_ci(app->filename, ".gc")) {
         ide_out(app, "Open a .gc source file");
         return;
     }
@@ -2068,7 +2935,7 @@ static void ide_run(IdeApp* app) {
     }
     if (app->last_gob[0])
         strncpy(gob, app->last_gob, sizeof(gob) - 1);
-    else if (app->filename[0] && has_suffix(app->filename, ".gc"))
+    else if (app->filename[0] && str_has_suffix_ci(app->filename, ".gc"))
         ide_make_gob_name(app->filename, gob, sizeof(gob));
     else {
         ide_out(app, "Build a .gc file first");
@@ -2113,7 +2980,7 @@ static void ide_open_tree_sel(IdeApp* app) {
     idx -= (int)d->child_count;
     if (idx >= 0 && idx < (int)d->file_count) {
         const char* name = d->files[idx].name;
-        if (has_suffix(name, ".gc") || has_suffix(name, ".txt"))
+        if (str_has_suffix_ci(name, ".gc") || str_has_suffix_ci(name, ".txt"))
             ide_load_file(app, name);
         else
             ide_out(app, "Select a .gc file");
@@ -2240,15 +3107,13 @@ static void ide_render(VWindow* win, int cx, int cy, int cw, int ch) {
         int cols = editor_w / IDE_CHAR_W;
         int rows = editor_h / IDE_CHAR_H;
         int text_row = 0, text_col = 0;
+        int caret_row = -1, caret_col = 0;
         if (cols < 2) cols = 2;
         if (rows < 2) rows = 2;
         for (i = 0; i <= app->len; i++) {
-            int display_row = text_row - app->scroll_row;
-            if (i == app->cursor && display_row >= 0 && display_row < rows) {
-                char cur[2] = { '|', '\0' };
-                vdesk_draw_text(editor_x + 2 + text_col * IDE_CHAR_W,
-                                editor_y + display_row * IDE_CHAR_H, cur,
-                                0xAEAFAD, ide_bg);
+            if (i == app->cursor) {
+                caret_row = text_row - app->scroll_row;
+                caret_col = text_col;
             }
             if (i == app->len) break;
             if (app->text[i] == '\n') {
@@ -2260,13 +3125,25 @@ static void ide_render(VWindow* win, int cx, int cy, int cw, int ch) {
                 text_row++;
                 text_col = 0;
             }
-            if (display_row >= 0 && display_row < rows && text_col < cols) {
-                char buf[2] = { app->text[i], '\0' };
-                vdesk_draw_text(editor_x + 2 + text_col * IDE_CHAR_W,
-                                editor_y + display_row * IDE_CHAR_H, buf,
-                                ide_fg, ide_bg);
+            {
+                int display_row = text_row - app->scroll_row;
+                if (display_row >= 0 && display_row < rows && text_col < cols) {
+                    char buf[2] = { app->text[i], '\0' };
+                    vdesk_draw_text(editor_x + 2 + text_col * IDE_CHAR_W,
+                                    editor_y + display_row * IDE_CHAR_H, buf,
+                                    ide_fg, ide_bg);
+                }
             }
             text_col++;
+        }
+        if (caret_row >= 0 && caret_row < rows) {
+            char cur[2] = { '|', '\0' };
+            vdesk_draw_rect(editor_x + 2 + caret_col * IDE_CHAR_W,
+                            editor_y + caret_row * IDE_CHAR_H,
+                            IDE_CHAR_W, IDE_CHAR_H, 0x264F78);
+            vdesk_draw_text(editor_x + 2 + caret_col * IDE_CHAR_W,
+                            editor_y + caret_row * IDE_CHAR_H, cur,
+                            0xAEAFAD, 0x264F78);
         }
     }
 
@@ -2485,9 +3362,389 @@ static void open_ide_window(void) {
     open_ide_file(NULL, fs_get_cwd_dir());
 }
 
+/* ---- Live-ISO Installer (whole-disk FAT32) ---- */
+enum {
+    INST_STEP_DISKS = 0,
+    INST_STEP_STYLE,
+    INST_STEP_CONFIRM,
+    INST_STEP_PROGRESS,
+    INST_STEP_DONE,
+    INST_STEP_FAIL
+};
+
+typedef struct {
+    int step;
+    int sel;
+    int target_count;
+    int style; /* install_partition_style_t */
+    uint32_t pct;
+    char status[96];
+    int result;
+} InstallerApp;
+
+static InstallerApp* g_installer_app;
+
+static void installer_progress_cb(uint32_t pct, const char* msg) {
+    InstallerApp* app = g_installer_app;
+    if (!app) return;
+    app->pct = pct;
+    if (msg) {
+        strncpy(app->status, msg, sizeof(app->status) - 1);
+        app->status[sizeof(app->status) - 1] = '\0';
+    }
+}
+
+static void installer_refresh_targets(InstallerApp* app) {
+    if (!app) return;
+    storage_scan();
+    app->target_count = storage_target_count();
+    if (app->sel < 0) app->sel = 0;
+    if (app->target_count > 0 && app->sel >= app->target_count)
+        app->sel = app->target_count - 1;
+}
+
+static void installer_fmt_size(const storage_device_info_t* d, char* out, int out_len) {
+    uint64_t mib;
+    char nbuf[16];
+    int i = 0;
+    int j;
+    if (!out || out_len < 8) return;
+    if (!d || d->sectors == 0) {
+        strncpy(out, "size?", (size_t)out_len - 1);
+        out[out_len - 1] = '\0';
+        return;
+    }
+    mib = d->sectors / 2048ULL;
+    itoa((int)mib, nbuf, 10);
+    for (j = 0; nbuf[j] && i + 1 < out_len; j++) out[i++] = nbuf[j];
+    const char* suf = " MiB";
+    for (j = 0; suf[j] && i + 1 < out_len; j++) out[i++] = suf[j];
+    out[i] = '\0';
+}
+
+static void installer_render(VWindow* win, int cx, int cy, int cw, int ch) {
+    InstallerApp* app = (InstallerApp*)win->user_data;
+    const VTheme* t = vdesk_get_theme();
+    int y;
+
+    if (!app) return;
+    vdesk_draw_rect(cx, cy, cw, ch, t->client_bg);
+    y = cy + 8;
+    vdesk_draw_text(cx + 8, y, "Install GooberOS (whole disk)", t->text, t->client_bg);
+    y += 22;
+
+    if (app->step == INST_STEP_DISKS) {
+        int i;
+        vdesk_draw_text(cx + 8, y, "Select a READY storage target:", t->text_muted, t->client_bg);
+        y += 20;
+        if (app->target_count <= 0) {
+            vdesk_draw_text(cx + 8, y, "No install targets. Attach a disk and Refresh.",
+                            t->text, t->client_bg);
+            y += 24;
+        }
+        for (i = 0; i < app->target_count && y + 22 < cy + ch - 40; i++) {
+            const storage_device_info_t* d = storage_get_target(i);
+            char line[96];
+            char sz[24];
+            char idbuf[8];
+            int li = 0;
+            int k;
+            if (!d) continue;
+            installer_fmt_size(d, sz, (int)sizeof(sz));
+            itoa(i, idbuf, 10);
+            line[li++] = '[';
+            for (k = 0; idbuf[k] && li + 1 < (int)sizeof(line); k++) line[li++] = idbuf[k];
+            line[li++] = ']';
+            line[li++] = ' ';
+            {
+                const char* name = d->model[0] ? d->model : "storage";
+                for (k = 0; name[k] && li + 1 < (int)sizeof(line); k++) line[li++] = name[k];
+            }
+            line[li++] = ' ';
+            for (k = 0; sz[k] && li + 1 < (int)sizeof(line); k++) line[li++] = sz[k];
+            line[li++] = ' ';
+            {
+                const char* bus = storage_bus_name(d->bus);
+                for (k = 0; bus && bus[k] && li + 1 < (int)sizeof(line); k++)
+                    line[li++] = bus[k];
+            }
+            line[li] = '\0';
+            draw_button(cx + 8, y, cw - 16, 20, line, i == app->sel);
+            y += 24;
+        }
+        draw_button(cx + 8, cy + ch - 32, 80, 24, "Refresh", 0);
+        draw_button(cx + 100, cy + ch - 32, 80, 24, "Next", app->target_count > 0);
+    } else if (app->step == INST_STEP_STYLE) {
+        vdesk_draw_text(cx + 8, y, "Partition style:", t->text_muted, t->client_bg);
+        y += 24;
+        draw_button(cx + 8, y, 160, 28, "MBR (BIOS)",
+                    app->style == INSTALL_STYLE_MBR);
+        draw_button(cx + 180, y, 160, 28, "GPT (UEFI)",
+                    app->style == INSTALL_STYLE_GPT);
+        y += 40;
+        vdesk_draw_text(cx + 8, y, "MBR for legacy BIOS; GPT for UEFI boot.",
+                        t->text_muted, t->client_bg);
+        draw_button(cx + 8, cy + ch - 32, 80, 24, "Back", 0);
+        draw_button(cx + 100, cy + ch - 32, 80, 24, "Next", 1);
+    } else if (app->step == INST_STEP_CONFIRM) {
+        const storage_device_info_t* d = storage_get_target(app->sel);
+        vdesk_draw_text(cx + 8, y, "WARNING: This erases the entire disk.",
+                        VCOLOR_LIGHT_RED, t->client_bg);
+        y += 20;
+        if (d) {
+            char line[80];
+            char sz[24];
+            installer_fmt_size(d, sz, (int)sizeof(sz));
+            strncpy(line, d->model[0] ? d->model : "storage", sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+            vdesk_draw_text(cx + 8, y, line, t->text, t->client_bg);
+            y += 18;
+            vdesk_draw_text(cx + 8, y, sz, t->text_muted, t->client_bg);
+            y += 18;
+            vdesk_draw_text(cx + 8, y,
+                            app->style == INSTALL_STYLE_GPT ? "Style: GPT (UEFI)"
+                                                            : "Style: MBR (BIOS)",
+                            t->text, t->client_bg);
+        }
+        y += 28;
+        vdesk_draw_text(cx + 8, y, "Confirm to wipe the disk and install.",
+                        t->text_muted, t->client_bg);
+        draw_button(cx + 8, cy + ch - 32, 80, 24, "Back", 0);
+        draw_button(cx + 100, cy + ch - 32, 120, 24, "Confirm Wipe", 1);
+    } else if (app->step == INST_STEP_PROGRESS) {
+        int bar_w = cw - 24;
+        int fill;
+        char pct_s[16];
+        if (bar_w < 40) bar_w = 40;
+        fill = (int)((app->pct * (uint32_t)bar_w) / 100U);
+        vdesk_draw_text(cx + 8, y, "Installing...", t->text, t->client_bg);
+        y += 24;
+        vdesk_draw_rect(cx + 8, y, bar_w, 18, t->button_bg);
+        if (fill > 0)
+            vdesk_draw_rect(cx + 8, y, fill, 18, t->accent);
+        vdesk_draw_border(cx + 8, y, bar_w, 18, t->border_light, t->border_dark);
+        y += 26;
+        itoa((int)app->pct, pct_s, 10);
+        {
+            char line[32];
+            int li = 0;
+            int k;
+            for (k = 0; pct_s[k] && li + 1 < (int)sizeof(line); k++) line[li++] = pct_s[k];
+            line[li++] = '%';
+            line[li] = '\0';
+            vdesk_draw_text(cx + 8, y, line, t->text, t->client_bg);
+        }
+        y += 20;
+        if (app->status[0])
+            vdesk_draw_text(cx + 8, y, app->status, t->text_muted, t->client_bg);
+    } else if (app->step == INST_STEP_DONE) {
+        vdesk_draw_text(cx + 8, y, "Install complete.", t->text, t->client_bg);
+        y += 20;
+        vdesk_draw_text(cx + 8, y, "Reboot from the target disk to start GooberOS.",
+                        t->text_muted, t->client_bg);
+        draw_button(cx + 8, cy + ch - 32, 100, 24, "Reboot", 1);
+        draw_button(cx + 120, cy + ch - 32, 80, 24, "Close", 0);
+    } else {
+        vdesk_draw_text(cx + 8, y, "Install failed.", VCOLOR_LIGHT_RED, t->client_bg);
+        y += 20;
+        if (app->status[0])
+            vdesk_draw_text(cx + 8, y, app->status, t->text_muted, t->client_bg);
+        draw_button(cx + 8, cy + ch - 32, 80, 24, "Back", 0);
+        draw_button(cx + 100, cy + ch - 32, 80, 24, "Close", 0);
+    }
+}
+
+static void installer_run(InstallerApp* app) {
+    const storage_device_info_t* d;
+    int rc;
+    if (!app) return;
+    d = storage_get_target(app->sel);
+    if (!d) {
+        app->step = INST_STEP_FAIL;
+        strncpy(app->status, "Target disappeared", sizeof(app->status) - 1);
+        return;
+    }
+    app->step = INST_STEP_PROGRESS;
+    app->pct = 0;
+    strncpy(app->status, "starting...", sizeof(app->status) - 1);
+    app->status[sizeof(app->status) - 1] = '\0';
+    g_installer_app = app;
+    install_set_progress_callback(installer_progress_cb);
+    rc = install_fat32_to_device(d, (install_partition_style_t)app->style);
+    install_set_progress_callback(NULL);
+    g_installer_app = NULL;
+    app->result = rc;
+    if (rc == 0) {
+        app->step = INST_STEP_DONE;
+        app->pct = 100;
+        strncpy(app->status, "complete", sizeof(app->status) - 1);
+        vdesk_notify("Installer", "GooberOS install finished");
+    } else {
+        app->step = INST_STEP_FAIL;
+        strncpy(app->status, "See shell logs / payload status", sizeof(app->status) - 1);
+        vdesk_notify("Installer", "Install failed");
+    }
+}
+
+static void installer_click(VWindow* win, int x, int y) {
+    InstallerApp* app = (InstallerApp*)win->user_data;
+    int cw = client_width(win);
+    int ch = win->height - TITLEBAR_HEIGHT - BORDER_SIZE * 2;
+    if (!app) return;
+
+    if (app->step == INST_STEP_DISKS) {
+        int i;
+        int row_y = 8 + 22 + 20;
+        for (i = 0; i < app->target_count; i++) {
+            if (IN_RECT(x, y, 8, row_y, cw - 16, 20)) {
+                app->sel = i;
+                return;
+            }
+            row_y += 24;
+        }
+        if (IN_RECT(x, y, 8, ch - 32, 80, 24)) {
+            installer_refresh_targets(app);
+            return;
+        }
+        if (IN_RECT(x, y, 100, ch - 32, 80, 24) && app->target_count > 0) {
+            app->step = INST_STEP_STYLE;
+            return;
+        }
+    } else if (app->step == INST_STEP_STYLE) {
+        if (IN_RECT(x, y, 8, 8 + 22 + 24, 160, 28)) {
+            app->style = INSTALL_STYLE_MBR;
+            return;
+        }
+        if (IN_RECT(x, y, 180, 8 + 22 + 24, 160, 28)) {
+            app->style = INSTALL_STYLE_GPT;
+            return;
+        }
+        if (IN_RECT(x, y, 8, ch - 32, 80, 24)) {
+            app->step = INST_STEP_DISKS;
+            return;
+        }
+        if (IN_RECT(x, y, 100, ch - 32, 80, 24)) {
+            app->step = INST_STEP_CONFIRM;
+            return;
+        }
+    } else if (app->step == INST_STEP_CONFIRM) {
+        if (IN_RECT(x, y, 8, ch - 32, 80, 24)) {
+            app->step = INST_STEP_STYLE;
+            return;
+        }
+        if (IN_RECT(x, y, 100, ch - 32, 120, 24)) {
+            installer_run(app);
+            return;
+        }
+    } else if (app->step == INST_STEP_DONE) {
+        if (IN_RECT(x, y, 8, ch - 32, 100, 24)) {
+            shell_reboot();
+            return;
+        }
+        if (IN_RECT(x, y, 120, ch - 32, 80, 24)) {
+            vdesk_close_window(win);
+            return;
+        }
+    } else if (app->step == INST_STEP_FAIL) {
+        if (IN_RECT(x, y, 8, ch - 32, 80, 24)) {
+            app->step = INST_STEP_DISKS;
+            installer_refresh_targets(app);
+            return;
+        }
+        if (IN_RECT(x, y, 100, ch - 32, 80, 24)) {
+            vdesk_close_window(win);
+            return;
+        }
+    }
+}
+
+static void installer_key(VWindow* win, char key) {
+    InstallerApp* app = (InstallerApp*)win->user_data;
+    if (!app) return;
+    if (app->step == INST_STEP_DISKS) {
+        if ((unsigned char)key == KEY_UP && app->sel > 0) app->sel--;
+        if ((unsigned char)key == KEY_DOWN && app->sel + 1 < app->target_count)
+            app->sel++;
+        if ((key == '\r' || key == '\n') && app->target_count > 0)
+            app->step = INST_STEP_STYLE;
+    } else if (app->step == INST_STEP_STYLE) {
+        if (key == 'm' || key == 'M') app->style = INSTALL_STYLE_MBR;
+        if (key == 'g' || key == 'G') app->style = INSTALL_STYLE_GPT;
+        if (key == '\r' || key == '\n') app->step = INST_STEP_CONFIRM;
+    } else if (app->step == INST_STEP_CONFIRM) {
+        if (key == '\r' || key == '\n') installer_run(app);
+    } else if (app->step == INST_STEP_DONE) {
+        if (key == 'r' || key == 'R') shell_reboot();
+    }
+}
+
+static void open_installer_window(void) {
+    VWindow* win;
+    if (fs_is_persistent()) {
+        vdesk_notify("Installer", "Already on installed disk (live ISO only)");
+        return;
+    }
+    win = vdesk_create_window("Install GooberOS", 100, 60, 520, 360);
+    if (!win) return;
+    {
+        int pid = create_process("vesa-install", 2);
+        if (pid > 0) win->process_pid = pid;
+    }
+    {
+        InstallerApp* app = (InstallerApp*)kmalloc(sizeof(InstallerApp));
+        if (!app) return;
+        memset(app, 0, sizeof(*app));
+        app->step = INST_STEP_DISKS;
+        app->style = INSTALL_STYLE_GPT;
+        installer_refresh_targets(app);
+        win->user_data = app;
+        win->render = installer_render;
+        win->key_handler = installer_key;
+        win->click_handler = installer_click;
+    }
+}
+
 /* Open a filesystem-backed desktop item according to its icon kind. Desktop
  * items live in the fixed Desktop directory regardless of where File Explorer
  * is currently browsing, so resolve everything against that handle. */
+static void vesa_open_fs_item(Directory* dir, const char* name, int is_dir) {
+    size_t len;
+    if (!dir || !name) return;
+    if (is_dir) {
+        Directory* child = fs_dir_find_child(dir, name);
+        if (child) fs_set_current_dir(child);
+        return;
+    }
+    len = strlen(name);
+    if (len >= 4) {
+        const char* e = name + len - 4;
+        if (e[0] == '.' &&
+            (e[1] == 'g' || e[1] == 'G') && (e[2] == 'b' || e[2] == 'B') &&
+            (e[3] == 'm' || e[3] == 'M')) {
+            open_paint_file(name, dir);
+            return;
+        }
+        if ((e[1] == 'g' || e[1] == 'G') && (e[2] == 'o' || e[2] == 'O') &&
+            (e[3] == 'b' || e[3] == 'B')) {
+            Directory* prev = fs_get_cwd_dir();
+            fs_set_current_dir(dir);
+            if (gob_exec(name) != 0)
+                vdesk_notify("GooberC", "Failed to run .gob");
+            if (prev) fs_set_current_dir(prev);
+            return;
+        }
+    }
+    if (len >= 3) {
+        const char* e = name + len - 3;
+        if (e[0] == '.' && (e[1] == 'g' || e[1] == 'G') &&
+            (e[2] == 'c' || e[2] == 'C')) {
+            open_ide_file(name, dir);
+            return;
+        }
+    }
+    open_editor_file(name, dir);
+}
+
 static void vesa_open_desktop_file(const char* name, int kind) {
     if (!name) return;
     Directory* desk = fs_get_desktop_dir();
@@ -2511,6 +3768,21 @@ static void vesa_open_desktop_file(const char* name, int kind) {
         else
             vdesk_notify("GooberC", "Finished running .gob");
         if (prev) fs_set_current_dir(prev);
+    } else if (kind == VICON_DOS) {
+        char path[96];
+        size_t pi = 0;
+        const char* pref = "Desktop/";
+        while (pref[pi] && pi + 1 < sizeof(path)) {
+            path[pi] = pref[pi];
+            pi++;
+        }
+        {
+            size_t j = 0;
+            while (name[j] && pi + 1 < sizeof(path)) path[pi++] = name[j++];
+        }
+        path[pi] = '\0';
+        if (dos_exec(path) != 0)
+            vdesk_notify("GooberDOS", "Failed to run DOS app");
     } else {
         vdesk_notify("Desktop", "No app for this file type");
     }
@@ -2550,6 +3822,29 @@ static void vesa_launch_app(VDeskAppId app_id) {
             break;
         case VDESK_APP_IDE:
             open_ide_window();
+            break;
+        case VDESK_APP_INSTALLER:
+            open_installer_window();
+            break;
+        case VDESK_APP_DOS:
+            if (dos_exec(NULL) != 0)
+                vdesk_notify("GooberDOS", "Failed to start");
+            break;
+        case VDESK_APP_DOOM:
+            /* Real DOOM.EXE is DOS/4GW PM — always use native GooberDoom. */
+            open_doom_window();
+            break;
+        case VDESK_APP_MINESWEEPER:
+            if (gob_exec("Apps/Minesweeper.gob") != 0)
+                vdesk_notify("Games", "Minesweeper.gob missing");
+            break;
+        case VDESK_APP_CUBEDIP:
+            if (gob_exec("Apps/CubeDip.gob") != 0)
+                vdesk_notify("Games", "CubeDip.gob missing");
+            break;
+        case VDESK_APP_SNAKEGAME:
+            if (gob_exec("Apps/SnakeGame.gob") != 0)
+                vdesk_notify("Games", "SnakeGame.gob missing");
             break;
     }
 }
@@ -2749,6 +4044,7 @@ void vesa_desktop_init(void) {
     vdesk_init(w, h);
     vdesk_set_app_launcher(vesa_launch_app);
     vdesk_set_file_opener(vesa_open_desktop_file);
+    vdesk_set_fs_item_opener(vesa_open_fs_item);
     int icon_y = vdesk_workspace_top() + 24;
     vdesk_add_icon("Shell", VDESK_APP_SHELL, 24, icon_y);
     vdesk_add_icon("Files", VDESK_APP_EXPLORER, 24, icon_y + 72);
@@ -2756,8 +4052,12 @@ void vesa_desktop_init(void) {
     vdesk_add_icon("Tasks", VDESK_APP_TASK_MANAGER, 24, icon_y + 216);
     vdesk_add_icon("Paint", VDESK_APP_PAINT, 24, icon_y + 288);
     vdesk_add_icon("GooberC", VDESK_APP_IDE, 24, icon_y + 360);
+    vdesk_add_icon("GooberDOS", VDESK_APP_DOS, 112, icon_y);
+    vdesk_add_icon("Doom", VDESK_APP_DOOM, 112, icon_y + 72);
     if (fs_is_persistent())
         vdesk_add_icon("Welcome", VDESK_APP_WELCOME, 24, icon_y + 432);
+    else
+        vdesk_add_icon("Install", VDESK_APP_INSTALLER, 24, icon_y + 432);
 
     /* Ensure the dedicated Desktop folder exists (created once if missing). */
     fs_get_desktop_dir();
@@ -2766,7 +4066,10 @@ void vesa_desktop_init(void) {
     vdesk_refresh_desktop_items(1);
 
     system_settings_load();
+    vdesk_set_tile_wm(g_tile_wm_pref);
+    vdesk_set_shift_click_rmb(g_shift_click_pref);
     open_shell_window(1);
+    /* Default / pref: start on the desktop (shell auto-hidden) for live + installed. */
     if (g_hide_shell_pref)
         vdesk_set_desktop_experience(1);
 

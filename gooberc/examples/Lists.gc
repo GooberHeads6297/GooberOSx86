@@ -1,0 +1,9 @@
+use goober.console
+
+var xs = [10, 20, 30]
+print len xs
+print get xs 1
+push xs 40
+print len xs
+print get xs 3
+exit

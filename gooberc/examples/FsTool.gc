@@ -1,0 +1,16 @@
+use goober.console
+use goober.fs
+
+var path = "Config/settings.cfg"
+var ok = exists path
+if ok
+  var data = read path
+  print "settings bytes:"
+  print len data
+end
+var missing = exists "NoSuch/file.txt"
+if missing
+  print "unexpected file"
+end
+print "fs tool done"
+exit

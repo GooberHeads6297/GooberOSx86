@@ -49,4 +49,14 @@ int native_fb_get_inherited(uintptr_t* addr, uint32_t* width, uint32_t* height,
  * priority order, with the display framework. */
 void native_fb_register_drivers(void);
 
+/* Runtime modeset (Bochs/QEMU dispi). Returns 0 if not available. */
+int native_fb_modeset_available(void);
+
+/* Program a new LFB mode and re-register it with the display/VESA layer.
+ * Returns 1 on success. No-op failure leaves the previous mode intact. */
+int native_fb_try_modeset(uint32_t width, uint32_t height, uint8_t bpp);
+
+/* Supported mode table for UI (width/height pairs; terminated by 0,0). */
+const uint16_t* native_fb_supported_modes(int* count);
+
 #endif

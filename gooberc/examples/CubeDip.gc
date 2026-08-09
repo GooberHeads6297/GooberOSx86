@@ -1,0 +1,620 @@
+# CubeDip — falling blocks (larger board, smaller cells, 7 shapes)
+use goober.gui
+app gui
+
+var W = 10
+var H = 18
+var CS = 16
+var OX = 24
+var OY = 36
+
+var board = []
+var score = 0
+var high = 0
+var over = 0
+var px = 3
+var py = 0
+var prot = 0
+var pshape = 0
+var drop = 0
+var seed = 4242
+
+fn mod a b
+  return a - (a / b) * b
+end
+
+fn rnd n
+  seed = seed * 1103515 + 12345
+  if seed < 0
+    seed = 0 - seed
+  end
+  return mod seed n
+end
+
+fn col id
+  if id == 1
+    return CYAN
+  end
+  if id == 2
+    return PURPLE
+  end
+  if id == 3
+    return BLUE
+  end
+  if id == 4
+    return GREEN
+  end
+  if id == 5
+    return RED
+  end
+  if id == 6
+    return ORANGE
+  end
+  if id == 7
+    return YELLOW
+  end
+  return GRAY
+end
+
+fn load_hi
+  # Session highscore always lives in `high` (ISO / memfs / FAT).
+  # FAT and live memfs may also refresh it from Apps/CubeDip.hi.
+  if exists "Apps/CubeDip.hi"
+    var t = read "Apps/CubeDip.hi"
+    if t
+      high = num t
+    end
+  end
+end
+
+fn save_hi
+  if score > high
+    high = score
+  end
+  write "Apps/CubeDip.hi" str high
+end
+
+fn bget x y
+  if x < 0
+    return 1
+  end
+  if x >= W
+    return 1
+  end
+  if y < 0
+    return 0
+  end
+  if y >= H
+    return 1
+  end
+  return get board y * W + x
+end
+
+fn bset x y v
+  if x < 0
+    return
+  end
+  if x >= W
+    return
+  end
+  if y < 0
+    return
+  end
+  if y >= H
+    return
+  end
+  set board y * W + x v
+end
+
+# Local cell offset for shape (I O T S Z J L), rotation, cell index 0..3
+# Every rotation keeps min(lx)=0 so upright pieces can hug the left wall at px=0.
+fn lx shape rot n
+  var r = mod rot 4
+  if shape == 0
+    if mod rot 2 == 0
+      return n
+    end
+    return 0
+  end
+  if shape == 1
+    if n == 0
+      return 0
+    end
+    if n == 1
+      return 1
+    end
+    if n == 2
+      return 0
+    end
+    return 1
+  end
+  if shape == 2
+    if r == 0
+      if n == 0
+        return 1
+      end
+      if n == 1
+        return 0
+      end
+      if n == 2
+        return 1
+      end
+      return 2
+    end
+    if r == 1
+      if n == 3
+        return 1
+      end
+      return 0
+    end
+    if r == 2
+      if n == 0
+        return 0
+      end
+      if n == 1
+        return 1
+      end
+      if n == 2
+        return 2
+      end
+      return 1
+    end
+    if n == 1
+      return 0
+    end
+    return 1
+  end
+  if shape == 3
+    if mod rot 2 == 0
+      if n == 0
+        return 1
+      end
+      if n == 1
+        return 2
+      end
+      if n == 2
+        return 0
+      end
+      return 1
+    end
+    if n < 2
+      return 0
+    end
+    return 1
+  end
+  if shape == 4
+    if mod rot 2 == 0
+      if n == 0
+        return 0
+      end
+      if n == 1
+        return 1
+      end
+      if n == 2
+        return 1
+      end
+      return 2
+    end
+    if n == 0
+      return 1
+    end
+    if n == 1
+      return 0
+    end
+    if n == 2
+      return 1
+    end
+    return 0
+  end
+  if shape == 5
+    if r == 0
+      if n < 2
+        return 0
+      end
+      return n - 1
+    end
+    if r == 1
+      if n == 1
+        return 1
+      end
+      return 0
+    end
+    if r == 2
+      if n < 3
+        return n
+      end
+      return 2
+    end
+    if n == 2
+      return 0
+    end
+    return 1
+  end
+  if r == 0
+    if n == 0
+      return 2
+    end
+    return n - 1
+  end
+  if r == 1
+    if n == 3
+      return 1
+    end
+    return 0
+  end
+  if r == 2
+    if n == 3
+      return 0
+    end
+    return n
+  end
+  if n == 0
+    return 0
+  end
+  return 1
+end
+
+fn ly shape rot n
+  var r = mod rot 4
+  if shape == 0
+    if mod rot 2 == 0
+      return 1
+    end
+    return n
+  end
+  if shape == 1
+    if n < 2
+      return 0
+    end
+    return 1
+  end
+  if shape == 2
+    if r == 0
+      if n == 0
+        return 0
+      end
+      return 1
+    end
+    if r == 1
+      if n == 0
+        return 0
+      end
+      if n == 1
+        return 1
+      end
+      if n == 2
+        return 2
+      end
+      return 1
+    end
+    if r == 2
+      if n == 3
+        return 2
+      end
+      return 1
+    end
+    if n == 0
+      return 0
+    end
+    if n == 1
+      return 1
+    end
+    if n == 2
+      return 1
+    end
+    return 2
+  end
+  if shape == 3
+    if mod rot 2 == 0
+      if n < 2
+        return 0
+      end
+      return 1
+    end
+    if n == 0
+      return 0
+    end
+    if n == 1
+      return 1
+    end
+    if n == 2
+      return 1
+    end
+    return 2
+  end
+  if shape == 4
+    if mod rot 2 == 0
+      if n < 2
+        return 0
+      end
+      return 1
+    end
+    if n == 0
+      return 0
+    end
+    if n == 1
+      return 1
+    end
+    if n == 2
+      return 1
+    end
+    return 2
+  end
+  if shape == 5
+    if r == 0
+      if n == 0
+        return 0
+      end
+      return 1
+    end
+    if r == 1
+      if n < 2
+        return 0
+      end
+      if n == 2
+        return 1
+      end
+      return 2
+    end
+    if r == 2
+      if n == 3
+        return 2
+      end
+      return 1
+    end
+    if n == 0
+      return 0
+    end
+    if n == 1
+      return 1
+    end
+    return 2
+  end
+  if r == 0
+    if n == 0
+      return 0
+    end
+    return 1
+  end
+  if r == 1
+    if n == 0
+      return 0
+    end
+    if n == 1
+      return 1
+    end
+    return 2
+  end
+  if r == 2
+    if n == 3
+      return 2
+    end
+    return 1
+  end
+  if n < 2
+    return 0
+  end
+  if n == 2
+    return 1
+  end
+  return 2
+end
+
+fn fits ox oy shape rot
+  var n = 0
+  while n < 4
+    var x = ox + lx shape rot n
+    var y = oy + ly shape rot n
+    if x < 0
+      return 0
+    end
+    if x >= W
+      return 0
+    end
+    if y >= H
+      return 0
+    end
+    if y >= 0
+      if bget x y != 0
+        return 0
+      end
+    end
+    n = n + 1
+  end
+  return 1
+end
+
+fn clear_lines
+  var yy = H - 1
+  while yy >= 0
+    var full = 1
+    var xx = 0
+    while xx < W
+      if bget xx yy == 0
+        full = 0
+      end
+      xx = xx + 1
+    end
+    if full == 1
+      score = score + 10
+      if score > high
+        high = score
+      end
+      var row = yy
+      while row > 0
+        xx = 0
+        while xx < W
+          var ay = row - 1
+          var above = bget xx ay
+          bset xx row above
+          xx = xx + 1
+        end
+        row = row - 1
+      end
+      xx = 0
+      while xx < W
+        bset xx 0 0
+        xx = xx + 1
+      end
+    end
+    if full == 0
+      yy = yy - 1
+    end
+  end
+end
+
+fn lock_piece
+  var n = 0
+  var cid = pshape + 1
+  while n < 4
+    var x = px + lx pshape prot n
+    var y = py + ly pshape prot n
+    if y >= 0
+      bset x y cid
+    end
+    n = n + 1
+  end
+  clear_lines
+end
+
+fn spawn
+  pshape = rnd 7
+  prot = 0
+  px = 3
+  py = 0
+  if fits px py pshape prot == 0
+    over = 1
+    save_hi
+  end
+end
+
+fn try_move dx dy
+  var nx = px + dx
+  var ny = py + dy
+  if fits nx ny pshape prot
+    px = nx
+    py = ny
+    return 1
+  end
+  return 0
+end
+
+fn try_rot
+  var nr = prot + 1
+  if fits px py pshape nr
+    prot = nr
+  end
+end
+
+fn hard_drop
+  while try_move 0 1
+  end
+  lock_piece
+  if over == 0
+    spawn
+  end
+end
+
+fn draw
+  fill NAVY
+  rect 8 8 340 22 PANEL
+  label 16 12 "Score " + str score + "  Hi " + str high INK PANEL
+  var y = 0
+  while y < H
+    var x = 0
+    while x < W
+      var sx = OX + x * CS
+      var sy = OY + y * CS
+      var c = bget x y
+      if c == 0
+        rect sx sy CS - 1 CS - 1 DARKGRAY
+      end
+      if c != 0
+        rect sx sy CS - 1 CS - 1 col c
+      end
+      x = x + 1
+    end
+    y = y + 1
+  end
+  if over == 0
+    var n = 0
+    while n < 4
+      var cx = px + lx pshape prot n
+      var cy = py + ly pshape prot n
+      if cy >= 0
+        rect OX + cx * CS OY + cy * CS CS - 1 CS - 1 col pshape + 1
+      end
+      n = n + 1
+    end
+  end
+  label 16 330 "Left/Right  Down drop  Up rotate  ESC" MUTED NAVY
+  if over
+    rect 8 348 340 22 RED
+    label 16 352 "GAME OVER — ESC to close" INK RED
+  end
+  present
+end
+
+window "CubeDip" 360x390
+load_hi
+var i = 0
+while i < 180
+  push board 0
+  i = i + 1
+end
+spawn
+draw
+
+while over == 0
+  if winclosed
+    save_hi
+    exit
+  end
+  var k = getkey
+  if k == KEY_ESC
+    save_hi
+    exit
+  end
+  if k == KEY_LEFT
+    var mleft = 0 - 1
+    try_move mleft 0
+    draw
+  end
+  if k == KEY_RIGHT
+    try_move 1 0
+    draw
+  end
+  if k == KEY_UP
+    try_rot
+    draw
+  end
+  if k == KEY_DOWN
+    hard_drop
+    draw
+  end
+  drop = drop + 1
+  if drop >= 7
+    drop = 0
+    if try_move 0 1 == 0
+      lock_piece
+      if over == 0
+        spawn
+      end
+    end
+    draw
+  end
+  sleep 70
+end
+
+draw
+while 1
+  if winclosed
+    exit
+  end
+  var k2 = getkey
+  if k2 == KEY_ESC
+    exit
+  end
+  sleep 80
+end
+exit

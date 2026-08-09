@@ -1,0 +1,257 @@
+# SnakeGame — colorful arcade grid
+use goober.gui
+app gui
+
+var W = 12
+var H = 8
+var CS = 26
+var OX = 24
+var OY = 40
+
+# Board accents (named colors: DARKGREEN, TEAL, LIME, GREEN, CORAL, INK, …)
+var C_EMPTY = 0x16362B
+var C_EMPTY2 = 0x1A4033
+
+var seed = 4242
+var snake
+var foodx
+var foody
+var dir
+var score
+var high
+var alive
+var tick
+
+fn mod a b
+  return a - (a / b) * b
+end
+
+fn rnd n
+  seed = seed * 1103515 + 12345
+  if seed < 0
+    seed = 0 - seed
+  end
+  return mod seed n
+end
+
+fn load_hi
+  # Session highscore stays in `high` on ISO/memfs; file refresh when present.
+  high = 0
+  if exists "Apps/SnakeGame.hi"
+    var d = read "Apps/SnakeGame.hi"
+    if d
+      high = num d
+    end
+  end
+end
+
+fn save_hi
+  if score > high
+    high = score
+  end
+  write "Apps/SnakeGame.hi" str high
+end
+
+fn cell_on sx sy
+  var i = 0
+  var n = len snake
+  while i < n
+    var p = get snake i
+    if p / 100 == sx
+      if mod p 100 == sy
+        return 1
+      end
+    end
+    i = i + 1
+  end
+  return 0
+end
+
+fn place_food
+  var tries = 0
+  foodx = rnd W
+  foody = rnd H
+  while cell_on foodx foody
+    foodx = rnd W
+    foody = rnd H
+    tries = tries + 1
+    if tries > 200
+      return
+    end
+  end
+end
+
+fn draw
+  fill DARKGREEN
+  rect 8 8 340 28 TEAL
+  label 16 16 "Score " + str score + "  Hi " + str high INK TEAL
+  rect OX - 4 OY - 4 W * CS + 8 H * CS + 8 GREEN
+  var y = 0
+  while y < H
+    var x = 0
+    while x < W
+      var px = OX + x * CS
+      var py = OY + y * CS
+      var col = C_EMPTY
+      if mod x + y 2 == 1
+        col = C_EMPTY2
+      end
+      if cell_on x y
+        col = GREEN
+        var head = get snake 0
+        if head / 100 == x
+          if mod head 100 == y
+            col = LIME
+          end
+        end
+      end
+      if x == foodx
+        if y == foody
+          col = CORAL
+        end
+      end
+      rect px py CS - 2 CS - 2 col
+      x = x + 1
+    end
+    y = y + 1
+  end
+  label 16 270 "Arrows steer  ESC quit" LIME DARKGREEN
+  if alive == 0
+    rect 8 290 340 22 CORAL
+    label 16 296 "GAME OVER — ESC to close" INK CORAL
+  end
+  present
+end
+
+fn step
+  if alive == 0
+    return
+  end
+  var head = get snake 0
+  var hx = head / 100
+  var hy = mod head 100
+  if dir == KEY_UP
+    hy = hy - 1
+  end
+  if dir == KEY_DOWN
+    hy = hy + 1
+  end
+  if dir == KEY_LEFT
+    hx = hx - 1
+  end
+  if dir == KEY_RIGHT
+    hx = hx + 1
+  end
+  if hx < 0
+    alive = 0
+    save_hi
+    return
+  end
+  if hy < 0
+    alive = 0
+    save_hi
+    return
+  end
+  if hx >= W
+    alive = 0
+    save_hi
+    return
+  end
+  if hy >= H
+    alive = 0
+    save_hi
+    return
+  end
+  if cell_on hx hy
+    alive = 0
+    save_hi
+    return
+  end
+  var nh = hx * 100 + hy
+  var grew = 0
+  if hx == foodx
+    if hy == foody
+      grew = 1
+      score = score + 1
+      if score > high
+        high = score
+      end
+      place_food
+    end
+  end
+  var ns = [nh]
+  var i = 0
+  var n = len snake
+  if grew == 0
+    n = n - 1
+  end
+  while i < n
+    push ns get snake i
+    i = i + 1
+  end
+  snake = ns
+end
+
+window "SnakeGame" 380x330
+load_hi
+snake = [406]
+push snake 306
+push snake 206
+dir = KEY_RIGHT
+score = 0
+alive = 1
+tick = 0
+place_food
+draw
+
+while alive
+  if winclosed
+    save_hi
+    exit
+  end
+  var k = getkey
+  if k == KEY_ESC
+    save_hi
+    exit
+  end
+  if k == KEY_UP
+    if dir != KEY_DOWN
+      dir = KEY_UP
+    end
+  end
+  if k == KEY_DOWN
+    if dir != KEY_UP
+      dir = KEY_DOWN
+    end
+  end
+  if k == KEY_LEFT
+    if dir != KEY_RIGHT
+      dir = KEY_LEFT
+    end
+  end
+  if k == KEY_RIGHT
+    if dir != KEY_LEFT
+      dir = KEY_RIGHT
+    end
+  end
+  tick = tick + 1
+  if tick >= 4
+    tick = 0
+    step
+    draw
+  end
+  sleep 100
+end
+
+draw
+while 1
+  if winclosed
+    exit
+  end
+  var k2 = getkey
+  if k2 == KEY_ESC
+    exit
+  end
+  sleep 80
+end
+exit

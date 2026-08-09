@@ -10,6 +10,20 @@ extern void print(const char*);
 /* VESA desktop provides a strong definition; other builds leave this NULL. */
 void install_ui_yield(void) __attribute__((weak));
 
+static install_progress_fn g_install_progress_cb;
+
+void install_set_progress_callback(install_progress_fn fn) {
+    g_install_progress_cb = fn;
+}
+
+static void install_notify_progress(uint32_t pct, const char* msg) {
+    if (pct > 100U) pct = 100U;
+    if (g_install_progress_cb)
+        g_install_progress_cb(pct, msg);
+    if (install_ui_yield)
+        install_ui_yield();
+}
+
 static int inst_write_core_embed(const storage_device_info_t* dev,
                                  const uint8_t* core, size_t core_size,
                                  uint32_t core_first_lba) {
@@ -43,12 +57,6 @@ static int inst_write_core_embed(const storage_device_info_t* dev,
         lba++;
     }
     return 0;
-}
-
-static void install_progress_line(const char* msg) {
-    print(msg);
-    if (install_ui_yield)
-        install_ui_yield();
 }
 
 static void install_u32_to_dec(uint32_t v, char* out, size_t out_len) {
@@ -104,7 +112,8 @@ static void install_report_pct(const char* phase, uint32_t done, uint32_t total)
     if (i + 1 < sizeof(line)) line[i++] = ')';
     if (i + 1 < sizeof(line)) line[i++] = '\n';
     line[i] = '\0';
-    install_progress_line(line);
+    print(line);
+    /* Progress bar uses install_notify_progress from the blast loop. */
 }
 
 static int inst_blast_partition_template(const storage_device_info_t* dev,
@@ -122,7 +131,6 @@ static int inst_blast_partition_template(const storage_device_info_t* dev,
     for (lba = 0; lba < to_write; ) {
         uint32_t n = to_write - lba;
         uint32_t i;
-        uint32_t pct;
 
         if (n > BLAST_CHUNK) n = BLAST_CHUNK;
         for (i = 0; i < n; i++) {
@@ -135,11 +143,19 @@ static int inst_blast_partition_template(const storage_device_info_t* dev,
             return -1;
         lba += n;
 
-        /* Report every 10% -- fewer UI yields during bulk copy. */
-        pct = (lba * 100U) / to_write;
-        if (pct != last_pct && (pct % 10U) == 0U) {
-            last_pct = pct;
-            install_report_pct("copying FAT32 template", lba, to_write);
+        /* Yield every chunk; print about every 5% of the copy. */
+        {
+            uint32_t copy_pct = (lba * 100U) / to_write;
+            uint32_t overall = 10U + (lba * 80U) / to_write;
+            if (overall > 90U) overall = 90U;
+            if (g_install_progress_cb)
+                g_install_progress_cb(overall, "copying FAT32 template");
+            if (install_ui_yield)
+                install_ui_yield();
+            if (copy_pct != last_pct && (copy_pct % 5U) == 0U) {
+                last_pct = copy_pct;
+                install_report_pct("copying FAT32 template", lba, to_write);
+            }
         }
     }
     return 0;
@@ -167,6 +183,7 @@ static int inst_write_mbr_layout(const storage_device_info_t* dev,
     }
 
     print("install: MBR layout...\n");
+    install_notify_progress(5U, "MBR layout");
     if (grub_bios_write_mbr(mbr, boot_img, boot_img_size,
                             INSTALL_MBR_CORE_FIRST_LBA,
                             INSTALL_PARTITION_START_LBA, part_sectors,
@@ -180,6 +197,7 @@ static int inst_write_mbr_layout(const storage_device_info_t* dev,
     }
 
     print("install: embedding GRUB core.img...\n");
+    install_notify_progress(8U, "embedding GRUB core.img");
     if (inst_write_core_embed(dev, core_img, core_img_size,
                               INSTALL_MBR_CORE_FIRST_LBA) != 0) {
         print("install: core.img embed failed\n");
@@ -194,6 +212,7 @@ static int inst_write_gpt_layout(const storage_device_info_t* dev,
                                  uint64_t disk_sectors,
                                  uint32_t* out_part_sectors) {
     print("install: GPT layout...\n");
+    install_notify_progress(5U, "GPT layout");
     if (gpt_write_esp_layout(dev, disk_sectors, INSTALL_PARTITION_START_LBA,
                              out_part_sectors) != 0) {
         print("install: GPT ESP layout failed\n");
@@ -237,10 +256,12 @@ int install_fat32_format_and_write(const storage_device_info_t* dev,
     }
 
     print("install: writing FAT32 template...\n");
+    install_notify_progress(10U, "writing FAT32 template");
     if (inst_blast_partition_template(dev, fat_template_sectors, part_sectors) != 0)
         return -1;
 
     print("install: patching volume boot record...\n");
+    install_notify_progress(92U, "patching volume boot record");
     /* Patch BPB HiddenSectors (and FAT32 backup VBR) to partition LBA 2048. */
     {
         uint8_t bpb[512];
@@ -261,9 +282,11 @@ int install_fat32_format_and_write(const storage_device_info_t* dev,
     }
 
     print("install: flushing...\n");
+    install_notify_progress(96U, "flushing");
     if (storage_flush(dev) != 0) return -1;
 
     install_debug_verify_disk(dev, INSTALL_PARTITION_START_LBA, part_sectors,
                               fat_template_sectors);
+    install_notify_progress(100U, "complete");
     return 0;
 }

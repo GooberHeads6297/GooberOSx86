@@ -7,7 +7,8 @@
 
 typedef enum {
     PROC_KIND_KERNEL = 0,
-    PROC_KIND_GOB = 1
+    PROC_KIND_GOB = 1,
+    PROC_KIND_DOS = 2
 } process_kind_t;
 
 typedef enum {

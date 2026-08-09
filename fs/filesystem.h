@@ -75,6 +75,8 @@ int fs_dir_create(Directory* dir, const char* filename);
 int fs_dir_create_dir(Directory* dir, const char* dirname);
 int fs_dir_rename(Directory* dir, const char* old_name, const char* new_name);
 int fs_dir_write(Directory* dir, const char* filename, const uint8_t* data, size_t size);
+/* Delete a file or empty-ish directory inside dir (tries file, then directory). */
+int fs_dir_delete(Directory* dir, const char* name);
 
 /* Persistent filesystem helpers */
 int fs_is_persistent(void);

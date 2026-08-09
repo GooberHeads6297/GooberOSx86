@@ -25,7 +25,9 @@ const char* process_state_name(process_state_t s) {
 }
 
 const char* process_kind_name(process_kind_t k) {
-    return k == PROC_KIND_GOB ? "GooberApp" : "Kernel";
+    if (k == PROC_KIND_GOB) return "GooberApp";
+    if (k == PROC_KIND_DOS) return "GooberDOS";
+    return "Kernel";
 }
 
 int create_process_ex(const char *name, size_t memory_kb, process_kind_t kind) {

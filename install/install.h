@@ -22,6 +22,10 @@ int install_payload_available(void);
 int install_fat32_to_device(const storage_device_info_t* dev,
                             install_partition_style_t style);
 
+/* Optional GUI progress hook (pct 0..100 + status line). NULL = print only. */
+typedef void (*install_progress_fn)(uint32_t pct, const char* msg);
+void install_set_progress_callback(install_progress_fn fn);
+
 /*
  * Memory-only "install": stamp a marker into live memfs so the session is
  * treated as an installed RAM root (no block device). Persistence still
