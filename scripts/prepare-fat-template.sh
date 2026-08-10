@@ -149,6 +149,38 @@ if command -v python3 >/dev/null 2>&1 && [ -f "${REPO_ROOT}/gooberc/gooberc.py" 
       echo "[+] Seeded Apps/${game}.gob (GooberC game)"
     fi
   done
+  # DoomRay: prepend WAD-extracted map include before compile.
+  if [ -f "${REPO_ROOT}/gooberc/examples/DoomRay.gc" ]; then
+    MAP_INC="${REPO_ROOT}/gooberc/examples/data/E1M1.map.gcinc"
+    if [ -f "${REPO_ROOT}/dosemu/fixtures/doom/DOOM1.WAD" ]; then
+      python3 -u "${REPO_ROOT}/scripts/wad-extract-e1m1.py" \
+        --wad "${REPO_ROOT}/dosemu/fixtures/doom/DOOM1.WAD" \
+        -o "${MAP_INC}" --width 56 --height 40
+    fi
+    if [ -f "${MAP_INC}" ]; then
+      MERGED="${PAYLOAD_DIR}/DoomRay.merged.gc"
+      # Inject map after `app gui` (GooberC is line-oriented; keep directives first).
+      python3 -u - "${MAP_INC}" "${REPO_ROOT}/gooberc/examples/DoomRay.gc" "${MERGED}" <<'PY'
+import sys
+inc, src, out = sys.argv[1], sys.argv[2], sys.argv[3]
+body = open(src, encoding="utf-8").read()
+marker = "app gui\n"
+map_text = open(inc, encoding="utf-8").read().rstrip() + "\n\n"
+if marker in body:
+    body = body.replace(marker, marker + "\n" + map_text, 1)
+else:
+    body = map_text + body
+open(out, "w", encoding="utf-8").write(body)
+PY
+      python3 -u "${REPO_ROOT}/gooberc/gooberc.py" \
+        "${MERGED}" -o "${PAYLOAD_DIR}/DoomRay.gob"
+      mcopy_fat "${PAYLOAD_DIR}/DoomRay.gob" ::Apps/DoomRay.gob
+      rm -f "${PAYLOAD_DIR}/DoomRay.gob" "${MERGED}"
+      echo "[+] Seeded Apps/DoomRay.gob (GooberC E1M1 raycaster)"
+    else
+      echo "[!] DoomRay map missing (${MAP_INC}) — not seeded"
+    fi
+  fi
 else
   echo "[!] python3/gooberc.py missing — Apps/*.gob not seeded into FAT template"
 fi

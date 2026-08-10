@@ -1,0 +1,50 @@
+# KeysDemo — KEY_* labels, keyheld, millis-paced loop
+use goober.gui
+app gui
+
+window "KeysDemo" 420x200
+var last = millis
+var frames = 0
+
+while winclosed == 0
+  var k = getkey
+  if k == KEY_ESC
+    exit
+  end
+  if k == KEY_F1
+    frames = 0
+  end
+
+  var now = millis
+  var dt = now - last
+  last = now
+  frames = frames + 1
+
+  fill NAVY
+  rect 0 0 420 28 PANEL
+  label 12 8 "WASD hold  F1 reset  ESC quit" INK PANEL
+  label 12 40 "millis " + str now + "  dt " + str dt MUTED NAVY
+  label 12 60 "frames " + str frames MUTED NAVY
+
+  if keyheld KEY_W
+    label 12 90 "W" LIME NAVY
+  end
+  if keyheld KEY_A
+    label 48 90 "A" LIME NAVY
+  end
+  if keyheld KEY_S
+    label 84 90 "S" LIME NAVY
+  end
+  if keyheld KEY_D
+    label 120 90 "D" LIME NAVY
+  end
+  if keyheld KEY_UP
+    label 12 120 "UP" YELLOW NAVY
+  end
+  if keyheld KEY_SPACE
+    label 80 120 "SPACE" CORAL NAVY
+  end
+  present
+  sleep 16
+end
+exit

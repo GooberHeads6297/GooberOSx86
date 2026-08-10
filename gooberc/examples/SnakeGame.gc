@@ -20,7 +20,8 @@ var dir
 var score
 var high
 var alive
-var tick
+var last_ms
+var acc_ms
 
 fn mod a b
   return a - (a / b) * b
@@ -200,7 +201,8 @@ push snake 206
 dir = KEY_RIGHT
 score = 0
 alive = 1
-tick = 0
+last_ms = millis
+acc_ms = 0
 place_food
 draw
 
@@ -214,7 +216,13 @@ while alive
     save_hi
     exit
   end
+  # Arrows or WASD
   if k == KEY_UP
+    if dir != KEY_DOWN
+      dir = KEY_UP
+    end
+  end
+  if k == KEY_W
     if dir != KEY_DOWN
       dir = KEY_UP
     end
@@ -224,7 +232,17 @@ while alive
       dir = KEY_DOWN
     end
   end
+  if k == KEY_S
+    if dir != KEY_UP
+      dir = KEY_DOWN
+    end
+  end
   if k == KEY_LEFT
+    if dir != KEY_RIGHT
+      dir = KEY_LEFT
+    end
+  end
+  if k == KEY_A
     if dir != KEY_RIGHT
       dir = KEY_LEFT
     end
@@ -234,13 +252,20 @@ while alive
       dir = KEY_RIGHT
     end
   end
-  tick = tick + 1
-  if tick >= 4
-    tick = 0
+  if k == KEY_D
+    if dir != KEY_LEFT
+      dir = KEY_RIGHT
+    end
+  end
+  var now = millis
+  acc_ms = acc_ms + (now - last_ms)
+  last_ms = now
+  if acc_ms >= 400
+    acc_ms = acc_ms - 400
     step
     draw
   end
-  sleep 100
+  sleep 16
 end
 
 draw

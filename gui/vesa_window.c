@@ -1704,7 +1704,7 @@ static void start_dos_flyout_geometry(int* out_fx, int* out_fy, int* out_fw, int
 }
 
 static void start_games_flyout_geometry(int* out_fx, int* out_fy, int* out_fw, int* out_fh) {
-    start_flyout_geometry(start_menu_games_item(), 3, 140, out_fx, out_fy, out_fw, out_fh);
+    start_flyout_geometry(start_menu_games_item(), 4, 140, out_fx, out_fy, out_fw, out_fh);
 }
 
 static void start_tools_flyout_geometry(int* out_fx, int* out_fy, int* out_fw, int* out_fh) {
@@ -1732,7 +1732,7 @@ static int start_menu_pick_at(int x, int y) {
         int fx, fy, fw, fh;
         start_games_flyout_geometry(&fx, &fy, &fw, &fh);
         if (x >= fx && x < fx + fw && y >= fy && y < fy + fh) {
-            for (i = 0; i < 3; i++) {
+            for (i = 0; i < 4; i++) {
                 int iy = fy + 4 + i * 22;
                 if (y >= iy && y < iy + 20) return 110 + i;
             }
@@ -1826,11 +1826,11 @@ static void render_start_menu(void) {
     }
     if (start_games_flyout) {
         int fx, fy, fw, fh;
-        const char* sub[] = { "Minesweeper", "CubeDip", "SnakeGame" };
+        const char* sub[] = { "Minesweeper", "CubeDip", "SnakeGame", "DoomRay" };
         start_games_flyout_geometry(&fx, &fy, &fw, &fh);
         vdesk_draw_rect(fx, fy, fw, fh, t->menu_bg);
         vdesk_draw_border(fx, fy, fw, fh, t->border_light, t->border_outer);
-        for (i = 0; i < 3; i++) {
+        for (i = 0; i < 4; i++) {
             int iy = fy + 4 + i * 22;
             vdesk_draw_rect(fx + 2, iy, fw - 4, 20, t->menu_bg);
             vdesk_draw_text(fx + 8, iy + 4, sub[i], t->menu_fg, t->menu_bg);
@@ -1857,6 +1857,7 @@ static VDeskAppId start_item_to_app(int item) {
     if (item == 110) return VDESK_APP_MINESWEEPER;
     if (item == 111) return VDESK_APP_CUBEDIP;
     if (item == 112) return VDESK_APP_SNAKEGAME;
+    if (item == 113) return VDESK_APP_DOOMRAY;
     if (item == 120) return VDESK_APP_EXPLORER;
     if (item == 121) return VDESK_APP_SYSINFO;
     if (item == 122) return VDESK_APP_TASK_MANAGER;

@@ -31,12 +31,11 @@ Hex literals (`0xRRGGBB`) still work for one-off shades.
 
 ## Keys
 
-| Name | Code |
-|------|------|
-| `KEY_ESC` | 27 |
-| `KEY_ENTER` | 13 |
-| `KEY_SPACE` | 32 |
-| `KEY_UP` / `KEY_DOWN` / `KEY_LEFT` / `KEY_RIGHT` | 128–131 |
+See [`keys.md`](keys.md) for the full table (`KEY_A`…`KEY_Z`, digits, F-keys,
+punctuation) and `keyheld`.
+
+Quick reference: `KEY_ESC` / `KEY_ENTER` / `KEY_SPACE` / arrows /
+`KEY_W`…`KEY_D` (lowercase codes) / `KEY_F1`…`KEY_F12`.
 
 ## Example
 

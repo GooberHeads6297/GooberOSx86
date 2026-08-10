@@ -97,6 +97,9 @@
 #define GBC_GFX_LABEL        64   /* pop bg,fg,str,y,x — text at x,y */
 #define GBC_GFX_PRESENT      65   /* mark window dirty */
 #define GBC_NUM              66   /* pop str → parse decimal int (0 on fail) */
+/* v2.4 — game-loop timing + held keys */
+#define GBC_MILLIS           67   /* push monotonic ms since boot */
+#define GBC_KEY_HELD         68   /* pop key code → 1 if currently held */
 
 #define GBC_MAX_GLOBALS      128
 #define GBC_MAX_LOCALS       32

@@ -1,0 +1,208 @@
+# DoomRay — column raycaster over build-time E1M1 extract (see data/E1M1.map.gcinc)
+# MAP_* vars are prepended by scripts/embed-gob-games.py / wad-extract-e1m1.py
+use goober.gui
+app gui
+
+var COLS = 80
+var VIEW_H = 200
+var FOV = 60
+var FIXED = 256
+
+var px
+var py
+var pa
+var last_ms
+
+fn mod a b
+  return a - (a / b) * b
+end
+
+fn isin deg
+  var sign = 1
+  var x = mod deg 360
+  if x < 0
+    x = x + 360
+  end
+  if x >= 180
+    sign = 0 - 1
+    x = x - 180
+  end
+  if x > 90
+    x = 180 - x
+  end
+  var n = 4 * x * (180 - x) * FIXED
+  var d = 40500 - x * (180 - x)
+  if d == 0
+    d = 1
+  end
+  return sign * (n / d)
+end
+
+fn icos deg
+  return isin (deg + 90)
+end
+
+fn wall_at cx cy
+  if cx < 0
+    return 1
+  end
+  if cy < 0
+    return 1
+  end
+  if cx >= MAP_W
+    return 1
+  end
+  if cy >= MAP_H
+    return 1
+  end
+  var row = get MAP_ROWS cy
+  var ch = slice row cx (cx + 1)
+  if ch == "#"
+    return 1
+  end
+  return 0
+end
+
+fn try_move nx ny
+  var cx = nx / FIXED
+  var cy = ny / FIXED
+  if wall_at cx cy
+    return
+  end
+  px = nx
+  py = ny
+end
+
+fn shade dist side
+  var c = 180
+  if side
+    c = 140
+  end
+  c = c - dist / 8
+  if c < 40
+    c = 40
+  end
+  if side
+    return c * 65536 + c / 2 * 256 + c / 3
+  end
+  return c * 65536 + c * 256 + c / 2
+end
+
+fn draw_frame
+  fill 0x1B2838
+  # sky / floor bands
+  rect 0 0 640 (VIEW_H / 2) 0x87A0C0
+  rect 0 (VIEW_H / 2) 640 (VIEW_H / 2) 0x3A2F24
+  var col = 0
+  while col < COLS
+    var ang = pa - FOV / 2 + col * FOV / COLS
+    var rx = icos ang
+    var ry = 0 - isin ang
+    var ox = px
+    var oy = py
+    var dist = 0
+    var hit = 0
+    var side = 0
+    var prevx = ox / FIXED
+    var prevy = oy / FIXED
+    while hit == 0
+      if dist > 1400
+        hit = 1
+      end
+      ox = ox + rx / 8
+      oy = oy + ry / 8
+      dist = dist + 4
+      var cx = ox / FIXED
+      var cy = oy / FIXED
+      if cx != prevx
+        side = 1
+      end
+      if cy != prevy
+        if cx == prevx
+          side = 0
+        end
+      end
+      prevx = cx
+      prevy = cy
+      if wall_at cx cy
+        hit = 1
+      end
+    end
+    var h = 12000 / (dist + 1)
+    if h > VIEW_H - 4
+      h = VIEW_H - 4
+    end
+    if h < 2
+      h = 2
+    end
+    var y0 = (VIEW_H - h) / 2
+    var bw = 640 / COLS
+    if bw < 1
+      bw = 1
+    end
+    var colr = shade dist side
+    rect (col * bw) y0 bw h colr
+    col = col + 1
+  end
+  rect 0 VIEW_H 640 24 PANEL
+  label 8 (VIEW_H + 6) "WASD move/turn  ESC quit  E1M1 extract" INK PANEL
+  present
+end
+
+window "DoomRay" 640x240
+px = MAP_PX * FIXED + FIXED / 2
+py = MAP_PY * FIXED + FIXED / 2
+# Doom yaw 90 = north; cropped grid has open cells toward +Y, so face south.
+pa = mod (MAP_PA + 180) 360
+last_ms = millis
+draw_frame
+
+while winclosed == 0
+  var k = getkey
+  if k == KEY_ESC
+    exit
+  end
+  var now = millis
+  var dt = now - last_ms
+  last_ms = now
+  if dt < 1
+    dt = 1
+  end
+  if dt > 80
+    dt = 80
+  end
+  var step = dt * 3
+  var turn = dt / 4
+  if turn < 1
+    turn = 1
+  end
+  if keyheld KEY_A
+    pa = mod (pa + turn) 360
+  end
+  if keyheld KEY_LEFT
+    pa = mod (pa + turn) 360
+  end
+  if keyheld KEY_D
+    pa = mod (pa + 360 - turn) 360
+  end
+  if keyheld KEY_RIGHT
+    pa = mod (pa + 360 - turn) 360
+  end
+  var cdir = icos pa
+  var sdir = isin pa
+  if keyheld KEY_W
+    try_move (px + cdir * step / FIXED) (py - sdir * step / FIXED)
+  end
+  if keyheld KEY_UP
+    try_move (px + cdir * step / FIXED) (py - sdir * step / FIXED)
+  end
+  if keyheld KEY_S
+    try_move (px - cdir * step / FIXED) (py + sdir * step / FIXED)
+  end
+  if keyheld KEY_DOWN
+    try_move (px - cdir * step / FIXED) (py + sdir * step / FIXED)
+  end
+  draw_frame
+  sleep 1
+end
+exit

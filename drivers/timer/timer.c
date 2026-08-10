@@ -17,6 +17,7 @@ static volatile uint32_t timer_hz = 0;
  */
 static uint32_t tsc_cycles_per_ms = 0;
 static int      tsc_calibrated = 0;
+static uint64_t tsc_boot = 0;
 
 /* Number of PIT ticks (10 ms each at 100 Hz) to average TSC over at init. */
 #define TSC_CAL_TICKS 3
@@ -143,6 +144,30 @@ void timer_calibrate_tsc(void) {
         return;
     }
     tsc_calibrated = 1;
+    tsc_boot = rdtsc();
+}
+
+/* 64/32 → 32 without __udivdi3 (freestanding). Caps at UINT32_MAX. */
+static uint32_t timer_u64_div_u32(uint64_t n, uint32_t d) {
+    uint64_t q = 0;
+    uint64_t r = 0;
+    int i;
+    if (d == 0) return 0;
+    for (i = 63; i >= 0; --i) {
+        r = (r << 1) | ((n >> i) & 1ULL);
+        if (r >= (uint64_t)d) {
+            r -= (uint64_t)d;
+            q |= (1ULL << i);
+        }
+    }
+    if (q > 0xFFFFFFFFu) return 0xFFFFFFFFu;
+    return (uint32_t)q;
+}
+
+uint32_t timer_millis(void) {
+    if (tsc_calibrated && tsc_cycles_per_ms != 0)
+        return timer_u64_div_u32(rdtsc() - tsc_boot, tsc_cycles_per_ms);
+    return timer_ticks() * 10u;
 }
 
 /* ms -> PIT ticks at 100 Hz (10 ms/tick), rounded up; constant divisor. */

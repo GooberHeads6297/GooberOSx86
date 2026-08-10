@@ -1518,6 +1518,20 @@ static int gob_run_bytecode(const uint8_t* code, uint32_t code_size,
             stack[sp++] = neg ? -n : n;
             continue;
         }
+        if (op == GBC_MILLIS) {
+            if (sp >= GBC_OP_STACK) break;
+            stack[sp++] = (int32_t)timer_millis();
+            continue;
+        }
+        if (op == GBC_KEY_HELD) {
+            int32_t k;
+            if (sp < 1) break;
+            k = stack[--sp];
+            keyboard_poll();
+            if (sp >= GBC_OP_STACK) break;
+            stack[sp++] = keyboard_char_held((unsigned char)k) ? 1 : 0;
+            continue;
+        }
         if (op == GBC_STR_I) {
             int32_t v;
             char buf[16];

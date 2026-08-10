@@ -1927,8 +1927,18 @@ display_reprobe:
                             "framebuffer stays uncached.");
         }
     } else {
-        fb_cache_enable_write_combining(fb.framebuffer_addr, fb.pitch * fb.height);
+        if (fb_cache_enable_write_combining(fb.framebuffer_addr,
+                                            fb.pitch * fb.height)) {
+            display_set_scanout_uncached(0);
+        } else if (fb_pat_set_wc(fb.framebuffer_addr, fb.pitch * fb.height)) {
+            display_set_scanout_uncached(0);
+        } else {
+            display_set_scanout_uncached(1);
+        }
     }
+    driver_log_line(display_scanout_uncached()
+                        ? "[display] scanout UC"
+                        : "[display] scanout WC");
     fbdbg(7, 0xFF00FF, "7 framebuffer committed");
     boot_mode_vesa = 1;
     last_fb_type = 1;
@@ -3345,6 +3355,9 @@ static int x64_inherit_only_display(void) {
             fbdbg_block(10, 0xFF0000); /* red: PAT WC failed */
         }
     }
+    driver_log_line(display_scanout_uncached()
+                        ? "[display] scanout UC"
+                        : "[display] scanout WC");
 
     boot_mode_vesa = 1;
     last_fb_type = 1;

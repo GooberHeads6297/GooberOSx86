@@ -4,13 +4,39 @@ import os
 import struct
 import subprocess
 import sys
-
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GAMES = [
     ("Minesweeper", "Minesweeper.gc"),
     ("CubeDip", "CubeDip.gc"),
     ("SnakeGame", "SnakeGame.gc"),
+    ("DoomRay", "DoomRay.gc"),
 ]
+
+
+def prepare_source(name: str, src_path: str, build: str) -> str:
+    """DoomRay prepends the WAD-extracted map include."""
+    if name != "DoomRay":
+        return src_path
+    extract = os.path.join(REPO, "scripts", "wad-extract-e1m1.py")
+    map_inc = os.path.join(REPO, "gooberc", "examples", "data", "E1M1.map.gcinc")
+    wad = os.path.join(REPO, "dosemu", "fixtures", "doom", "DOOM1.WAD")
+    if os.path.isfile(wad):
+        subprocess.check_call(
+            [sys.executable, extract, "--wad", wad, "-o", map_inc, "--width", "56", "--height", "40"]
+        )
+    if not os.path.isfile(map_inc):
+        raise SystemExit(f"DoomRay needs {map_inc} (run scripts/wad-extract-e1m1.py)")
+    merged = os.path.join(build, "DoomRay.merged.gc")
+    body = open(src_path, encoding="utf-8").read()
+    marker = "app gui\n"
+    map_text = open(map_inc, encoding="utf-8").read().rstrip() + "\n\n"
+    if marker in body:
+        body = body.replace(marker, marker + "\n" + map_text, 1)
+    else:
+        body = map_text + body
+    with open(merged, "w", encoding="utf-8") as out:
+        out.write(body)
+    return merged
 
 
 def main() -> int:
@@ -20,7 +46,7 @@ def main() -> int:
     compiler = os.path.join(REPO, "gooberc", "gooberc.py")
     blobs = []
     for name, src in GAMES:
-        src_path = os.path.join(REPO, "gooberc", "examples", src)
+        src_path = prepare_source(name, os.path.join(REPO, "gooberc", "examples", src), build)
         gob_path = os.path.join(build, f"{name}.gob")
         subprocess.check_call([sys.executable, compiler, src_path, "-o", gob_path])
         data = open(gob_path, "rb").read()

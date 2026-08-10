@@ -8,6 +8,8 @@ void timer_phase(uint32_t hz);
 void timer_interrupt_handler(void);
 void timer_sleep(uint32_t ms);
 uint32_t timer_ticks(void);
+/* Monotonic milliseconds since boot (TSC when calibrated, else PIT×10). */
+uint32_t timer_millis(void);
 
 /*
  * ---- IRQ-independent monotonic time source (rdtsc-based) ----

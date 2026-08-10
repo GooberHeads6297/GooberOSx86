@@ -3846,6 +3846,10 @@ static void vesa_launch_app(VDeskAppId app_id) {
             if (gob_exec("Apps/SnakeGame.gob") != 0)
                 vdesk_notify("Games", "SnakeGame.gob missing");
             break;
+        case VDESK_APP_DOOMRAY:
+            if (gob_exec("Apps/DoomRay.gob") != 0)
+                vdesk_notify("Games", "DoomRay.gob missing");
+            break;
     }
 }
 

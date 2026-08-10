@@ -38,24 +38,40 @@ rect 40 40 28 28 LIME
 present
 ```
 
-## Input
+## Input & timing
 
 - `getkey` — poll one key (0 if none); pumps a desktop frame
+- `keyheld k` — `1` if key code `k` is currently held (does not consume queue)
+- `millis` — monotonic milliseconds since boot (for `dt` in game loops)
 - `winclosed` — 1 if the window was closed
 - `str n` — int → decimal string
 - `num s` — decimal string → int (for saved scores)
 - `exit` — terminate
 - `sleep N` — wait about `N` milliseconds (wall clock) while pumping the desktop
 
-Key labels: `KEY_UP` / `KEY_DOWN` / `KEY_LEFT` / `KEY_RIGHT`, `KEY_ESC`,
-`KEY_SPACE`, `KEY_ENTER` (see [`color.md`](color.md)).
+Key labels: `KEY_W` / `KEY_A` / `KEY_S` / `KEY_D`, arrows, `KEY_ESC`,
+`KEY_SPACE`, `KEY_ENTER`, `KEY_F1`… — see [`keys.md`](keys.md).
+
+Game-loop pattern (pace with `millis`, yield with a short `sleep`):
+
+```gooberc
+var last = millis
+while winclosed == 0
+  var now = millis
+  var dt = now - last
+  last = now
+  # ... update using dt / keyheld KEY_W ...
+  present
+  sleep 1
+end
+```
 
 Interactive games should `fill` + redraw each frame (or `cleargui` + `text`),
-poll `getkey`, and exit on ESC / `winclosed`. Prefer the canvas API for boards
-and artwork — text lines are best for dialogs.
+poll `getkey` / `keyheld`, and exit on ESC / `winclosed`. Prefer the canvas API
+for boards and artwork — text lines are best for dialogs.
 
 ## Notes for agents
 
-Start → Games titles (`Minesweeper`, `CubeDip`, `SnakeGame`) use the canvas API.
-Keep draw lists under ~384 commands per frame. Named colors/keys and hex
-literals work in both host and in-OS compilers.
+Start → Games titles (`Minesweeper`, `CubeDip`, `SnakeGame`, `DoomRay`) use the
+canvas API. Keep draw lists under ~384 commands per frame. Named colors/keys and
+hex literals work in both host and in-OS compilers.

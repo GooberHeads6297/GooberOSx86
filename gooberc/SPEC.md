@@ -25,13 +25,14 @@ punctuation. Humans and agents both author it easily.
 | `call name args…` | Call with 0+ args |
 | `return` / `return <expr>` | Return (optional value) |
 | `window "Title" WxH` / `text "..."` / `text expr` / `wait` | GUI |
-| `cleargui` / `getkey` / `winclosed` / `str n` | Interactive GUI |
+| `cleargui` / `getkey` / `keyheld k` / `winclosed` / `str n` | Interactive GUI |
+| `millis` | Monotonic ms since boot (game-loop `dt`) |
 | `if` / `else` / `end` | Conditional with optional else |
 | `sleep N` / `clear 0xRRGGBBAA` | wall-clock ms sleep (GUI pumps desktop) / gfx3d stub |
 | `exit` | Terminate |
 | `# comment` | Comment |
 | `RED` / `NAVY` / `PANEL` / … | Named RGB color literals (see `libs/color.md`) |
-| `KEY_UP` / `KEY_ESC` / … | Named key-code literals |
+| `KEY_UP` / `KEY_W` / `KEY_F1` / … | Named key-code literals (see `libs/keys.md`) |
 
 ### Values and builtins
 
@@ -156,8 +157,11 @@ offset  size  field
 | 64 GFX_LABEL | — | pop bg,fg,str,y,x → text at x,y |
 | 65 GFX_PRESENT | — | dirty canvas window |
 | 66 NUM | — | pop str → parse decimal int |
+| 67 MILLIS | — | push monotonic ms since boot |
+| 68 KEY_HELD | — | pop key → 1 if currently held |
 
-Surface syntax: `fill` / `rect` / `label` / `present` / `num` (see [libs/gui.md](libs/gui.md)).
+Surface syntax: `fill` / `rect` / `label` / `present` / `num` / `millis` /
+`keyheld` (see [libs/gui.md](libs/gui.md), [libs/keys.md](libs/keys.md)).
 Hex integer literals (`0xRRGGBB`) are accepted. Call arguments bind at sum
 precedence so `mod x 10 == 9` means `(mod x 10) == 9`.
 

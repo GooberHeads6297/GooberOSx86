@@ -174,28 +174,56 @@ static int key_was_down(uint8_t key) {
     return 0;
 }
 
+static int key_is_down_now(const uint8_t* report, uint8_t key) {
+    int i;
+    for (i = 2; i < 8; i++) {
+        if (report[i] == key) return 1;
+    }
+    return 0;
+}
+
+static char hid_usage_to_char(uint8_t key, int shifted) {
+    char c = 0;
+    if (key < 128)
+        c = shifted ? hid_key_ascii_shift[key] : hid_key_ascii[key];
+    if (key == 0x4F) c = KEY_RIGHT;
+    else if (key == 0x50) c = KEY_LEFT;
+    else if (key == 0x51) c = KEY_DOWN;
+    else if (key == 0x52) c = KEY_UP;
+    else if (key >= 0x3A && key <= 0x45) c = (char)(KEY_F1 + (key - 0x3A));
+    return c;
+}
+
 static void usb_hid_handle_keyboard_report(const uint8_t* report, uint8_t length) {
     if (!report || length < 8 || !keyboard_present) return;
     uint8_t modifiers = report[0];
     int shifted = (modifiers & ((1U << 1) | (1U << 5))) != 0;
+    int i;
     if (keyboard_report_count == 0) {
         hid_print("[usb-hid] first keyboard interrupt report received.\n");
     }
     keyboard_report_count++;
 
-    for (int i = 2; i < 8; i++) {
+    /* Releases: clear held state for usages that left the 6-key slot. */
+    for (i = 0; i < 6; i++) {
+        uint8_t key = last_keys[i];
+        char c0, c1;
+        if (key == 0 || key_is_down_now(report, key)) continue;
+        c0 = hid_usage_to_char(key, 0);
+        c1 = hid_usage_to_char(key, 1);
+        if (c0) keyboard_release_char(c0);
+        if (c1 && c1 != c0) keyboard_release_char(c1);
+    }
+
+    for (i = 2; i < 8; i++) {
         uint8_t key = report[i];
+        char c;
         if (key == 0 || key_was_down(key)) continue;
-        char c = (key < 128) ? (shifted ? hid_key_ascii_shift[key] : hid_key_ascii[key]) : 0;
-        if (key == 0x4F) c = KEY_RIGHT;
-        else if (key == 0x50) c = KEY_LEFT;
-        else if (key == 0x51) c = KEY_DOWN;
-        else if (key == 0x52) c = KEY_UP;
-        else if (key >= 0x3A && key <= 0x45) c = KEY_F1 + (key - 0x3A);
+        c = hid_usage_to_char(key, shifted);
         if (c) keyboard_inject_char(c);
     }
 
-    for (int i = 0; i < 6; i++) last_keys[i] = report[2 + i];
+    for (i = 0; i < 6; i++) last_keys[i] = report[2 + i];
 }
 
 void usb_hid_handle_boot_report_ex(int protocol, const uint8_t* report,

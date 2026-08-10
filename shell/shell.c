@@ -496,7 +496,7 @@ static int shell_is_live(void) {
 
 static void list_games(void) {
     if (shell_is_live()) {
-        print("Start menu -> Games: Minesweeper, CubeDip, SnakeGame (GooberC)\n");
+        print("Start menu -> Games: Minesweeper, CubeDip, SnakeGame, DoomRay (GooberC)\n");
         print("doom.exe (native GooberDoom)\n");
         return;
     }
@@ -1711,7 +1711,7 @@ void execute_command(const char* cmd) {
                !strcmp_local(cmd, "pong.exe")) {
         if (shell_is_live()) {
             print("Legacy VGA games disabled on live ISO.\n");
-            print("Use Start -> Games for GooberC Minesweeper/CubeDip/SnakeGame.\n");
+            print("Use Start -> Games for GooberC Minesweeper/CubeDip/SnakeGame/DoomRay.\n");
         } else if (!strcmp_local(cmd, "snakeGame.exe")) {
             print("Launching snakeGame.exe... Press ESC to quit.\n");
             run_snake_game();

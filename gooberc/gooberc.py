@@ -77,6 +77,8 @@ GBC_GFX_RECT = 63
 GBC_GFX_LABEL = 64
 GBC_GFX_PRESENT = 65
 GBC_NUM = 66
+GBC_MILLIS = 67
+GBC_KEY_HELD = 68
 
 MAX_LOCALS = 32
 MAX_GLOBALS = 128
@@ -123,15 +125,49 @@ COLORS = {
 }
 
 # Key codes from the OS keyboard driver (unsigned char values).
+# Letters/digits match getkey inject (lowercase / unshifted).
 KEYS = {
     "KEY_ESC": 27,
     "KEY_ENTER": 13,
+    "KEY_TAB": 9,
+    "KEY_BACKSPACE": 8,
     "KEY_SPACE": 32,
     "KEY_UP": 128,
     "KEY_DOWN": 129,
     "KEY_LEFT": 130,
     "KEY_RIGHT": 131,
+    "KEY_F1": 0x8B,
+    "KEY_F2": 0x8C,
+    "KEY_F3": 0x8D,
+    "KEY_F4": 0x8E,
+    "KEY_F5": 0x8F,
+    "KEY_F6": 0x90,
+    "KEY_F7": 0x91,
+    "KEY_F8": 0x92,
+    "KEY_F9": 0x93,
+    "KEY_F10": 0x94,
+    "KEY_F11": 0x95,
+    "KEY_F12": 0x96,
 }
+for _i, _ch in enumerate("abcdefghijklmnopqrstuvwxyz"):
+    KEYS["KEY_" + _ch.upper()] = ord(_ch)
+for _i in range(10):
+    KEYS["KEY_%d" % _i] = ord("0") + _i
+KEYS.update(
+    {
+        "KEY_MINUS": ord("-"),
+        "KEY_EQUALS": ord("="),
+        "KEY_LBRACKET": ord("["),
+        "KEY_RBRACKET": ord("]"),
+        "KEY_SEMICOLON": ord(";"),
+        "KEY_QUOTE": ord("'"),
+        "KEY_BACKTICK": ord("`"),
+        "KEY_BACKSLASH": ord("\\"),
+        "KEY_COMMA": ord(","),
+        "KEY_DOT": ord("."),
+        "KEY_SLASH": ord("/"),
+    }
+)
 
 
 class Compiler:
@@ -306,13 +342,15 @@ class Compiler:
         name, i = self.parse_ident(s, i)
         if name is None:
             raise ValueError(f"bad factor near: {s[i:i+24]!r}")
-        if name in ("map", "errmsg", "getkey", "winclosed"):
+        if name in ("map", "errmsg", "getkey", "winclosed", "millis"):
             if name == "map":
                 self.emit(GBC_MAP_NEW)
             elif name == "errmsg":
                 self.emit(GBC_LAST_ERR)
             elif name == "getkey":
                 self.emit(GBC_KEY_POLL)
+            elif name == "millis":
+                self.emit(GBC_MILLIS)
             else:
                 self.emit(GBC_GUI_CLOSED)
             return i
@@ -330,6 +368,7 @@ class Compiler:
             "dos_run",
             "str",
             "num",
+            "keyheld",
         ):
             # Args are sums so trailing == / != bind outside the call.
             i = self.emit_sum(s, i)
@@ -346,6 +385,7 @@ class Compiler:
                 "dos_run": GBC_DOS_RUN,
                 "str": GBC_STR_I,
                 "num": GBC_NUM,
+                "keyheld": GBC_KEY_HELD,
             }[name]
             self.emit(op)
             return i

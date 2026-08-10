@@ -265,9 +265,31 @@ static int gc_named_const(const char* name, int32_t* out) {
         {"PANEL", 0x243447}, {"INK", 0xEEF2F7}, {"MUTED", 0x9FB3C8},
         {"TRANSPARENT", 0x000000},
         {"KEY_ESC", 27}, {"KEY_ENTER", 13}, {"KEY_SPACE", 32},
+        {"KEY_TAB", 9}, {"KEY_BACKSPACE", 8},
         {"KEY_UP", 128}, {"KEY_DOWN", 129}, {"KEY_LEFT", 130}, {"KEY_RIGHT", 131},
+        {"KEY_F1", 0x8B}, {"KEY_F2", 0x8C}, {"KEY_F3", 0x8D}, {"KEY_F4", 0x8E},
+        {"KEY_F5", 0x8F}, {"KEY_F6", 0x90}, {"KEY_F7", 0x91}, {"KEY_F8", 0x92},
+        {"KEY_F9", 0x93}, {"KEY_F10", 0x94}, {"KEY_F11", 0x95}, {"KEY_F12", 0x96},
+        {"KEY_MINUS", '-'}, {"KEY_EQUALS", '='},
+        {"KEY_LBRACKET", '['}, {"KEY_RBRACKET", ']'},
+        {"KEY_SEMICOLON", ';'}, {"KEY_QUOTE", '\''}, {"KEY_BACKTICK", '`'},
+        {"KEY_BACKSLASH", '\\'}, {"KEY_COMMA", ','}, {"KEY_DOT", '.'},
+        {"KEY_SLASH", '/'},
     };
     size_t i;
+    /* KEY_A..KEY_Z → lowercase getkey codes; KEY_0..KEY_9 → digit chars. */
+    if (name[0] == 'K' && name[1] == 'E' && name[2] == 'Y' && name[3] == '_' &&
+        name[4] != '\0' && name[5] == '\0') {
+        char ch = name[4];
+        if (ch >= 'A' && ch <= 'Z') {
+            *out = (int32_t)('a' + (ch - 'A'));
+            return 0;
+        }
+        if (ch >= '0' && ch <= '9') {
+            *out = (int32_t)ch;
+            return 0;
+        }
+    }
     for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
         if (strcmp(name, tab[i].n) == 0) {
             *out = tab[i].v;
@@ -425,6 +447,10 @@ static int emit_factor(const char** pp) {
         *pp = p;
         return emit_byte(GBC_KEY_POLL);
     }
+    if (strcmp(name, "millis") == 0) {
+        *pp = p;
+        return emit_byte(GBC_MILLIS);
+    }
     if (strcmp(name, "winclosed") == 0) {
         *pp = p;
         return emit_byte(GBC_GUI_CLOSED);
@@ -434,7 +460,8 @@ static int emit_factor(const char** pp) {
         strcmp(name, "read") == 0 || strcmp(name, "listdir") == 0 ||
         strcmp(name, "dirname") == 0 || strcmp(name, "basename") == 0 ||
         strcmp(name, "typeof") == 0 || strcmp(name, "dos_run") == 0 ||
-        strcmp(name, "str") == 0 || strcmp(name, "num") == 0) {
+        strcmp(name, "str") == 0 || strcmp(name, "num") == 0 ||
+        strcmp(name, "keyheld") == 0) {
         uint8_t op;
         *pp = p;
         /* Args are sums so trailing == / != bind outside the call. */
@@ -450,6 +477,7 @@ static int emit_factor(const char** pp) {
         else if (strcmp(name, "dos_run") == 0) op = GBC_DOS_RUN;
         else if (strcmp(name, "str") == 0) op = GBC_STR_I;
         else if (strcmp(name, "num") == 0) op = GBC_NUM;
+        else if (strcmp(name, "keyheld") == 0) op = GBC_KEY_HELD;
         else op = GBC_TYPEOF;
         return emit_byte(op);
     }

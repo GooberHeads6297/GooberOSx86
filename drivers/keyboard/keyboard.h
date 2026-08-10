@@ -11,6 +11,9 @@ void keyboard_poll(void);
 char keyboard_read_char(void);
 int keyboard_has_char(void);
 void keyboard_inject_char(char c);
+void keyboard_release_char(char c);
+/* 1 if GooberC/getkey code `c` is currently held (PS/2 or USB). */
+int keyboard_char_held(unsigned char c);
 bool keyboard_is_shift_active(void);
 bool keyboard_is_ctrl_active(void);
 bool keyboard_is_alt_active(void);

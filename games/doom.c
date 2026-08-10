@@ -170,14 +170,24 @@ static void doom_render_scene(DoomApp* app) {
     for (x = 0; x < FB_W; x++) cast_column(app, x);
 }
 
+static void doom_dirty_client(VWindow* win) {
+    int cx = win->x + BORDER_SIZE;
+    int cy = win->y + TITLEBAR_HEIGHT + BORDER_SIZE;
+    int cw = win->width - BORDER_SIZE * 2;
+    int ch = win->height - TITLEBAR_HEIGHT - BORDER_SIZE * 2;
+    if (cw < 1 || ch < 1) return;
+    vdesk_mark_dirty(cx, cy, cw, ch);
+}
+
 static void doom_win_render(VWindow* win, int cx, int cy, int cw, int ch) {
     DoomApp* app = (DoomApp*)win->user_data;
     int x, y, bw, bh, cols, rows;
     if (!app || !app->fb) return;
-    cols = 160;
-    rows = 100;
+    /* Fixed low present grid; block size grows with client area (high-res). */
+    cols = 80;
+    rows = 50;
     if (cw < cols) cols = cw > 0 ? cw : 1;
-    if (ch < rows) rows = ch > 20 ? ch - 20 : 1;
+    if (ch < rows + 18) rows = ch > 20 ? ch - 20 : 1;
     bw = cw / cols;
     bh = (ch - 18) / rows;
     if (bw < 1) bw = 1;
@@ -199,32 +209,41 @@ static void doom_win_render(VWindow* win, int cx, int cy, int cw, int ch) {
 static void doom_win_key(VWindow* win, char key) {
     DoomApp* app = (DoomApp*)win->user_data;
     unsigned char k;
-    int dx, dy;
     if (!app) return;
     k = (unsigned char)key;
-    dx = app->cos_t[app->player_dir] >> 2;
-    dy = -app->sin_t[app->player_dir] >> 2;
-    if (k == 'w' || k == 'W') try_move(app, dx, dy);
-    else if (k == 's' || k == 'S') try_move(app, -dx, -dy);
-    else if (k == 'a' || k == 'A') app->player_dir = (app->player_dir + 350) % 360;
-    else if (k == 'd' || k == 'D') app->player_dir = (app->player_dir + 10) % 360;
-    else if (k == 0x1B) {
+    if (k == 0x1B) {
         if (app->fb) kfree(app->fb);
         kfree(app);
         win->user_data = NULL;
         vdesk_close_window(win);
         return;
     }
-    doom_render_scene(app);
-    vdesk_mark_dirty(win->x, win->y, win->width, win->height);
+    /* Movement is handled in tick via keyboard_char_held (hold-to-move). */
+    (void)k;
 }
 
 static void doom_win_tick(VWindow* win) {
     DoomApp* app = (DoomApp*)win->user_data;
+    int dx, dy;
+    int moved = 0;
     if (!app) return;
-    /* light idle redraw so window stays lively */
-    doom_render_scene(app);
-    vdesk_mark_dirty(win->x, win->y, win->width, win->height);
+    keyboard_poll();
+    dx = app->cos_t[app->player_dir] >> 2;
+    dy = -app->sin_t[app->player_dir] >> 2;
+    if (keyboard_char_held('w')) { try_move(app, dx, dy); moved = 1; }
+    if (keyboard_char_held('s')) { try_move(app, -dx, -dy); moved = 1; }
+    if (keyboard_char_held('a')) {
+        app->player_dir = (app->player_dir + 350) % 360;
+        moved = 1;
+    }
+    if (keyboard_char_held('d')) {
+        app->player_dir = (app->player_dir + 10) % 360;
+        moved = 1;
+    }
+    if (moved) {
+        doom_render_scene(app);
+        doom_dirty_client(win);
+    }
 }
 
 static void doom_win_close_cleanup(VWindow* win) {

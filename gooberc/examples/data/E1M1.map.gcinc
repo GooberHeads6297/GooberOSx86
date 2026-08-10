@@ -1,0 +1,21 @@
+# Auto-generated from DOOM1.WAD E1M1 — do not edit.
+var MAP_W = 21
+var MAP_H = 14
+var MAP_PX = 17
+var MAP_PY = 1
+var MAP_PA = 90
+var MAP_ROWS = []
+push MAP_ROWS "#####################"
+push MAP_ROWS "###############...###"
+push MAP_ROWS "###############....##"
+push MAP_ROWS "#############.......#"
+push MAP_ROWS "######...####..#..#.#"
+push MAP_ROWS "#####.....##........#"
+push MAP_ROWS "#...................#"
+push MAP_ROWS "####......#.........#"
+push MAP_ROWS "######....###..#..#.#"
+push MAP_ROWS "#############.......#"
+push MAP_ROWS "###############.....#"
+push MAP_ROWS "###################.#"
+push MAP_ROWS "###################.#"
+push MAP_ROWS "#####################"

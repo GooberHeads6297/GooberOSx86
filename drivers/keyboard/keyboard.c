@@ -34,6 +34,8 @@ static volatile uint8_t isr_last_scancode = 0;
 static volatile uint32_t isr_count = 0;
 
 static bool key_states[256];
+/* Char codes delivered to getkey / GooberC (ASCII + KEY_*). */
+static uint8_t char_held[256];
 static bool shift_pressed = false;
 static bool ctrl_pressed = false;
 static bool alt_pressed = false;
@@ -314,17 +316,68 @@ void keyboard_init(void) {
     extended = 0;
     g_set2_break = 0;
     /* g_scancode_mode is set inside keyboard_enable_irq(). */
-    for (int i = 0; i < 256; i++) key_states[i] = false;
+    for (int i = 0; i < 256; i++) {
+        key_states[i] = false;
+        char_held[i] = 0;
+    }
     keyboard_enable_irq();
+}
+
+static void char_held_set(unsigned char c, int down) {
+    if (!c) return;
+    char_held[c] = down ? 1 : 0;
+    /* Letters: track both cases so KEY_W matches shift or caps. */
+    if (c >= 'a' && c <= 'z')
+        char_held[(unsigned char)(c - 32)] = down ? 1 : 0;
+    else if (c >= 'A' && c <= 'Z')
+        char_held[(unsigned char)(c + 32)] = down ? 1 : 0;
 }
 
 void keyboard_inject_char(char c) {
     if (!c) return;
+    char_held_set((unsigned char)c, 1);
     int next = (head + 1) % BUFFER_SIZE;
     if (next != tail) {
         buffer[head] = c;
         head = next;
     }
+}
+
+void keyboard_release_char(char c) {
+    char_held_set((unsigned char)c, 0);
+}
+
+int keyboard_char_held(unsigned char c) {
+    if (!c) return 0;
+    if (char_held[c]) return 1;
+    if (c >= 'a' && c <= 'z' && char_held[(unsigned char)(c - 32)]) return 1;
+    if (c >= 'A' && c <= 'Z' && char_held[(unsigned char)(c + 32)]) return 1;
+    return 0;
+}
+
+/* Clear held chars for a set-1 make code (and both shift variants). */
+static void keyboard_release_scancode(uint8_t code, int is_extended) {
+    char a = 0, b = 0;
+    if (is_extended) {
+        switch (code) {
+            case 0x48: a = KEY_UP; break;
+            case 0x50: a = KEY_DOWN; break;
+            case 0x4B: a = KEY_LEFT; break;
+            case 0x4D: a = KEY_RIGHT; break;
+            default: break;
+        }
+    } else if (code >= 0x3B && code <= 0x44) {
+        a = (char)(KEY_F1 + (code - 0x3B));
+    } else if (code == 0x57) {
+        a = (char)(KEY_F1 + 10);
+    } else if (code == 0x58) {
+        a = (char)(KEY_F1 + 11);
+    } else if (code < 128) {
+        a = scancode_to_ascii[code];
+        b = scancode_to_ascii_shift[code];
+    }
+    if (a) keyboard_release_char(a);
+    if (b && b != a) keyboard_release_char(b);
 }
 
 /*
@@ -428,7 +481,15 @@ static void keyboard_handle_scancode(uint8_t scancode) {
     if (code == 0x38) alt_pressed = !released;
     if (code == 0x3A && !released) caps_lock = !caps_lock;
 
-    if (!released) {
+    if (released) {
+        int suppress = 0;
+        if (g_vm_guest && usb_hid_has_keyboard_device())
+            suppress = 1;
+        else if (!g_vm_guest && usb_hid_keyboard_active())
+            suppress = 1;
+        if (!suppress)
+            keyboard_release_scancode(code, extended);
+    } else {
         char c = 0;
 
         if (extended) {

@@ -55,7 +55,8 @@ typedef enum {
     VDESK_APP_DOOM,
     VDESK_APP_MINESWEEPER,
     VDESK_APP_CUBEDIP,
-    VDESK_APP_SNAKEGAME
+    VDESK_APP_SNAKEGAME,
+    VDESK_APP_DOOMRAY
 } VDeskAppId;
 
 typedef struct {
