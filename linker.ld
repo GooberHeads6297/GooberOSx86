@@ -12,7 +12,18 @@ SECTIONS {
 
     .rodata : { *(.rodata*) }
     .data : { *(.data*) }
-    .bss : { *(.bss*) }
 
+    /* IDT before .bss so the kernel heap arena cannot overrun it. */
+    .idt : ALIGN(4K) {
+        *(.idt)
+    }
+
+    .bss : ALIGN(4K) {
+        *(COMMON)
+        *(.bss)
+        *(.bss.*)
+    }
+
+    . = ALIGN(4K);
     _kernel_end = .;
 }

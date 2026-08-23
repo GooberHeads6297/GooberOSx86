@@ -64,9 +64,7 @@ static int text_pos_at_cell(const char* text, int len, int cols,
 #define IN_RECT(px, py, rx, ry, rw, rh) \
     ((px) >= (rx) && (px) < (rx) + (rw) && (py) >= (ry) && (py) < (ry) + (rh))
 
-#ifdef __x86_64__
-static void vesa_desktop_alloc_backbuffer_x64(uint32_t w, uint32_t h);
-#endif
+static void vesa_desktop_alloc_backbuffer(uint32_t w, uint32_t h);
 
 /* Draw a simple raised push-button with a centered label. */
 static void draw_button(int x, int y, int w, int h, const char* label, int active) {
@@ -836,9 +834,7 @@ static void display_settings_apply(DisplaySettingsApp* app) {
         strncpy(app->status, "Mode rejected by display.", sizeof(app->status) - 1);
         return;
     }
-#ifdef __x86_64__
-    vesa_desktop_alloc_backbuffer_x64(w, h);
-#endif
+    vesa_desktop_alloc_backbuffer(w, h);
     input_set_bounds(w, h);
     vdesk_set_screen_size((int)w, (int)h);
     app->drop_open = 0;
@@ -3882,12 +3878,10 @@ static void vesa_launch_app(VDeskAppId app_id) {
  * pre-Phase-4 tearing visible. The decision and the allocation size are
  * logged so the boot trail makes it obvious which path armed.
  *
- * On x86 we keep the legacy 4 MiB BSS static back-buffer that kernel.c
- * installs (see VESA_STATIC_BACKBUFFER_BYTES). The new heap-backed path
- * is x64-only so we don't churn the x86 bump-allocator lifecycle.
+ * installs a heap-backed back-buffer during desktop init and on resolution
+ * changes. The legacy 8 MiB BSS static back-buffer was removed from x86.
  */
-#ifdef __x86_64__
-static void vesa_desktop_alloc_backbuffer_x64(uint32_t w, uint32_t h) {
+static void vesa_desktop_alloc_backbuffer(uint32_t w, uint32_t h) {
     uint32_t pitch = vesa_get_pitch();
     uint8_t  bpp   = vesa_get_bpp();
     uint32_t need  = pitch * h;
@@ -3928,7 +3922,6 @@ static void vesa_desktop_alloc_backbuffer_x64(uint32_t w, uint32_t h) {
     itoa(fps, buf, 10); print(buf); print(" Hz, budget ");
     itoa(budget_ms, buf, 10); print(buf); print(" ms/frame\n");
 }
-#endif
 
 /*
  * Phase 4 (item 3): VGA-graphics fallback surface. When the display
@@ -4036,12 +4029,10 @@ void vesa_desktop_init(void) {
         itoa((int)h, buf, 10); print(buf); print("\n");
     }
 
-#ifdef __x86_64__
     /* Allocate the heap-backed back-buffer before we touch any of the
      * draw primitives in vdesk_init -- the bb pointer takes effect via
      * vesa_set_backbuffer_bytes BEFORE the first vesa_fill_rect. */
-    vesa_desktop_alloc_backbuffer_x64(w, h);
-#endif
+    vesa_desktop_alloc_backbuffer(w, h);
 
     input_set_bounds(w, h);
 

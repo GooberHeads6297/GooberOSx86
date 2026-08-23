@@ -75,8 +75,30 @@ compile_c() {
   ${CC} ${CFLAGS_BASE} ${EXTRA_DEFS} "$@"
 }
 
+print_migration_banner() {
+  cat <<'EOF'
+
+============================================================================
+GooberOSx86  i386 protected-mode build (x64 parity backport)
+----------------------------------------------------------------------------
+Phase B1   (free-list heap + 16 MiB BSS arena)                 -- COMPLETE.
+Phase B2   (heap-backed VESA backbuffer; static 8 MiB BSS gone) -- COMPLETE.
+Phase B3   (boot stages: userspace + desktop + WD_STORAGE_X64)  -- COMPLETE.
+Phase B4   (ACPI reboot + fb console echo + touchpad guard)     -- COMPLETE.
+Phase B5   (GooberDOS on x86 — 8 MiB guest arena via kmalloc)   -- COMPLETE.
+Phase B6   (verify-x86-smoke.sh + USB gate on x86 ISO)          -- COMPLETE.
+
+x86 keeps BIOS VBE + INT 13h real-mode paths; x64 keeps long-mode + PAT WC.
+Both arches share shell, desktop, GooberC, games, storage, USB, and GooberDOS.
+============================================================================
+
+EOF
+}
+
 build_image() {
   local payload_requested="${EMBED_INSTALL_PAYLOAD}"
+
+  print_migration_banner
 
   build_kernel 0 ""
 
@@ -349,7 +371,8 @@ build_kernel() {
     "${BUILD_DIR}/memory.o" \
     "${BUILD_DIR}/string.o" \
     "${BUILD_DIR}/boot_safety.o" \
-    "${BUILD_DIR}/kernel.o"
+    "${BUILD_DIR}/kernel.o" \
+    "$(gcc -m32 -print-libgcc-file-name)"
 
   echo "[+] Kernel built: ${BUILD_DIR}/kernel.bin"
 }

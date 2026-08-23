@@ -623,21 +623,14 @@ void touchpad_init(void) {
     int max_controllers = 4;
 
     if (!acpi_match && !baytrail_probe && controllers > 0) {
-#ifdef __x86_64__
         /*
-         * Acer R3-131T / Braswell UEFI: poking ungated LPSS I2C MMIO without
-         * an ACPI HID node can bus-stall. Skip the blind multi-controller
-         * probe; touchpad stays off rather than hanging the boot.
+         * Without an ACPI HID node, blind LPSS I2C MMIO probes can bus-stall
+         * (Braswell UEFI / Acer-class hardware). Skip rather than hang boot.
          */
-        print("[touchpad] no ACPI HID match; skipping PCI I2C MMIO probe (x64 UEFI).\n");
-        driver_log_line("[touchpad] skipping PCI I2C probe without ACPI HID on x64.");
-        g_tp_skip_reason = "no ACPI HID match (x64)";
+        print("[touchpad] no ACPI HID match; skipping PCI I2C MMIO probe.\n");
+        driver_log_line("[touchpad] skipping PCI I2C probe without ACPI HID.");
+        g_tp_skip_reason = "no ACPI HID match";
         return;
-#else
-        print("[touchpad] no ACPI HID match; probing PCI I2C controllers anyway.\n");
-        driver_log_line("[touchpad] probing PCI I2C without ACPI HID match.");
-        baytrail_probe = 1;
-#endif
     }
 
     if (!acpi_match && !baytrail_probe) {

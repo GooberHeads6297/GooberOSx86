@@ -22,9 +22,9 @@
 # Notes:
 #   * Both arch scripts produce HYBRID BIOS + UEFI ISOs. On a UEFI machine the
 #     same ISO boots via grub-efi-amd64 and exposes the GOP framebuffer via
-#     multiboot2 (Phase 0 of the UEFI/GOP/x64 migration plan).
-#   * The x64 build is the migration target; until phases 1-4 of the plan are
-#     complete, expect compile errors. Set X64_ALLOW_FAIL=1 to scaffold past them.
+#     multiboot2.
+#   * x86 and x64 are both full-featured builds (desktop, GooberC, GooberDOS).
+#     x64 adds long-mode + PAT WC; x86 keeps BIOS VBE real-mode modeset.
 # -----------------------------------------------------------------------------
 set -euo pipefail
 

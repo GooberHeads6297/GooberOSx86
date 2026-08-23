@@ -6,10 +6,9 @@
 
 /*
  * Phase 3f extends the heap API with krealloc() so storage drivers, the
- * install path, the editor, taskmgr, and the games can resize buffers
- * cleanly. The x86 build still uses the original bump allocator (a
- * thin krealloc shim is provided for source-level parity); the x64
- * build uses the new free-list allocator below.
+ * install path, the editor, taskmgr, games, and GooberDOS can resize
+ * buffers cleanly. Both x86 and x86_64 use the free-list allocator in
+ * lib/memory.c backed by a BSS arena from kernel.c.
  *
  * Semantics:
  *   - kmalloc(0)   -> NULL

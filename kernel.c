@@ -34,15 +34,9 @@
  *   - the CPU-exception handler entry point (the body differs by ABI;
  *     gated by __i386__ / __x86_64__)
  *
- * The driver stack that is still x86-only at this round (Phase 3e/3f):
- *   drivers/storage, fs, shell/shell.c, taskmgr, gui, editor, games.
- *
- * Phase 3d brings drivers/pci/pci.c (real PCI scan) and the entire USB host
- * stack (uhci/ohci/ehci/xhci + host.c + enumeration.c + hid.c + usb.c) into
- * the unified link. The x64 boot stage `USB host stack` invokes usb_init()
- * under boot_guarded_run() with a 12-second watchdog (WD_USB = 1200 ticks
- * at 100 Hz), so a wedged controller is contained and the boot continues
- * to Display + REPL.
+ * The driver stack is linked on both arches (storage, fs, shell, gui,
+ * editor, games, GooberDOS). x86_64 adds long-mode boot and PAT WC; x86
+ * keeps BIOS VBE real-mode modeset.
  */
 #include "drivers/keyboard/keyboard.h"
 #include "drivers/mouse/mouse.h"
@@ -65,21 +59,19 @@
 #define IRQ0 32
 #define IRQ1 33
 
-#define KERNEL_HEAP_SIZE (512 * 1024)  // 512KB heap for FAT32 + desktop
-#define VESA_STATIC_BACKBUFFER_BYTES (8 * 1024 * 1024)
-
 #ifdef __i386__
 volatile int keyboard_interrupt_flag = 0;
 #endif
 
+/* Set by the Shell / desktop boot stage when vesa_desktop_init() succeeds. */
+static int g_desktop_init_ok = 0;
+
 extern unsigned char _kernel_start;
 extern unsigned char _kernel_end;
 
-
-
 #ifdef __i386__
 static int kernel_pid = -1;
-static uint8_t vesa_static_backbuffer[VESA_STATIC_BACKBUFFER_BYTES] __attribute__((aligned(4096)));
+static int i386_fb_console_echo = 1;
 #endif
 
 /* Boot mode: 0 = VGA text mode, 1 = VESA framebuffer mode */
@@ -104,7 +96,8 @@ static uintptr_t last_fb_addr = 0;
  * re-walking the cmdline. gooberos.display= values: "auto" (try every driver
  * in priority order), "vesa" (inherited GRUB LFB only), "bochs" (Bochs/QEMU
  * dispi only), or "off" (force VGA text). gooberos.boot= values: "vesa-auto",
- * "vga", "smart" (hardware-aware profile), or "default".
+ * "vga", "v86" (v86/QEMU text-plane only), "smart" (hardware-aware profile),
+ * or "default".
  */
 static boot_config_t g_boot_config = {
     .cmdline = "",
@@ -140,11 +133,9 @@ const boot_smart_profile_t* boot_smart_profile(void) { return &g_smart_profile; 
 int kernel_display_target_fps(void) {
     int fps = g_boot_config.display_fps;
     if (fps <= 0) {
-#ifdef __x86_64__
         /* Braswell inherit: fewer full-frame composites to uncached GOP. */
         extern int display_scanout_uncached(void);
         if (display_scanout_uncached()) return 20;
-#endif
         return 60;
     }
     return fps;
@@ -993,6 +984,28 @@ static void serial_out(const char* s);
 static void serial_out_hex(uint32_t v);
 static void serial_out_hex64(uint64_t v);
 
+/*
+ * v86 / bare VGA-text frontends that only scan the legacy 0xB8000 plane (not
+ * GRUB's inherited GOP framebuffer). gooberos.boot=v86 or =vga forces early
+ * VGA register restore and skips the textcon FB backend in revert_to_text_floor.
+ */
+static int kernel_wants_vga_text_plane(void) {
+    if (kstr_eq(g_boot_config.boot, "vga") || kstr_eq(g_boot_config.boot, "v86"))
+        return 1;
+    return 0;
+}
+
+static void kernel_bind_vga_text_plane(void) {
+    boot_mode_vesa = 0;
+    boot_mode_text_console = 1;
+    display_restore_vga_text();
+    vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    clear_screen();
+    con_init_vga();
+    display_register_text_mode();
+    serial_out("[display] bound text console to 0xB8000 (VGA text plane).\n");
+}
+
 /* Parse a "WxH" geometry string (e.g. "1366x768"). Returns 1 and fills the w
  * and h out-params on success, 0 on a malformed/empty string. */
 static int parse_wxh(const char* s, uint32_t* w, uint32_t* h) {
@@ -1351,6 +1364,11 @@ static void revert_to_text_floor(void) {
     boot_mode_vesa = 0;
     boot_mode_text_console = 1;
 
+    if (kernel_wants_vga_text_plane()) {
+        kernel_bind_vga_text_plane();
+        return;
+    }
+
     /*
      * Prefer drawing the text console into the inherited LFB whenever GRUB
      * left us a graphics framebuffer. Falling through to 0xB8000 while the
@@ -1668,9 +1686,9 @@ static void framebuffer_bringup(void) {
         }
     }
 
-    /* Respect an explicit VGA / off request; never override the user's choice. */
-    if (kstr_eq(g_boot_config.boot, "vga")) {
-        vesa_reject_reason = "VESA disabled: VGA Compatibility Mode requested by GRUB.\n";
+    /* Respect an explicit VGA / v86 / off request; never override the user's choice. */
+    if (kstr_eq(g_boot_config.boot, "vga") || kstr_eq(g_boot_config.boot, "v86")) {
+        vesa_reject_reason = "VESA disabled: VGA text plane requested by GRUB.\n";
         revert_to_text_floor();
         return;
     }
@@ -2326,8 +2344,10 @@ struct IDTPointer {
     uint32_t base;
 } __attribute__((packed));
 
-static struct IDTEntry idt[256];
-static struct IDTPointer idt_ptr;
+static struct IDTEntry idt[256]
+    __attribute__((section(".idt"), aligned(16)));
+static struct IDTPointer idt_ptr
+    __attribute__((section(".idt")));
 
 extern void load_idt(struct IDTPointer*);
 extern void irq1_handler_asm();
@@ -2679,13 +2699,17 @@ void print(const char* str) {
      * for any early print() that fires before that sink is installed.
      */
     for (size_t i = 0; str[i] != '\0'; i++) {
+#ifdef __i386__
+        if (!i386_fb_console_echo && boot_mode_vesa) continue;
+#endif
         vga_put_char(str[i]);
     }
 }
 
 #ifdef __i386__
-extern void fs_init();
-extern void vesa_desktop_run();
+extern void fs_init(void);
+extern void vesa_desktop_init(void);
+extern void vesa_desktop_main_loop(void);
 #endif
 
 /* shell.c is linked on both arches (Phase 3e), so the shell entry points
@@ -2912,7 +2936,24 @@ static void boot_run_stages_table(const boot_stage_def_t* stages, int n) {
 #ifdef __i386__
 static void stage_timer(void)    { timer_init(100); }
 static void stage_input(void)    { input_init(); keyboard_init(); mouse_init(); }
-static void stage_heap(void)     { memory_init((void*)(&_kernel_end), KERNEL_HEAP_SIZE); }
+
+/* 16 MiB: desktop + GooberDOS 8 MiB guest arena (DOS/4GW Doom path) */
+#define I386_KERNEL_HEAP_SIZE (16u * 1024u * 1024u)
+static uint8_t g_i386_kernel_heap[I386_KERNEL_HEAP_SIZE];
+static void stage_heap(void) {
+    memory_init(g_i386_kernel_heap, I386_KERNEL_HEAP_SIZE);
+    char buf[24];
+    print("[heap] init: size=");
+    itoa((int)memory_total_bytes(), buf, 10); print(buf);
+    print(" free=");
+    itoa((int)memory_free_bytes(), buf, 10); print(buf);
+    print(" (free-list, coalescing, BSS-backed)\n");
+    serial_out("[heap] init: size=");
+    itoa((int)memory_total_bytes(), buf, 10); serial_out(buf);
+    serial_out(" free=");
+    itoa((int)memory_free_bytes(), buf, 10); serial_out(buf);
+    serial_out("\n");
+}
 static void stage_hwsummary(void){ boot_print_hardware_summary(); }
 static void stage_display(void)  { framebuffer_bringup(); fbdbg(8, 0xFFFFFF, "8 report diagnostics"); report_display_diagnostics(); fbdbg(9, 0x808080, "9 display stage done"); }
 static void stage_pci(void)      { pci_init(); }
@@ -2930,6 +2971,40 @@ static void stage_touchpad(void) {
     touchpad_init();
 }
 
+extern void userspace_init(void);
+static void stage_userspace(void) {
+    userspace_init();
+}
+
+static void register_kernel_process_i386(void) {
+    kernel_pid = create_process("kernel.bin", I386_KERNEL_HEAP_SIZE / 1024u);
+}
+
+static void stage_desktop(void) {
+    if (!boot_mode_vesa) return;
+    register_kernel_process_i386();
+    update_kernel_process_memory();
+    vesa_desktop_init();
+    g_desktop_init_ok = 1;
+}
+
+static void stage_fault_probe(void) {
+    serial_out("[stage:fault-probe] deliberately triggering #BP (int3) -- "
+               "boot_guarded_run should contain it.\n");
+    __asm__ volatile ("int3");
+    serial_out("[stage:fault-probe] BUG: int3 returned (guard did NOT catch).\n");
+}
+
+static volatile int i386_watchdog_probe_observed = 0;
+
+static void stage_watchdog_probe(void) {
+    serial_out("[stage:watchdog-probe] entering bounded busy-loop with IRQ0 "
+               "enabled; boot_watchdog_tick should longjmp out.\n");
+    i386_watchdog_probe_observed = 1;
+    __asm__ volatile ("sti");
+    for (;;) __asm__ volatile ("hlt");
+}
+
 static const boot_stage_def_t k_boot_stages[] = {
     /* --- Minimal floor: always runs, even in safe mode --- */
     { "Timer (PIT 100Hz)",           stage_timer,     0, 0, NULL, 0, 0 },
@@ -2945,13 +3020,20 @@ static const boot_stage_def_t k_boot_stages[] = {
     { "I2C HID touchpad",            stage_touchpad,  1, 0,
       "Touchpad probe complete. Scanning storage...", 0, WD_TOUCHPAD },
     { "Storage controllers",         stage_storage,   1, 0,
-      "Storage initialized. Initializing USB...", 0, WD_STORAGE },
+      "Storage initialized. Initializing USB...", 0, WD_STORAGE_X64 },
     { "USB host stack",              stage_usb,       1, 0,
       "USB initialized. Loading filesystem...", 0, WD_USB },
     /* Filesystem is always run (not skipped in safe mode) but is fault-
      * guarded with a watchdog so a bad auto-mount cannot hang the box. */
     { "Filesystem",                  stage_fs,        0, 0,
-      "Filesystem ready. Starting desktop...", 0, WD_STORAGE },
+      "Filesystem ready. Starting desktop...", 0, WD_STORAGE_X64 },
+    { "Userspace (ring-3 / .gob)",   stage_userspace, 1, 0, NULL, 0, WD_USERSPACE },
+    { "Shell / desktop",             stage_desktop,   1, 0, NULL, 0, WD_DESKTOP },
+};
+
+static const boot_stage_def_t k_boot_selftests_i386[] = {
+    { "Fault probe (self-test, expected to fail)",     stage_fault_probe,    0, 0, NULL, 0, 0 },
+    { "Watchdog probe (self-test, expected to fail)",  stage_watchdog_probe, 0, 0, NULL, 0, 50 },
 };
 
 static void boot_run_stages(void) {
@@ -2972,22 +3054,30 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
 
     serial_out("GooberOS boot starting...\n");
 
-    vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    clear_screen();
-    display_register_text_mode();
+    /*
+     * Parse cmdline before the first panel write so v86/vga boots can restore
+     * the 0xB8000 text plane while GRUB is still in gfxterm graphics mode.
+     */
+    boot_config_parse_multiboot(magic, mb_info);
+
+    if (kernel_wants_vga_text_plane()) {
+        kernel_bind_vga_text_plane();
+    } else {
+        vga_set_text_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        clear_screen();
+        display_register_text_mode();
+    }
+
     print("GooberOS -- x86 Kernel\n");
     print("\n");
 
     /*
      * Bootstrap (NOT guarded -- these must succeed for the guard to function):
-     *   1. Parse the unified boot config from the multiboot cmdline. This must
-     *      happen before the staged boot so boot_safe_mode() is known.
      *   2. Install the IDT so the CPU-exception handlers (and IRQ handlers)
      *      exist; the boot fault guard relies on cpu_exception_handler being
      *      wired here. A fault before this point would triple-fault, so the
      *      bootstrap is intentionally kept tiny.
      */
-    boot_config_parse_multiboot(magic, mb_info);
     idt_init();
 
     print("Boot request: ");
@@ -3008,6 +3098,27 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
      * and the next stage still runs; in safe mode the risky stages are skipped.
      */
     boot_run_stages();
+
+    if (kcmdline_contains("gooberos.selftest=1")) {
+        serial_out("[boot] gooberos.selftest=1: running fault + watchdog "
+                   "self-tests.\n");
+        boot_results_reset();
+        boot_run_stages_table(k_boot_selftests_i386,
+                              (int)(sizeof(k_boot_selftests_i386) /
+                                    sizeof(k_boot_selftests_i386[0])));
+        boot_print_results_summary_titled("Self-test results");
+        {
+            void* dos_probe = kmalloc(8u * 1024u * 1024u);
+            if (dos_probe) {
+                print("[selftest] GooberDOS arena kmalloc(8 MiB) OK\n");
+                serial_out("[selftest] GooberDOS arena kmalloc(8 MiB) OK\n");
+                kfree(dos_probe);
+            } else {
+                print("[selftest] GooberDOS arena kmalloc(8 MiB) FAILED\n");
+                serial_out("[selftest] GooberDOS arena kmalloc(8 MiB) FAILED\n");
+            }
+        }
+    }
 
     /* Report the resulting display mode (text vs framebuffer). */
     if (!boot_mode_vesa) {
@@ -3033,27 +3144,21 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
     /* Per-stage OK / FAILED / SKIPPED summary to VGA + serial. */
     boot_print_results_summary();
 
-    if (boot_mode_vesa) {
-        uint32_t fb_size = vesa_get_pitch() * vesa_get_height();
-        if (fb_size <= VESA_STATIC_BACKBUFFER_BYTES) {
-            vesa_set_backbuffer_bytes((uint32_t*)vesa_static_backbuffer, fb_size);
-            serial_out("VESA static backbuffer enabled\n");
-        } else {
-            vesa_set_backbuffer_bytes(NULL, 0);
-            serial_out("VESA backbuffer too large; using direct framebuffer\n");
+    if (boot_mode_vesa && g_desktop_init_ok) {
+        if (vesa_get_pitch() && vesa_get_height()) {
+            vesa_boot_splash("Starting desktop...");
         }
-        /* Prove the panel is ours before the desktop event loop. */
-        vesa_boot_splash("Starting desktop...");
+        __asm__ volatile("sti" ::: "memory");
+        vesa_desktop_main_loop();
+        serial_out("[boot] vesa_desktop_main_loop returned; falling back to shell.\n");
     }
 
-    kernel_pid = create_process("kernel.bin", 0);
-    update_kernel_process_memory();
+    if (kernel_pid < 0) {
+        kernel_pid = create_process("kernel.bin", I386_KERNEL_HEAP_SIZE / 1024u);
+        update_kernel_process_memory();
+    }
 
     shell_init();
-
-    if (boot_mode_vesa) {
-        vesa_desktop_run();
-    }
 
     while (1) {
         usb_poll();
@@ -3064,8 +3169,10 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
 }
 #endif /* __i386__ kernel_main */
 
-#ifndef __x86_64__
-void kernel_set_fb_console_echo(int enabled) { (void)enabled; }
+#ifdef __i386__
+void kernel_set_fb_console_echo(int enabled) {
+    i386_fb_console_echo = enabled ? 1 : 0;
+}
 #endif
 
 #ifdef __x86_64__
@@ -3073,10 +3180,8 @@ void kernel_set_fb_console_echo(int enabled) { (void)enabled; }
  *  x86_64 long-mode kernel_main                                          *
  *                                                                       *
  *  Phase 3b deliverable: the unified staged-boot orchestrator runs on   *
- *  x64. We deliberately only link the EARLY stages this round (IDT,     *
- *  PIC, timer, framebuffer bring-up + display confirm). The PS/2 input, *
- *  PCI, USB, FS, shell, GUI stages stay x86-only until Phase 3c/3d/3e   *
- *  port the corresponding driver translation units to -m64.             *
+ *  x64. PS/2 input, PCI, USB, FS, shell, and GUI are linked on both    *
+ *  arches; x64 adds long-mode entry via boot64.s.                      *
  *                                                                       *
  *  Boot flow on x64:                                                    *
  *    1. COM1 init -> "GooberOS boot starting..." serial banner.         *
@@ -3506,7 +3611,6 @@ static void stage_x64_touchpad(void) {
  * and the orchestrator drops back to the REPL -- the smallest possible
  * diff vs. polling boot_record_stage's log.
  */
-static int g_desktop_init_ok = 0;
 extern void fs_init(void);
 extern void vesa_desktop_init(void);
 extern void vesa_desktop_main_loop(void);

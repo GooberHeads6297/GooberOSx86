@@ -308,7 +308,6 @@ static void set_input_line(const char* text) {
  * (no FADT, RESET_REG_SUP not in FADT flags, unsupported SpaceId,
  * malformed table) falls through.
  */
-#ifdef __x86_64__
 typedef struct __attribute__((packed)) {
     char     signature[8];
     uint8_t  checksum;
@@ -463,15 +462,24 @@ static int acpi_reset_attempt(void) {
     }
     return 1;
 }
-#endif /* __x86_64__ */
 
 void shell_reboot(void) {
     __asm__ volatile ("cli");
 #ifdef __i386__
-    /* Original 32-bit path: load an invalid IDT then int3 -> triple fault. */
-    struct { uint16_t limit; uint32_t base; } __attribute__((packed)) idt_ptr = {0, 0};
-    __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
-    __asm__ volatile ("int3\nud2\n");
+    if (!acpi_reset_attempt()) {
+        print("[shell] reboot: pulsing 8042 keyboard-controller reset\n");
+        for (int i = 0; i < 16; i++) {
+            if ((inb(0x64) & 0x02) == 0) break;
+            (void)inb(0x60);
+        }
+        outb(0x64, 0xFE);
+    }
+    /* Last resort: invalid IDT + int3 -> triple fault. */
+    {
+        struct { uint16_t limit; uint32_t base; } __attribute__((packed)) idt_ptr = {0, 0};
+        __asm__ volatile ("lidt %0" : : "m"(idt_ptr));
+        __asm__ volatile ("int3\nud2\n");
+    }
 #else
     /*
      * x64: ACPI 5.0 RESET_REG (via Multiboot2 RSDP), then 8042 pulse,

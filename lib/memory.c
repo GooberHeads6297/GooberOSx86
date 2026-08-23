@@ -1,28 +1,15 @@
 #include "memory.h"
 
 /*
- * Phase 3f kernel allocator.
+ * Phase 3f kernel allocator (both x86 and x86_64).
  *
- * x86 (Phase 1..3e legacy)  : bump allocator -- kfree() is a no-op,
- *                             memory_reset() rewinds the offset.
- * x86_64 (Phase 3f)         : doubly-linked first-fit free-list with
- *                             coalescing on free and on growth, real
- *                             kfree(), and a krealloc() that grows in
- *                             place when the next neighbour is free.
+ * Doubly-linked first-fit free-list with coalescing on free and on
+ * growth, real kfree(), and a krealloc() that grows in place when the
+ * next neighbour is free.
  *
- * The x86 build is intentionally NOT changed: storage/install/editor/
- * games TUs there continue to depend on bump-allocator lifetimes. The
- * x64 build's drivers/storage/, install path, editor, taskmgr, and
- * games can run for arbitrarily long sessions, so they need real
- * free-list semantics.
- *
- * The free-list path is sandbox-safe: it only manages the BSS-backed
- * arena passed to memory_init(). No syscalls, no mmap, no MMIO. The
- * arena pointer is host-supplied; the x64 builder allocates a 4 MiB
- * BSS array (`g_x64_kernel_heap[]`) and hands it in.
+ * The arena is BSS-backed: each arch passes a dedicated heap array from
+ * kernel.c (g_i386_kernel_heap[] / g_x64_kernel_heap[]).
  */
-
-#ifdef __x86_64__
 
 /*
  * Free-list allocator with coalescing.
@@ -258,56 +245,3 @@ void memory_reset(void) {
 
 size_t memory_total_bytes(void) { return g_heap_capacity; }
 size_t memory_free_bytes(void)  { return g_heap_free_bytes; }
-
-#else  /* !__x86_64__ ---- legacy x86 bump allocator (unchanged) -------- */
-
-static uint8_t* heap_base = 0;
-static size_t   heap_capacity = 0;
-static size_t   heap_offset = 0;
-
-void memory_init(void* heap_start, size_t heap_size) {
-    heap_base     = (uint8_t*)heap_start;
-    heap_capacity = heap_size;
-    heap_offset   = 0;
-}
-
-void* kmalloc(size_t size) {
-    if (size == 0) return 0;
-    if (heap_offset + size > heap_capacity) return 0;
-    void* ptr = heap_base + heap_offset;
-    heap_offset += size;
-    return ptr;
-}
-
-void kfree(void* ptr) {
-    /* Bump allocator: per-block free is unimplemented. */
-    (void)ptr;
-}
-
-void* krealloc(void* ptr, size_t new_size) {
-    /*
-     * Bump allocator can't free; return a fresh allocation and copy.
-     * Callers in the x86 build are limited to startup-only usage so
-     * this is safe in practice.
-     */
-    if (!ptr) return kmalloc(new_size);
-    if (new_size == 0) { kfree(ptr); return 0; }
-    void* nptr = kmalloc(new_size);
-    if (!nptr) return 0;
-    /* We don't know the old size; copy up to new_size from ptr. The
-     * worst case (over-read) lands inside the bump arena so it's
-     * not a fault. */
-    uint8_t* dst = (uint8_t*)nptr;
-    const uint8_t* src = (const uint8_t*)ptr;
-    for (size_t i = 0; i < new_size; i++) dst[i] = src[i];
-    return nptr;
-}
-
-void memory_reset(void) {
-    heap_offset = 0;
-}
-
-size_t memory_total_bytes(void) { return heap_capacity; }
-size_t memory_free_bytes(void)  { return heap_capacity - heap_offset; }
-
-#endif

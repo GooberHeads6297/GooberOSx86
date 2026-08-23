@@ -37,15 +37,25 @@ if [[ "${VERIFY_USB_QEMU:-0}" == "1" ]]; then
   echo "== QEMU gate (nec-usb-xhci + usb-mouse) =="
   ISO="${VERIFY_USB_ISO:-$ROOT/GooberOSx86-x64.iso}"
   if [[ ! -f "$ISO" ]]; then
-    echo "missing ISO: $ISO (run ./build.sh x64 first)" >&2
+    echo "missing ISO: $ISO (run ./build.sh x64 or ./build.sh x86 first)" >&2
     exit 1
   fi
   CAP="$(mktemp)"
+  PIDFILE="$(mktemp)"
   cp -f "$ISO" /tmp/goober-usb-verify.iso
-  timeout 40 qemu-system-x86_64 \
+  QEMU_BIN=qemu-system-x86_64
+  if [[ "$ISO" == *x86* ]] && [[ "$ISO" != *x64* ]]; then
+    QEMU_BIN=qemu-system-i386
+  fi
+  "$QEMU_BIN" \
     -cdrom /tmp/goober-usb-verify.iso -m 512 -machine q35 \
     -device nec-usb-xhci,id=xhci -device usb-mouse,bus=xhci.0 \
-    -serial "file:$CAP" -display none -no-reboot >/dev/null 2>&1 || true
+    -serial "file:$CAP" -display none -no-reboot \
+    -pidfile "$PIDFILE" -daemonize
+  sleep 50
+  if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
+  rm -f "$PIDFILE"
+  sleep 1
   if grep -q 'USB HID pointer ready' "$CAP" && grep -q 'USB: stack=new' "$CAP"; then
     echo "QEMU: USB HID pointer ready (stack=new) OK"
   else
