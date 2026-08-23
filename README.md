@@ -1,5 +1,5 @@
-# GooberOSx86
-Simple OS with a Kernel and a Shell (W.I.P)
+# GooberOS
+Small OS with a handful of applications and its own language.  (W.I.P)
 
 <img width="397" height="138" alt="imageStart" src="https://github.com/user-attachments/assets/7598db4d-5243-41c1-84ba-0f8388f031cc" />
 
@@ -10,32 +10,38 @@ ________________________________
 (At the moment not neccesary becasue the only thing runnnig is the Kernel itself.)
 
 
-<img width="3840" height="2160" alt="TaskManagerUpdate" src="https://github.com/user-attachments/assets/7856bcc9-8228-492b-a3ce-ba765fc7cafb" />
+<img width="442" height="363" alt="image" src="https://github.com/user-attachments/assets/8d464279-8f1c-425a-8ca8-ceb60359c5d7" />
+
 
 ________________________________
 
 ### Memory-Based Filesystem With Directory Traversal
 
 
-<img width="693" height="270" alt="ImageMemfilesystem" src="https://github.com/user-attachments/assets/4e2f3cc1-fcf3-4ec6-a14c-ce4ea1cce921" />
+<img width="845" height="500" alt="image" src="https://github.com/user-attachments/assets/11ef35c6-1087-4d78-923b-6c7c33dcdbd5" />
+
 
 ________________________________
 
-### Integrated Text Editor (Currenntly In Development)
+### Integrated Text Editor + GooberIDE (Currenntly In Development)
 
-<img width="835" height="354" alt="ImageEditor" src="https://github.com/user-attachments/assets/e8d2dc58-3b94-4217-b09f-59b8ca868698" />
+<img width="911" height="503" alt="image" src="https://github.com/user-attachments/assets/09e3c7da-e128-4e24-94d1-12397caf0456" />
 
-________________________________
-
-### Built-in Display Manager using VGA + File Explorer
-
-<img width="3840" height="2160" alt="screenExplorer" src="https://github.com/user-attachments/assets/0c9d12ea-2870-4c57-aace-c748b706aaa0" />
 
 ________________________________
 
-### Text Editor Integration with GUI
+### Built-in Display Manager with display settings + themes and resolution toggle
 
-<img width="3840" height="2160" alt="TextEdit" src="https://github.com/user-attachments/assets/67997362-36f6-4fe4-ab9e-f5244c3c8498" />
+<img width="911" height="503" alt="image" src="https://github.com/user-attachments/assets/1b0bb6a0-ab04-4016-9499-908155ff88ad" />
+
+
+________________________________
+
+
+### GUI-based installer for live-ISO 
+(This currently works on real HDD, eMMC cards, and currently any VHD. 
+
+<img width="911" height="503" alt="image" src="https://github.com/user-attachments/assets/e763309a-5424-4506-972f-2422e6f462ef" />
 
 ________________________________
 
