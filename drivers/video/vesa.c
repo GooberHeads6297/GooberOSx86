@@ -2,6 +2,7 @@
 #include "font.h"
 #include "display.h"
 #include "../../lib/string.h"
+#include "../../gooberos_arch.h"
 
 static volatile uint8_t* framebuffer = NULL;
 static uint8_t* backbuffer = NULL;
@@ -340,7 +341,7 @@ void vesa_boot_splash(const char* status) {
     vesa_fill_rect(logo_x + 8, logo_y + 8, 28, 28, panel);
     vesa_fill_rect(logo_x + 16, logo_y + 16, 12, 12, accent2);
 
-    vesa_draw_string(logo_x + 62, logo_y + 2, "GooberOSx86", text, panel);
+    vesa_draw_string(logo_x + 62, logo_y + 2, GOOBEROS_MENU_LABEL, text, panel);
     vesa_draw_string(logo_x + 62, logo_y + 24, "Starting graphical desktop", muted, panel);
     vesa_draw_string(bar_x, bar_y - 28, status ? status : "Loading...", text, panel);
 

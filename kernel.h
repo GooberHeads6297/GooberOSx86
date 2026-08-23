@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gooberos_arch.h"
 #include "include/multiboot.h"
 
 typedef void (*kernel_print_sink_t)(const char* str, void* ctx);

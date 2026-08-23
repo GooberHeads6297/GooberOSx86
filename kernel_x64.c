@@ -41,6 +41,7 @@
 #include "drivers/timer/timer.h"
 #include "cpu_exception_names.h"
 #include "font_8x16.h"
+#include "gooberos_arch.h"
 
 /* ---- COM1 (0x3F8) serial init ------------------------------------------- */
 
@@ -426,7 +427,7 @@ static void fb_render_proof_of_life(const struct goober_fb* fb) {
     const uint32_t BLACK = 0x00000000u;
 
     fb_draw_band(fb, 0, 0, fb->width, 64, BLACK);
-    fb_print_at(0, 0, "GooberOSx86 x64  Phase 3a.1", WHITE, BLACK);
+    fb_print_at(0, 0, GOOBEROS_MENU_LABEL "  Phase 3a.1", WHITE, BLACK);
 
     char line1[96];
     size_t n = 0;

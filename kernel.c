@@ -3068,7 +3068,7 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
         display_register_text_mode();
     }
 
-    print("GooberOS -- x86 Kernel\n");
+    print("GooberOS " GOOBEROS_ARCH_SHORT " kernel (" GOOBEROS_ARCH_LONG ")\n");
     print("\n");
 
     /*
@@ -3807,7 +3807,7 @@ void kernel_main(uint32_t magic, uintptr_t info) {
 
     serial_out("\n");
     serial_out("=========================================================\n");
-    serial_out(" GooberOSx86 x86_64 long-mode kernel: Phase 1 milestone\n");
+    serial_out(" GooberOS " GOOBEROS_ARCH_SHORT " kernel (" GOOBEROS_ARCH_LONG ")\n");
     serial_out("=========================================================\n");
     serial_out("[boot64] long mode operational; serial print confirmed.\n");
 
@@ -3847,7 +3847,7 @@ void kernel_main(uint32_t magic, uintptr_t info) {
     /* Legacy 0xB8000 fallback for legacy-BIOS x64 boots. Invisible on UEFI
      * (the firmware does not map the legacy text plane), harmless either way.
      * Kept for parity with the 3b.0 log. */
-    x64_arch_legacy_vga_text_line("GooberOSx86 x64 Phase 3b\n");
+    x64_arch_legacy_vga_text_line("GooberOS " GOOBEROS_ARCH_SHORT " kernel\n");
 
     /*
      * Step 5. Install the print sink so every subsequent print() call
@@ -3861,7 +3861,7 @@ void kernel_main(uint32_t magic, uintptr_t info) {
     serial_out("=========================================================\n");
     serial_out(" Phase 3b milestone: unified staged-boot orchestrator on x64\n");
     serial_out("=========================================================\n");
-    print("GooberOS boot starting (x86_64, Phase 3b orchestrator)...\n");
+    print("GooberOS boot starting (" GOOBEROS_ARCH_LONG ")...\n");
 
     /*
      * Step 6. Run the productive x64 stages through the same
@@ -3935,7 +3935,7 @@ void kernel_main(uint32_t magic, uintptr_t info) {
      * or 0xB8000 (legacy BIOS).
      */
     if (kernel_display_is_text_console()) {
-        print("\nGooberOSx86 x64 VGA-Compatibility text shell\n");
+        print("\nGooberOS " GOOBEROS_ARCH_SHORT " VGA text shell\n");
         print("Type `help` for the command list.\n\n");
         /* Sync the shell's cell-grid cursor to where the boot log left
          * off so the prompt does not overwrite the results summary. */

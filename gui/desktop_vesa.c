@@ -522,7 +522,7 @@ static void sysinfo_render(VWindow* win, int cx, int cy, int cw, int ch) {
     const VDeskMetrics* metrics = vdesk_get_metrics();
     int row = cy + 4;
     vdesk_draw_rect(cx, cy, cw, ch, theme->client_bg);
-    vdesk_draw_text(cx + 4, row, "GooberOS x86", theme->text, theme->client_bg);
+    vdesk_draw_text(cx + 4, row, GOOBEROS_MENU_LABEL, theme->text, theme->client_bg);
     row += 16;
     vdesk_draw_text(cx + 4, row, "VESA Display Manager", theme->text, theme->client_bg);
     row += 20;
@@ -3939,7 +3939,7 @@ static void desktop_vga13_render(void) {
 
     /* Top status bar. */
     vga_graphics_fill_rect(0, 0, 320, 16, VGA13_COLOR_LIGHT_GREY);
-    vga_graphics_draw_string(4, 0, "GooberOS x86_64",
+    vga_graphics_draw_string(4, 0, GOOBEROS_MENU_LABEL,
                              VGA13_COLOR_BLACK, VGA13_COLOR_LIGHT_GREY);
     vga_graphics_draw_string(160, 0, "VGA Safe Graphics",
                              VGA13_COLOR_RED, VGA13_COLOR_LIGHT_GREY);

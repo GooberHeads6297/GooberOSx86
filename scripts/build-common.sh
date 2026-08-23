@@ -108,6 +108,7 @@ prepare_install_root() {
   mkdir -p "${install_root}/boot/grub"
   cp "${BUILD_DIR}/kernel.bin" "${install_root}/boot/kernel.bin"
   cp grub/grub.cfg "${install_root}/boot/grub/grub.cfg"
+  patch_grub_arch_labels "${install_root}/boot/grub/grub.cfg"
   echo "[+] Install root staged at ${install_root}"
 }
 
@@ -128,9 +129,7 @@ create_iso_hybrid() {
   mkdir -p "${ISO_DIR}/boot/grub"
   cp "${BUILD_DIR}/kernel.bin" "${ISO_DIR}/boot/"
   cp grub/grub.cfg "${ISO_DIR}/boot/grub/"
-  if [ "${ISO_DIR}" = "iso64" ]; then
-    patch_grub_x64_normal_boot "${ISO_DIR}/boot/grub/grub.cfg"
-  fi
+  patch_grub_arch_labels "${ISO_DIR}/boot/grub/grub.cfg"
   prepare_install_root
 
   grub-mkrescue \
@@ -145,7 +144,26 @@ create_iso_hybrid() {
 write_installed_grub_cfg() {
   local dest="$1"
   cp grub/grub.installed.cfg "${dest}"
+  patch_grub_arch_labels "${dest}"
   echo "[+] Wrote installed grub.cfg -> ${dest}"
+}
+
+# Stamp ISO/install GRUB menus with the target arch (x86 vs x64).
+patch_grub_arch_labels() {
+  local cfg="$1"
+  local arch="${GOOBEROS_GRUB_ARCH:-x86}"
+  if [ ! -f "${cfg}" ]; then
+    echo "[!] grub.cfg not found at ${cfg}"
+    return 1
+  fi
+  sed -i 's/GooberOSx86/GooberOS x86/g' "${cfg}"
+  if [ "${arch}" = "x64" ]; then
+    sed -i 's/GooberOS x86/GooberOS x64/g' "${cfg}"
+    patch_grub_x64_normal_boot "${cfg}"
+    echo "[+] grub arch labels -> x64 (${cfg})"
+  else
+    echo "[+] grub arch labels -> x86 (${cfg})"
+  fi
 }
 
 # x64: normalize any leftover storage=sdhci cmdline to storage=ata.
@@ -182,6 +200,7 @@ prepare_install_payload() {
 
   mkdir -p "${memdisk_dir}/boot/grub"
   cp grub/grub.installed.cfg "${memdisk_dir}/boot/grub/grub.cfg"
+  patch_grub_arch_labels "${memdisk_dir}/boot/grub/grub.cfg"
   tar -C "${memdisk_dir}" -cf "${payload_dir}/memdisk.tar" boot
 
   if [ -r /usr/lib/grub/i386-pc/boot.img ] && command -v grub-mkimage >/dev/null 2>&1; then
