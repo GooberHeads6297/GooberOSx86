@@ -48,8 +48,8 @@ ________________________________
 
 <img width="128" height="21" alt="Screenshot 2025-07-12 212951" src="https://github.com/user-attachments/assets/2c69725e-ff7d-45ca-b3e6-30fc4e05b50a" />
 
-Release: 0.11.5 (sha256 only shows the one for the latest release)
-802df6ae35109f057163d37c072072695bbc9177e7f033b48b491a6bce6e5180
+Release: 0.12.4 (sha256 only shows the one for the latest release)
+sha256:b6f83191940a5652392a12b4acd23f9e76a78f199e88ed6be61196da55a0167b
 
   Install with GRUB on a storage device:
 
